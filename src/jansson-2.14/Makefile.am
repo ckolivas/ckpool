@@ -1,4 +1,3 @@
-ACLOCAL_AMFLAGS = -I m4
 EXTRA_DIST = CHANGES LICENSE README.rst CMakeLists.txt cmake android examples scripts
 SUBDIRS = doc src
 
