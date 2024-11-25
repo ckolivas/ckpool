@@ -1030,11 +1030,10 @@ static void send_client(ckpool_t *ckp, cdata_t *cdata, const int64_t id, char *b
 		}
 		if (ckp->redirector && !client->redirected && client->authorised) {
 			/* If clients match the IP of clients that have already
-			 * been whitelisted as finding valid shares then
-			 * redirect them immediately. */
-			if (redirect_matches(cdata, client))
-				redirect = true;
-			else
+			 * been redirected then do not try redirecting them
+			 * again as they may be ignoring the redirect request
+			 * or failing to redirect. */
+			if (!redirect_matches(cdata, client))
 				redirect = test_redirector_shares(cdata, client, buf);
 		}
 	}
