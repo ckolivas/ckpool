@@ -7966,7 +7966,7 @@ static void *statsupdate(void *arg)
 					idle_workers++;
 					if (ckp->dropidle && per_tdiff > ckp->dropidle) {
 						/* Drop clients idle for longer than
-						 * ckp->dropidle default 1 hour */
+						 * ckp->dropidle in seconds if set */
 						LOGINFO("Dropping client %"PRId64" due to being idle", client->id);
 						lazy_drop_client(ckp, client);
 					} else if (per_tdiff > 600) {
