@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2020,2023 Con Kolivas
+ * Copyright 2014-2020,2023,2025 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -3378,7 +3378,10 @@ static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, con
 	client = __recruit_stratum_instance(sdata);
 	ck_wunlock(&sdata->instance_lock);
 
-	client->start_time = time(NULL);
+	/* Fake a share time at startup to prevent client being dropped for
+	 * being idle. */
+	client->start_time = client->last_share.tv_sec = time(NULL);
+
 	client->id = id;
 	client->session_id = ++sdata->session_id;
 	strcpy(client->address, address);
@@ -3571,7 +3574,7 @@ static void drop_client(ckpool_t *ckp, sdata_t *sdata, const int64_t id)
 
 	ck_wlock(&sdata->instance_lock);
 	client = __instance_by_id(sdata, id);
-	if (client && !client->dropped) {
+	if (client) {
 		__disconnect_session(sdata, client);
 		/* If the client is still holding a reference, don't drop them
 		 * now but wait till the reference is dropped */
@@ -7894,6 +7897,12 @@ static worker_instance_t *next_worker(sdata_t *sdata, user_instance_t *user, wor
 	return worker;
 }
 
+static void lazy_drop_client(ckpool_t *ckp, stratum_instance_t *client)
+{
+	client->dropped = true;
+	connector_drop_client(ckp, client->id);
+}
+
 static void *statsupdate(void *arg)
 {
 	ckpool_t *ckp = (ckpool_t *)arg;
@@ -7936,20 +7945,18 @@ static void *statsupdate(void *arg)
 
 		while (client) {
 			tv_time(&now);
-			/* Look for clients that may have been dropped which the
-			 * stratifier has not been informed about and ask the
-			 * connector if they still exist */
+			/* Look for clients that have been dropped which the
+			 * connector may not have been informed about and should
+			 * disconnect. */
 			if (client->dropped)
-				connector_test_client(ckp, client->id);
+				connector_drop_client(ckp, client->id);
 			else if (remote_server(client)) {
 				/* Do nothing to these */
 			} else if (!client->authorised) {
 				/* Test for clients that haven't authed in over a minute
 				 * and drop them lazily */
-				if (now.tv_sec > client->start_time + 60) {
-					client->dropped = true;
-					connector_drop_client(ckp, client->id);
-				}
+				if (now.tv_sec > client->start_time + 60)
+					lazy_drop_client(ckp, client);
 			} else {
 				per_tdiff = tvdiff(&now, &client->last_share);
 				/* Decay times per connected instance */
@@ -7957,10 +7964,16 @@ static void *statsupdate(void *arg)
 					/* No shares for over a minute, decay to 0 */
 					decay_client(client, 0, &now);
 					idle_workers++;
-					if (per_tdiff > 600)
+					if (ckp->dropidle && per_tdiff > ckp->dropidle) {
+						/* Drop clients idle for longer than
+						 * ckp->dropidle default 1 hour */
+						LOGINFO("Dropping client %"PRId64" due to being idle", client->id);
+						lazy_drop_client(ckp, client);
+					} else if (per_tdiff > 600) {
 						client->idle = true;
-					/* Test idle clients are still connected */
-					connector_test_client(ckp, client->id);
+						/* Test idle clients are still connected */
+						connector_test_client(ckp, client->id);
+					}
 				}
 			}
 
@@ -7981,7 +7994,6 @@ static void *statsupdate(void *arg)
 		while ((user = next_user(sdata, user)) != NULL) {
 			worker_instance_t *worker;
 			json_t *user_array;
-			bool idle = false;
 
 			if (!user->authorised)
 				continue;
@@ -7990,15 +8002,13 @@ static void *statsupdate(void *arg)
 
 			/* Decay times per user */
 			per_tdiff = tvdiff(&now, &user->last_share);
-			if (per_tdiff > 60) {
-				/* Drop storage of users idle for 1 week */
-				if (per_tdiff > 600000) {
-					LOGDEBUG("Skipping user %s", user->username);
-					continue;
-				}
-				decay_user(user, 0, &now);
-				idle = true;
+			/* Drop storage of users with no shares */
+			if (!user->last_share.tv_sec) {
+				LOGDEBUG("Skipping inactive user %s", user->username);
+				continue;
 			}
+			if (per_tdiff > 60)
+				decay_user(user, 0, &now);
 
 			ghs = user->dsps1440 * nonces;
 			suffix_string(ghs, suffix1440, 16, 0);
@@ -8038,12 +8048,11 @@ static void *statsupdate(void *arg)
 					remote_users++;
 			}
 
-			if (!idle) {
-				s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_COMPACT);
-				ASPRINTF(&sp, "User %s:%s", user->username, s);
-				dealloc(s);
-				add_msg_entry(&char_list, &sp);
-			}
+			s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_COMPACT);
+			ASPRINTF(&sp, "User %s:%s", user->username, s);
+			dealloc(s);
+			add_msg_entry(&char_list, &sp);
+
 			user_array = json_array();
 			worker = NULL;
 
@@ -8053,13 +8062,13 @@ static void *statsupdate(void *arg)
 
 				per_tdiff = tvdiff(&now, &worker->last_share);
 				if (per_tdiff > 60) {
-					/* Drop storage of workers idle for 1 week */
-					if (per_tdiff > 600000) {
-						LOGDEBUG("Skipping worker %s", worker->workername);
-						continue;
-					}
 					decay_worker(worker, 0, &now);
 					worker->idle = true;
+					/* Drop storage of workers idle for 1 week */
+					if (per_tdiff > 600000) {
+						LOGDEBUG("Skipping inactive worker %s", worker->workername);
+						continue;
+					}
 				}
 
 				ghs = worker->dsps1440 * nonces;
@@ -8404,6 +8413,9 @@ void *throbber(void *arg)
 	sdata_t *sdata = ckp->sdata;
 	int counter = 0;
 
+	if (ckp->quiet)
+		goto out;
+
 	rename_proc("throbber");
 
 	while (42) {
@@ -8432,7 +8444,7 @@ void *throbber(void *arg)
 		}
 		fflush(stdout);
 	}
-
+out:
 	return NULL;
 }
 

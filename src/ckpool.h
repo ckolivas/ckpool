@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2018,2023 Con Kolivas
+ * Copyright 2014-2018,2023,2025 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -163,6 +163,8 @@ struct ckpool_instance {
 	bool handover;
 	/* How many clients maximum to accept before rejecting further */
 	int maxclients;
+	/* Drop clients that have been idle for this many seconds, 0 to disable */
+	int dropidle;
 
 	/* API message queue */
 	ckmsgq_t *ckpapi;
