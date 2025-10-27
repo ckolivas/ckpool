@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2020,2023 Con Kolivas
+ * Copyright 2014-2020,2023,2025 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -433,6 +433,10 @@ retry:
 		LOGWARNING("Listener received reject message, rejecting clients");
 		send_proc(ckp->connector, "reject");
 		send_unix_msg(sockd, "rejecting");
+	} else if (cmdmatch(buf, "dropall")) {
+		LOGWARNING("Listener received dropall message, disconnecting all clients");
+		send_proc(ckp->stratifier, buf);
+		send_unix_msg(sockd, "dropping all");
 	} else if (cmdmatch(buf, "reconnect")) {
 		LOGWARNING("Listener received request to send reconnect to clients");
 		send_proc(ckp->stratifier, buf);
@@ -1452,6 +1456,9 @@ static void parse_config(ckpool_t *ckp)
 		sscanf(vmask, "%x", &ckp->version_mask);
 	else
 		ckp->version_mask = 0x1fffe000;
+	/* Default drop clients idle for 1 hour */
+	if (!json_get_int(&ckp->dropidle, json_conf, "dropidle"))
+		ckp->dropidle = 3600;
 	/* Look for an array first and then a single entry */
 	arr_val = json_object_get(json_conf, "serverurl");
 	if (!parse_serverurls(ckp, arr_val)) {
