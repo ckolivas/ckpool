@@ -22,6 +22,8 @@ config.guess
 config.sub
 
 *~
+logs/*
+solobtc/*
 
 ext_deps
 config.h.in
@@ -40,4 +42,4 @@ ltmain.sh
 
 libtool
 
-
+test-driver

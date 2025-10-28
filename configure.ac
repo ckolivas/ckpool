@@ -52,27 +52,37 @@ AC_CHECK_HEADERS(zmq.h)
 AC_CHECK_PROG(YASM, yasm, yes)
 AM_CONDITIONAL([HAVE_YASM], [test x$YASM = xyes])
 
+x86_shani=
 rorx=
 avx1=
 sse4=
 sha2=
 if test $host_cpu = 'x86_64' && test x$YASM = xyes; then
-	rorx=`cat /proc/cpuinfo | grep -o -m 1 avx2`
-	if [test x$rorx != xavx2]; then
-		avx1=`cat /proc/cpuinfo | grep -o -m 1 avx`
-		if [test x$avx1 != xavx]; then
-			sse4=`cat /proc/cpuinfo | grep -o -m 1 sse4_1`
-		fi
+	cpuinfo=$(cat /proc/cpuinfo)
+
+	if [[[ $cpuinfo =~ sha_ni ]]]; then
+		 CFLAGS="$CFLAGS -msse4.1 -msha"
+        	x86_shani="sha_ni"
+	elif [[[ $cpuinfo =~ avx2 ]]]; then
+		rorx="avx2"
+	elif [[[ $cpuinfo =~ avx ]]]; then
+		avx1="avx"
+	elif [[[ $cpuinfo =~ sse4_1 ]]]; then
+		sse4="sse4_1"
 	fi
 fi
 if test $host_cpu = 'aarch64'; then
 	CFLAGS="$CFLAGS -march=armv8-a+crypto"
 	sha2=`cat /proc/cpuinfo | grep -o -m 1 sha2`
 fi
+AM_CONDITIONAL([HAVE_X86_SHANI], [test x$x86_shani = xsha_ni])
 AM_CONDITIONAL([HAVE_AVX2], [test x$rorx = xavx2])
 AM_CONDITIONAL([HAVE_AVX1], [test x$avx1 = xavx])
 AM_CONDITIONAL([HAVE_SSE4], [test x$sse4 = xsse4_1])
 AM_CONDITIONAL([HAVE_ARM_SHA2], [test x$sha2 = xsha2])
+if test x$x86_shani = xsha_ni; then
+        AC_DEFINE([USE_X86_SHANI], [1], [Use x86 SHA-NI assembly instructions for sha256])
+fi
 if test x$rorx = xavx2; then
 	AC_DEFINE([USE_AVX2], [1], [Use avx2 assembly instructions for sha256])
 fi
@@ -111,6 +121,7 @@ echo "  CPPFLAGS.............: $CPPFLAGS"
 echo "  CFLAGS...............: $CFLAGS"
 echo "  LDFLAGS..............: $LDFLAGS"
 echo "  LDADD................: $LIBS $JANSSON_LIBS"
+echo "  ARCHITECTURE.........: $host_cpu $x86_shani$rorx$avx1$sse4$sha2"
 echo
 echo "Installation...........: make install (as root if needed, with 'su' or 'sudo')"
 echo "  prefix...............: $prefix"
