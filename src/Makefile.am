@@ -5,6 +5,9 @@ AM_CPPFLAGS =  -I$(top_srcdir)/src/jansson-2.14/src
 
 native_objs :=
 
+if HAVE_X86_SHANI
+native_objs += sha256_x86_shani.o
+endif
 if HAVE_AVX2
 native_objs += sha256_code_release/sha256_avx2_rorx2.A
 endif
