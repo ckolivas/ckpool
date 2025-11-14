@@ -6173,9 +6173,12 @@ out_put:
 	put_workbase(sdata, wb);
 out_nowb:
 
-	/* Accept shares of the old diff until the next update */
+	/* Accept shares of the old diff until the next update. Strictly
+	 * speaking clients should not use the new diff until the next update
+	 * but very few clients do this properly, so accept whichever is the
+	 * minimum. */
 	if (id < client->diff_change_job_id)
-		diff = client->old_diff;
+		diff = MIN(diff, client->old_diff);
 	if (!invalid) {
 		char wdiffsuffix[16];
 
