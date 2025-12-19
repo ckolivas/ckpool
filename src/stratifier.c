@@ -5617,7 +5617,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 	tv_time(&now_t);
 
 	ck_rlock(&sdata->workbase_lock);
-	next_blockid = sdata->workbase_id + 1;
+	next_blockid = sdata->workbase_id;
 	if (ckp->proxy)
 		network_diff = sdata->current_workbase->diff;
 	else
@@ -6482,7 +6482,7 @@ static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *
 	client->suggest_diff = sdiff;
 	if (client->diff == sdiff)
 		return;
-	client->diff_change_job_id = client->sdata->workbase_id + 1;
+	client->diff_change_job_id = client->sdata->workbase_id;
 	client->old_diff = client->diff;
 	client->diff = sdiff;
 	stratum_send_diff(ckp->sdata, client);
