@@ -5647,7 +5647,6 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 
 	client->ssdc++;
 	bdiff = sane_tdiff(&now_t, &client->first_share);
-	bias = time_bias(bdiff, 300);
 	tdiff = sane_tdiff(&now_t, &client->ldc);
 
 	/* Check the difficulty every 240 seconds or as many shares as we
@@ -5660,8 +5659,17 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 		return;
 	}
 
-	/* Diff rate ratio */
-	dsps = client->dsps5 / bias;
+	/* Diff rate ratio.
+	 * If shares are coming in fast, calculate based on
+	 * the one minute rolling average for quick diff adjustment, otherwise
+	 * use the 5 minute rolling average */
+	if (client->ssdc >= 72) {
+		bias = time_bias(bdiff, 60);
+		dsps = client->dsps1 / bias;
+	} else {
+		bias = time_bias(bdiff, 300);
+		dsps = client->dsps5 / bias;
+	}
 	drr = dsps / (double)client->diff;
 
 	/* Optimal rate product is 0.3, allow some hysteresis. */
