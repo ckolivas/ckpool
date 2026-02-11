@@ -63,7 +63,7 @@ if $PREVIOUS_INSTALL; then
 fi
 
 # Main installation
-echo "Starting installation of Bitcoin Core v29.0 and CKPool-Solo. This requires sudo privileges."
+echo "Starting installation of Bitcoin Core v29.2 and CKPool-Solo. This requires sudo privileges."
 echo "Warning: Bitcoin Core will download up to ~675GB of blockchain data (or less if pruned). Ensure sufficient disk space."
 echo "Important: You cannot mine with CKPool-Solo until the Bitcoin Core blockchain is fully synchronized, which may take days depending on your hardware and network speed."
 
@@ -166,7 +166,7 @@ echo "Enabling persistent journal storage for easier log access..."
 mkdir -p /var/log/journal
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
-# Download and verify Bitcoin Core v29.0 tarball
+# Download and verify Bitcoin Core v29.2 tarball
 BITCOIN_VERSION="29.2"
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
