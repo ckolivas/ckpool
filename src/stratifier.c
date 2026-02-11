@@ -5617,7 +5617,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 	tv_time(&now_t);
 
 	ck_rlock(&sdata->workbase_lock);
-	next_blockid = sdata->workbase_id + 1;
+	next_blockid = sdata->workbase_id;
 	if (ckp->proxy)
 		network_diff = sdata->current_workbase->diff;
 	else
@@ -5647,7 +5647,6 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 
 	client->ssdc++;
 	bdiff = sane_tdiff(&now_t, &client->first_share);
-	bias = time_bias(bdiff, 300);
 	tdiff = sane_tdiff(&now_t, &client->ldc);
 
 	/* Check the difficulty every 240 seconds or as many shares as we
@@ -5660,8 +5659,17 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 		return;
 	}
 
-	/* Diff rate ratio */
-	dsps = client->dsps5 / bias;
+	/* Diff rate ratio.
+	 * If shares are coming in fast, calculate based on
+	 * the one minute rolling average for quick diff adjustment, otherwise
+	 * use the 5 minute rolling average */
+	if (client->ssdc >= 72) {
+		bias = time_bias(bdiff, 60);
+		dsps = client->dsps1 / bias;
+	} else {
+		bias = time_bias(bdiff, 300);
+		dsps = client->dsps5 / bias;
+	}
 	drr = dsps / (double)client->diff;
 
 	/* Optimal rate product is 0.3, allow some hysteresis. */
@@ -6088,7 +6096,7 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 	if (unlikely(!wb)) {
 		id = sdata->current_workbase->id;
 		err = SE_INVALID_JOBID;
-		json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
+		*err_val = JSON_ERR(err);
 		strncpy(idstring, job_id, 19);
 		ASPRINTF(&fname, "%s.sharelog", sdata->current_workbase->logdir);
 		goto out_nowb;
@@ -6150,14 +6158,14 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 			}
 		}
 		err = SE_STALE;
-		json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
+		*err_val = JSON_ERR(err);
 		goto out_submit;
 	}
 no_stale:
 	/* Ntime cannot be less, but allow forward ntime rolling up to max */
 	if (ntime32 < wb->ntime32 || ntime32 > wb->ntime32 + 7000) {
 		err = SE_NTIME_INVALID;
-		json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
+		*err_val = JSON_ERR(err);
 		goto out_put;
 	}
 	invalid = false;
@@ -6190,7 +6198,7 @@ out_nowb:
 				result = true;
 			} else {
 				err = SE_DUPE;
-				json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
+				*err_val = JSON_ERR(err);
 				LOGINFO("Rejected client %s dupe diff %.1f/%.0f/%s: %s",
 					client->identity, sdiff, diff, wdiffsuffix, hexhash);
 				submit = false;
@@ -6199,7 +6207,7 @@ out_nowb:
 			err = SE_HIGH_DIFF;
 			LOGINFO("Rejected client %s high diff %.1f/%.0f/%s: %s",
 				client->identity, sdiff, diff, wdiffsuffix, hexhash);
-			json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
+			*err_val = JSON_ERR(err);
 			submit = false;
 		}
 	}  else
@@ -6229,7 +6237,6 @@ out_nowb:
 	json_set_double(val, "sdiff", sdiff);
 	json_set_string(val, "hash", hexhash);
 	json_set_bool(val, "result", result);
-	json_object_set(val, "reject-reason", json_object_get(json_msg, "reject-reason"));
 	json_object_set(val, "error", *err_val);
 	json_set_int(val, "errn", err);
 	json_set_string(val, "createdate", cdfield);
@@ -6482,7 +6489,7 @@ static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *
 	client->suggest_diff = sdiff;
 	if (client->diff == sdiff)
 		return;
-	client->diff_change_job_id = client->sdata->workbase_id + 1;
+	client->diff_change_job_id = client->sdata->workbase_id;
 	client->old_diff = client->diff;
 	client->diff = sdiff;
 	stratum_send_diff(ckp->sdata, client);
@@ -7969,7 +7976,7 @@ static void *statsupdate(void *arg)
 					idle_workers++;
 					if (ckp->dropidle && per_tdiff > ckp->dropidle) {
 						/* Drop clients idle for longer than
-						 * ckp->dropidle default 1 hour */
+						 * ckp->dropidle in seconds if set */
 						LOGINFO("Dropping client %"PRId64" due to being idle", client->id);
 						lazy_drop_client(ckp, client);
 					} else if (per_tdiff > 600) {
@@ -8149,8 +8156,11 @@ static void *statsupdate(void *arg)
 
 		ASPRINTF(&fname, "%s/pool/pool.status", ckp->logdir);
 		fp = fopen(fname, "we");
-		if (unlikely(!fp))
+		if (unlikely(!fp)) {
 			LOGERR("Failed to fopen %s", fname);
+			dealloc(fname);
+			goto out_status;
+		}
 		dealloc(fname);
 
 		JSON_CPACK(val, "{si,si,si,si,si,si}",
@@ -8198,6 +8208,7 @@ static void *statsupdate(void *arg)
 		dealloc(s);
 		fclose(fp);
 
+out_status:
 		if (ckp->proxy && sdata->proxy) {
 			proxy_t *proxy, *proxytmp, *subproxy, *subtmp;
 

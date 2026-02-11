@@ -1456,9 +1456,9 @@ static void parse_config(ckpool_t *ckp)
 		sscanf(vmask, "%x", &ckp->version_mask);
 	else
 		ckp->version_mask = 0x1fffe000;
-	/* Default drop clients idle for 1 hour */
-	if (!json_get_int(&ckp->dropidle, json_conf, "dropidle"))
-		ckp->dropidle = 3600;
+
+	/* Default don't drop idle clients */
+	json_get_int(&ckp->dropidle, json_conf, "dropidle");
 	/* Look for an array first and then a single entry */
 	arr_val = json_object_get(json_conf, "serverurl");
 	if (!parse_serverurls(ckp, arr_val)) {

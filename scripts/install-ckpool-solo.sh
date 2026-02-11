@@ -63,7 +63,7 @@ if $PREVIOUS_INSTALL; then
 fi
 
 # Main installation
-echo "Starting installation of Bitcoin Core v29.0 and CKPool-Solo. This requires sudo privileges."
+echo "Starting installation of Bitcoin Core v29.2 and CKPool-Solo. This requires sudo privileges."
 echo "Warning: Bitcoin Core will download up to ~675GB of blockchain data (or less if pruned). Ensure sufficient disk space."
 echo "Important: You cannot mine with CKPool-Solo until the Bitcoin Core blockchain is fully synchronized, which may take days depending on your hardware and network speed."
 
@@ -166,7 +166,7 @@ echo "Enabling persistent journal storage for easier log access..."
 mkdir -p /var/log/journal
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
-# Download and verify Bitcoin Core v29.0 tarball
+# Download and verify Bitcoin Core v29.2 tarball
 BITCOIN_VERSION="29.2"
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
@@ -266,12 +266,12 @@ cat << EOF > /usr/local/bin/wait-for-bitcoind-sync.sh
 echo "Starting wait for bitcoind sync at \$(date)"
 echo "Using config file: $DATADIR/bitcoin.conf"
 while true; do
-    if ! bitcoin-cli -conf="$DATADIR/bitcoin.conf" getblockchaininfo >/dev/null 2>&1; then
+    if ! bitcoin-cli -conf="$DATADIR/bitcoin.conf" -rpcuser=ckpooluser -rpcpassword=$rpc_password getblockchaininfo >/dev/null 2>&1; then
         echo "Waiting for bitcoind to start... at \$(date)"
         sleep 60
         continue
     fi
-    info=\$(bitcoin-cli -conf="$DATADIR/bitcoin.conf" getblockchaininfo 2>/dev/null)
+    info=\$(bitcoin-cli -conf="$DATADIR/bitcoin.conf" -rpcuser=ckpooluser -rpcpassword=$rpc_password getblockchaininfo 2>/dev/null)
     if [ \$? -ne 0 ]; then
         echo "Error querying bitcoind: RPC failure at \$(date)"
         sleep 60
@@ -311,6 +311,8 @@ After=network.target
 User=$service_user
 ExecStart=/usr/local/bin/bitcoind -conf="$DATADIR/bitcoin.conf" -datadir="$DATADIR" -printtoconsole
 Restart=always
+TimeoutSec=120
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
