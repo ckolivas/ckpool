@@ -266,12 +266,12 @@ cat << EOF > /usr/local/bin/wait-for-bitcoind-sync.sh
 echo "Starting wait for bitcoind sync at \$(date)"
 echo "Using config file: $DATADIR/bitcoin.conf"
 while true; do
-    if ! bitcoin-cli -conf="$DATADIR/bitcoin.conf" getblockchaininfo >/dev/null 2>&1; then
+    if ! bitcoin-cli -conf="$DATADIR/bitcoin.conf" -rpcuser=ckpooluser -rpcpassword=$rpc_password getblockchaininfo >/dev/null 2>&1; then
         echo "Waiting for bitcoind to start... at \$(date)"
         sleep 60
         continue
     fi
-    info=\$(bitcoin-cli -conf="$DATADIR/bitcoin.conf" getblockchaininfo 2>/dev/null)
+    info=\$(bitcoin-cli -conf="$DATADIR/bitcoin.conf" -rpcuser=ckpooluser -rpcpassword=$rpc_password getblockchaininfo 2>/dev/null)
     if [ \$? -ne 0 ]; then
         echo "Error querying bitcoind: RPC failure at \$(date)"
         sleep 60
@@ -311,6 +311,8 @@ After=network.target
 User=$service_user
 ExecStart=/usr/local/bin/bitcoind -conf="$DATADIR/bitcoin.conf" -datadir="$DATADIR" -printtoconsole
 Restart=always
+TimeoutSec=120
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
