@@ -339,6 +339,9 @@ static void *p2p_reader(void *arg)
 	uchar *payload;
 	uint32_t plen;
 
+	pthread_detach(pthread_self());
+	rename_proc("ckp2pr");
+
 	while (42) {
 		if (conn->sock < 0) {
 			if (p2p_connect_socket(conn)) {
@@ -435,6 +438,9 @@ static void *p2p_reader(void *arg)
 static void *p2p_keepalive(void *arg)
 {
 	p2p_conn_t *conn = arg;
+
+	pthread_detach(pthread_self());
+	rename_proc("ckp2pk");
 
 	while (42) {
 		uint64_t nonce, nonce_le;
