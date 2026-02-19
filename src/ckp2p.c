@@ -1,0 +1,702 @@
+/*
+ * Copyright 2026 Con Kolivas
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 3 of the License, or (at your option)
+ * any later version.  See COPYING for more details.
+ */
+
+#include "libckpool.h"
+#include "sha2.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define MAX_SUBMITTED_BLOCKS 16
+#define MSG_BLOCK 2
+#define MSG_WITNESS_FLAG (1U << 30)
+#define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
+#define MSG_CMPCT_BLOCK 4
+#define KEEPALIVE_INTERVAL 60
+#define RECONNECT_DELAY 5 // seconds to wait before reconnecting
+
+struct submitted_block {
+	struct submitted_block *next;
+	uchar blockhash[32];
+	uchar *cmpct_payload;
+	uint32_t cmpct_len;
+	uint64_t shortid_nonce;
+};
+
+typedef struct submitted_block submitted_block_t;
+
+typedef struct {
+	int sock;
+	uchar magic[4];
+	uchar genesis[32];
+	const char *netname;
+	bool handshake_done;
+	bool high_bw;
+	cklock_t submitted_lock;
+	submitted_block_t *submitted_blocks;
+	char host[256];
+	int port;
+} p2p_conn_t;
+
+static const struct {
+	const char *name;
+	int port;
+	uchar magic[4];
+	uchar genesis[32];
+} netdefs[] = {
+	{"mainnet",  8333, {0xf9, 0xbe, 0xb4, 0xd9}, {0x6f,0xe2,0x8c,0x0a,0xb6,0xf1,0xb3,0x72,0xc1,0xa6,0xa2,0x46,0xae,0x63,0xf7,0x4f,0x93,0x1e,0x83,0x65,0xe1,0x5a,0x08,0x9c,0x68,0xd6,0x19,0x00,0x00,0x00,0x00,0x00}},
+	{"testnet", 18333, {0x0b, 0x11, 0x09, 0x07}, {0x43,0x49,0x7f,0xd7,0xf8,0x26,0x95,0x71,0x08,0xf4,0xa3,0x0f,0xd9,0xce,0xc3,0xae,0xba,0x79,0x97,0x20,0x84,0xe9,0x0e,0xad,0x01,0xea,0x33,0x09,0x00,0x00,0x00,0x00}},
+	{"signet",  38333, {0x40, 0xcf, 0x03, 0x0a}, {0xdd,0x46,0x00,0x7f,0x9c,0x9d,0x8d,0x56,0xc7,0xd2,0xf5,0xa0,0xd4,0x96,0x6d,0x49,0x02,0x5f,0xdf,0xff,0x95,0x2c,0x42,0x25,0xe9,0x73,0x98,0x81,0x08,0x00,0x00,0x00}},
+	{"regtest", 18444, {0xfa, 0xbf, 0xb5, 0xda}, {0x0f,0x91,0x88,0xf1,0x3c,0xb7,0xb2,0xc7,0x1f,0x2a,0x33,0x5e,0x3a,0x4f,0xc3,0x28,0xbf,0x5b,0xeb,0x43,0x60,0x12,0xaf,0xca,0x59,0x0b,0x1a,0x11,0x46,0x6e,0x22,0x06}},
+	{NULL, 0, {0}}
+};
+
+/* Check if magic is unset (all zeros) */
+static bool magic_unset(const uchar m[4])
+{
+	return m[0] == 0 && m[1] == 0 && m[2] == 0 && m[3] == 0;
+}
+
+static int64_t parse_varint(const uchar *data, uint32_t dlen, uint32_t *pos)
+{
+	if (*pos >= dlen)
+		return -1;
+	uchar c = data[(*pos)++];
+	if (c < 0xfd)
+		return c;
+	if (c == 0xfd) {
+		if (*pos + 2 > dlen)
+			return -1;
+		uint16_t v;
+		memcpy(&v, data + *pos, 2);
+		*pos += 2;
+		return v;
+	} else if (c == 0xfe) {
+		if (*pos + 4 > dlen)
+			return -1;
+		uint32_t v;
+		memcpy(&v, data + *pos, 4);
+		*pos += 4;
+		return v;
+	} else {
+		if (*pos + 8 > dlen)
+			return -1;
+		uint64_t v;
+		memcpy(&v, data + *pos, 8);
+		*pos += 8;
+		return v;
+	}
+}
+
+static void double_sha256_4(uchar chksum[4], const uchar *data, size_t len)
+{
+	uchar h1[32], h2[32];
+	sha256(data, (unsigned int)len, h1);
+	sha256(h1, 32, h2);
+	memcpy(chksum, h2, 4);
+}
+
+static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, uint32_t plen)
+{
+	uchar hdr[24];
+	uchar chksum[4];
+
+	memcpy(hdr, conn->magic, 4);
+	memset(hdr + 4, 0, 12);
+	strncpy((char *)(hdr + 4), cmd, 12);
+	memcpy(hdr + 16, &plen, 4);
+
+	if (plen == 0) {
+		static const uchar empty_chksum[4] = {0x5d, 0xf6, 0xe0, 0xe2};
+		memcpy(chksum, empty_chksum, 4);
+	} else {
+		double_sha256_4(chksum, payload, plen);
+	}
+	memcpy(hdr + 20, chksum, 4);
+
+	if (write(conn->sock, hdr, 24) != 24 ||
+		(plen && write(conn->sock, payload, plen) != (ssize_t)plen))
+		LOGERR("p2p_send(%s) failed", cmd);
+	else
+		LOGNOTICE("Sent %s (%u bytes)", cmd, plen);
+}
+
+static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *plen)
+{
+	uchar hdr[24];
+	uchar rec_magic[4];
+	uchar rec_chksum[4];
+
+	ssize_t nread = read(conn->sock, hdr, 24);
+	if (nread != 24) {
+		if (nread == 0) {
+			LOGERR("Peer closed connection");
+		} else {
+			LOGERR("Failed to read message header (%s)", strerror(errno));
+		}
+		return false;
+	}
+
+	memcpy(rec_magic, hdr, 4);
+	if (magic_unset(conn->magic)) {
+		memcpy(conn->magic, rec_magic, 4);
+		LOGNOTICE("Auto-detected network magic %02x%02x%02x%02x", rec_magic[0], rec_magic[1], rec_magic[2], rec_magic[3]);
+	} else if (memcmp(rec_magic, conn->magic, 4)) {
+		LOGERR("Magic mismatch");
+		return false;
+	}
+
+	memcpy(cmd, hdr + 4, 12); cmd[12] = 0;
+	memcpy(plen, hdr + 16, 4);
+	memcpy(rec_chksum, hdr + 20, 4);
+
+	if (*plen == 0) {
+		*payload = NULL;
+		static const uchar empty_chksum[4] = {0x5d, 0xf6, 0xe0, 0xe2};
+		if (memcmp(rec_chksum, empty_chksum, 4)) {
+			LOGERR("Checksum fail on %s (empty)", cmd);
+			return false;
+		}
+		return true;
+	}
+
+	*payload = ckalloc(*plen);
+	if (read(conn->sock, *payload, *plen) != (ssize_t)*plen) {
+		dealloc(*payload);
+		return false;
+	}
+	uchar calc_chksum[4];
+	double_sha256_4(calc_chksum, *payload, *plen);
+	if (memcmp(calc_chksum, rec_chksum, 4)) {
+		LOGERR("Checksum fail on %s", cmd);
+		dealloc(*payload);
+		return false;
+	}
+	return true;
+}
+
+static void handle_ping(p2p_conn_t *conn, uchar *payload, uint32_t len)
+{
+	if (len == 8)
+		p2p_send(conn, "pong", payload, len);
+	if (payload) dealloc(payload);
+}
+
+static void handle_sendcmpct(p2p_conn_t *conn, uchar *payload, uint32_t len)
+{
+	if (len == 9) {
+		bool announce = (payload[0] != 0);
+		uint64_t ver;
+		memcpy(&ver, payload + 1, 8);
+		if (ver == 1 || ver == 2) {
+			conn->high_bw = announce;
+			LOGINFO("Peer SENDCMPCT v%llu high-bw=%d", (unsigned long long)ver, conn->high_bw);
+		}
+	}
+	if (payload) dealloc(payload);
+}
+
+static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
+{
+	uint32_t pos = 0;
+	int64_t count = parse_varint(payload, plen, &pos);
+	if (count < 0 || count > 500) { // basic sanity
+		dealloc(payload);
+		return;
+	}
+	for (int64_t i = 0; i < count; i++) {
+		if (pos + 36 > plen)
+			break;
+		uint32_t type;
+		memcpy(&type, payload + pos, 4);
+		pos += 4;
+		uchar hash[32];
+		memcpy(hash, payload + pos, 32);
+		pos += 32;
+		if (type != MSG_CMPCT_BLOCK) {
+			uchar nf_payload[37];
+			nf_payload[0] = 1;
+			memcpy(nf_payload + 1, &type, 4);
+			memcpy(nf_payload + 5, hash, 32);
+			p2p_send(conn, "notfound", nf_payload, 37);
+			continue;
+		}
+		ck_rlock(&conn->submitted_lock);
+		for (submitted_block_t *sb = conn->submitted_blocks; sb; sb = sb->next) {
+			if (!memcmp(sb->blockhash, hash, 32)) {
+				p2p_send(conn, "cmpctblock", sb->cmpct_payload, sb->cmpct_len);
+				break;
+			}
+		}
+		ck_runlock(&conn->submitted_lock);
+	}
+	dealloc(payload);
+}
+
+static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
+{
+	if (plen < 32) {
+		dealloc(payload);
+		return;
+	}
+	uchar nf_payload[37];
+	nf_payload[0] = 1;
+	uint32_t type = MSG_BLOCK;
+	memcpy(nf_payload + 1, &type, 4);
+	memcpy(nf_payload + 5, payload, 32); // blockhash
+	p2p_send(conn, "notfound", nf_payload, 37);
+	LOGDEBUG("GETBLOCKTXN - sent NOTFOUND for block");
+	dealloc(payload);
+}
+
+static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
+{
+	uint32_t pos = 0;
+	bool has_block = false;
+	int64_t count = parse_varint(payload, plen, &pos);
+	if (count < 0 || count > 500) {
+		dealloc(payload);
+		return;
+	}
+	for (int64_t i = 0; i < count; i++) {
+		if (pos + 36 > plen)
+			break;
+		uint32_t type;
+		memcpy(&type, payload + pos, 4);
+		pos += 4;
+		uchar hash[32];
+		memcpy(hash, payload + pos, 32);
+		pos += 32;
+		if (type == MSG_BLOCK || type == MSG_WITNESS_BLOCK) {
+			has_block = true;
+			uint32_t req_type = MSG_CMPCT_BLOCK;
+			uchar getdata_payload[37];
+			getdata_payload[0] = 1;
+			memcpy(getdata_payload + 1, &req_type, 4);
+			memcpy(getdata_payload + 5, hash, 32);
+			p2p_send(conn, "getdata", getdata_payload, 37);
+		}
+	}
+	if (has_block)
+		LOGNOTICE("Received INV (%u bytes) - requesting cmpctblock for blocks", plen);
+	else
+		LOGDEBUG("Received INV (%u bytes) - ignoring transaction announcements", plen);
+	dealloc(payload);
+}
+
+static void sample_submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce);
+
+static void handle_cmpctblock(p2p_conn_t *conn, uchar *payload, uint32_t plen)
+{
+	if (plen < 88) {
+		dealloc(payload);
+		return;
+	}
+	uchar header[80];
+	memcpy(header, payload, 80);
+	uchar h1[32], blockhash[32];
+	sha256(header, 80, h1);
+	sha256(h1, 32, blockhash);
+	uint64_t shortid_nonce;
+	memcpy(&shortid_nonce, payload + 80, 8);
+	sample_submit_compact_block(conn, blockhash, payload, plen, shortid_nonce);
+	dealloc(payload);
+}
+
+static bool p2p_connect_socket(p2p_conn_t *conn);
+
+static bool do_handshake(p2p_conn_t *conn, int port);
+
+static void *p2p_reader(void *arg)
+{
+	p2p_conn_t *conn = arg;
+	char cmd[13];
+	uchar *payload;
+	uint32_t plen;
+
+	while (42) {
+		if (conn->sock < 0) {
+			if (p2p_connect_socket(conn)) {
+				if (do_handshake(conn, conn->port)) {
+					// continue to recv loop
+				} else {
+					close(conn->sock);
+					conn->sock = -1;
+				}
+			}
+			if (conn->sock < 0) {
+				sleep(RECONNECT_DELAY);
+				continue;
+			}
+		}
+
+		if (!p2p_recv(conn, cmd, &payload, &plen)) {
+			LOGERR("P2P recv failed - disconnecting");
+			close(conn->sock);
+			conn->sock = -1;
+			conn->handshake_done = false;
+			continue;
+		}
+
+		// Log all received messages with descriptive type, even if ignoring
+		if (!strcmp(cmd, "version")) {
+			LOGNOTICE("Received VERSION (%u bytes) - handling for handshake", plen);
+		} else if (!strcmp(cmd, "verack")) {
+			LOGNOTICE("Received VERACK (%u bytes) - handling for handshake", plen);
+		} else if (!strcmp(cmd, "ping")) {
+			LOGNOTICE("Received PING (%u bytes) - replying with PONG", plen);
+			handle_ping(conn, payload, plen);
+			continue; // Skip dealloc since handler does it
+		} else if (!strcmp(cmd, "pong")) {
+			LOGNOTICE("Received PONG (%u bytes) - ignoring (keep-alive response)", plen);
+		} else if (!strcmp(cmd, "sendcmpct")) {
+			LOGNOTICE("Received SENDCMPCT (%u bytes) - handling compact block negotiation", plen);
+			handle_sendcmpct(conn, payload, plen);
+			continue; // Skip dealloc since handler does it
+		} else if (!strcmp(cmd, "getdata")) {
+			LOGNOTICE("Received GETDATA (%u bytes) - handling (request for compact block or tx)", plen);
+			handle_getdata(conn, payload, plen);
+			continue; // Skip dealloc since handler does it
+		} else if (!strcmp(cmd, "getblocktxn")) {
+			LOGNOTICE("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
+			handle_getblocktxn(conn, payload, plen);
+			continue; // Skip dealloc since handler does it
+		} else if (!strcmp(cmd, "inv")) {
+			handle_inv(conn, payload, plen);
+			continue;
+		} else if (!strcmp(cmd, "headers")) {
+			LOGNOTICE("Received HEADERS (%u bytes) - ignoring (block headers announcement)", plen);
+		} else if (!strcmp(cmd, "cmpctblock")) {
+			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - handling (resend for validity check)", plen);
+			handle_cmpctblock(conn, payload, plen);
+			continue;
+		} else if (!strcmp(cmd, "tx")) {
+			LOGNOTICE("Received TX (%u bytes) - ignoring (transaction data)", plen);
+		} else if (!strcmp(cmd, "block")) {
+			LOGNOTICE("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
+		} else if (!strcmp(cmd, "blocktxn")) {
+			LOGNOTICE("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
+		} else if (!strcmp(cmd, "getheaders")) {
+			LOGNOTICE("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
+		} else if (!strcmp(cmd, "getblocks")) {
+			LOGNOTICE("Received GETBLOCKS (%u bytes) - ignoring (blocks request)", plen);
+		} else if (!strcmp(cmd, "getaddr")) {
+			LOGNOTICE("Received GETADDR (%u bytes) - ignoring (peer discovery request)", plen);
+		} else if (!strcmp(cmd, "addr")) {
+			LOGNOTICE("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
+		} else if (!strcmp(cmd, "addrv2")) {
+			LOGNOTICE("Received ADDRV2 (%u bytes) - ignoring (peer addresses v2)", plen);
+		} else if (!strcmp(cmd, "feefilter")) {
+			LOGNOTICE("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
+		} else if (!strcmp(cmd, "reject")) {
+			LOGNOTICE("Received REJECT (%u bytes) - ignoring (rejection message)", plen);
+		} else if (!strcmp(cmd, "notfound")) {
+			LOGNOTICE("Received NOTFOUND (%u bytes) - ignoring (item not found)", plen);
+		} else if (!strcmp(cmd, "wtxidrelay")) {
+			LOGNOTICE("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
+		} else if (!strcmp(cmd, "sendaddrv2")) {
+			LOGNOTICE("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
+		} else {
+			LOGNOTICE("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
+		}
+
+		if (payload) dealloc(payload);
+	}
+	return NULL;
+}
+
+static void *p2p_keepalive(void *arg)
+{
+	p2p_conn_t *conn = arg;
+
+	while (42) {
+		sleep(KEEPALIVE_INTERVAL);
+		if (!conn->handshake_done || conn->sock < 0) continue;
+
+		uint64_t nonce = ((uint64_t)rand() << 32) | rand();
+		p2p_send(conn, "ping", (uchar *)&nonce, 8);
+	}
+	return NULL;
+}
+
+static bool do_handshake(p2p_conn_t *conn, int port)
+{
+	uchar version_payload[97];
+	memset(version_payload, 0, sizeof(version_payload));
+	int off = 0;
+
+	int32_t nversion = 70016;
+	memcpy(version_payload + off, &nversion, sizeof(nversion));
+	off += sizeof(nversion);
+
+	uint64_t services = 9ULL;
+	memcpy(version_payload + off, &services, sizeof(services));
+	off += sizeof(services);
+
+	int64_t ntime = (int64_t)time(NULL);
+	memcpy(version_payload + off, &ntime, sizeof(ntime));
+	off += sizeof(ntime);
+
+	// addr_recv: services 9, IPv4-mapped 127.0.0.1, port
+	uint64_t recv_services = services;
+	memcpy(version_payload + off, &recv_services, sizeof(recv_services));
+	off += sizeof(recv_services);
+	uchar recv_ip[16] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0x7f,0x00,0x00,0x01};
+	memcpy(version_payload + off, recv_ip, 16);
+	off += 16;
+	uint16_t recv_port = htons(port);
+	memcpy(version_payload + off, &recv_port, sizeof(recv_port));
+	off += sizeof(recv_port);
+
+	// addr_from: services 9, all zeros ip, port 0 (dummy to prevent self-connection)
+	memcpy(version_payload + off, &services, sizeof(services));
+	off += sizeof(services);
+	memset(version_payload + off, 0, 16); // ip all zero
+	off += 16;
+	uint16_t from_port = htons(0);
+	memcpy(version_payload + off, &from_port, sizeof(from_port));
+	off += sizeof(from_port);
+
+	// nonce: random
+	uint64_t nnonce = ((uint64_t)rand() << 32) | rand();
+	memcpy(version_payload + off, &nnonce, sizeof(nnonce));
+	off += sizeof(nnonce);
+
+	// user_agent
+	const char *ua = "/ckp2p:1.0/";
+	uchar ualen = (uchar)strlen(ua);
+	version_payload[off++] = ualen;
+	memcpy(version_payload + off, ua, ualen);
+	off += ualen;
+
+	// start_height: 0
+	int32_t height = 0;
+	memcpy(version_payload + off, &height, sizeof(height));
+	off += sizeof(height);
+
+	// relay: 1 (to enable TX relay and unsolicited INV/TX)
+	version_payload[off++] = 1;
+
+	p2p_send(conn, "version", version_payload, sizeof(version_payload));
+
+	char cmd[13];
+	uchar *payload;
+	uint32_t plen;
+
+	LOGNOTICE("Waiting for VERSION from peer...");
+
+	while (42) {
+		if (!p2p_recv(conn, cmd, &payload, &plen))
+			return false;
+		LOGNOTICE("Received %s (%u bytes)", cmd, plen);
+		if (!strcmp(cmd, "version")) {
+			LOGNOTICE("Received VERSION from peer");
+			dealloc(payload);
+			break;
+		}
+		if (payload) dealloc(payload);
+	}
+
+	p2p_send(conn, "wtxidrelay", NULL, 0);
+	p2p_send(conn, "sendaddrv2", NULL, 0);
+
+	uchar sc[9] = {0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // high_bw=1, ver=2
+	p2p_send(conn, "sendcmpct", sc, 9);
+
+	p2p_send(conn, "verack", NULL, 0);
+
+	while (42) {
+		if (!p2p_recv(conn, cmd, &payload, &plen))
+			return false;
+		LOGNOTICE("Received %s (%u bytes)", cmd, plen);
+		if (!strcmp(cmd, "verack")) {
+			LOGNOTICE("Received VERACK - handshake complete");
+			dealloc(payload);
+			break;
+		}
+		if (payload) dealloc(payload);
+	}
+
+	conn->handshake_done = true;
+	LOGNOTICE("P2P handshake complete on %s - ready for compact blocks", conn->netname);
+
+	// Send getheaders with genesis locator and zero stop to request up to 2000 headers
+	uchar gethdr_payload[69];
+	memset(gethdr_payload, 0, sizeof(gethdr_payload));
+	int32_t protover = 70016;
+	memcpy(gethdr_payload, &protover, 4);
+	gethdr_payload[4] = 1; // hash_count varint=1
+	memcpy(gethdr_payload + 5, conn->genesis, 32);
+	// hash_stop remains all zeros
+	p2p_send(conn, "getheaders", gethdr_payload, sizeof(gethdr_payload));
+
+	return true;
+}
+
+void sample_submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce)
+{
+	if (!conn) {
+		LOGERR("Cannot submit - no P2P connection object");
+		return;
+	}
+
+	if (conn->sock < 0 || !conn->handshake_done) {
+		LOGINFO("Connection not active - reconnecting for submission");
+		if (p2p_connect_socket(conn)) {
+			if (!do_handshake(conn, conn->port)) {
+				LOGERR("Reconnect failed - cannot submit");
+				close(conn->sock);
+				conn->sock = -1;
+				conn->handshake_done = false;
+				return;
+			}
+		} else {
+			LOGERR("Reconnect failed - cannot submit");
+			return;
+		}
+	}
+
+	submitted_block_t *sb = ckzalloc(sizeof(*sb));
+	memcpy(sb->blockhash, blockhash, 32);
+	sb->cmpct_payload = ckalloc(cmpct_len);
+	memcpy(sb->cmpct_payload, cmpct_payload, cmpct_len);
+	sb->cmpct_len = cmpct_len;
+	sb->shortid_nonce = shortid_nonce;
+
+	ck_wlock(&conn->submitted_lock);
+	sb->next = conn->submitted_blocks;
+	conn->submitted_blocks = sb;
+
+	submitted_block_t *tmp = conn->submitted_blocks, *prev = NULL;
+	int count = 0;
+	while (tmp) {
+		if (++count > MAX_SUBMITTED_BLOCKS) {
+			if (prev) prev->next = NULL;
+			dealloc(tmp->cmpct_payload);
+			dealloc(tmp);
+			break;
+		}
+		prev = tmp;
+		tmp = tmp->next;
+	}
+	ck_wunlock(&conn->submitted_lock);
+
+	p2p_send(conn, "cmpctblock", cmpct_payload, cmpct_len);
+
+	char *hex = bin2hex(blockhash, 32);
+	LOGINFO("Submitted compact block %s", hex);
+	dealloc(hex);
+}
+
+p2p_conn_t *ckp2p_connect(const char *host, int port)
+{
+	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
+	cklock_init(&conn->submitted_lock);
+	conn->submitted_blocks = NULL;
+	conn->sock = -1;
+	strncpy(conn->host, host, sizeof(conn->host) - 1);
+	conn->port = port;
+	memset(conn->magic, 0, 4); // unset
+
+	int i;
+	for (i = 0; netdefs[i].name; i++) {
+		if (netdefs[i].port == port) {
+			memcpy(conn->magic, netdefs[i].magic, 4);
+			memcpy(conn->genesis, netdefs[i].genesis, 32);
+			conn->netname = netdefs[i].name;
+			break;
+		}
+	}
+	if (!conn->netname) {
+		memcpy(conn->magic, netdefs[0].magic, 4);
+		memcpy(conn->genesis, netdefs[0].genesis, 32);
+		conn->netname = netdefs[0].name;
+	}
+
+	if (!p2p_connect_socket(conn)) goto err;
+
+	if (!do_handshake(conn, port)) goto err;
+
+	pthread_t reader_thread;
+	create_pthread(&reader_thread, p2p_reader, conn);
+
+	pthread_t keepalive_thread;
+	create_pthread(&keepalive_thread, p2p_keepalive, conn);
+
+	return conn;
+
+err:
+	if (conn->sock >= 0) close(conn->sock);
+	dealloc(conn);
+	return NULL;
+}
+
+static bool p2p_connect_socket(p2p_conn_t *conn)
+{
+	conn->sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (conn->sock < 0) {
+		LOGERR("socket() failed");
+		return false;
+	}
+
+	struct sockaddr_in sa = {0};
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(conn->port);
+	if (inet_pton(AF_INET, conn->host, &sa.sin_addr) <= 0) {
+		struct hostent *h = gethostbyname(conn->host);
+		if (!h) {
+			close(conn->sock);
+			conn->sock = -1;
+			return false;
+		}
+		memcpy(&sa.sin_addr, h->h_addr, h->h_length);
+	}
+
+	if (connect(conn->sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		LOGERR("connect failed: %s", strerror(errno));
+		close(conn->sock);
+		conn->sock = -1;
+		return false;
+	}
+
+	LOGNOTICE("ckp2p connected to %s:%d (%s)", conn->host, conn->port, conn->netname);
+
+	usleep(10000);
+
+	return true;
+}
+
+int main(int argc, char **argv)
+{
+	srand((unsigned int)time(NULL));
+
+	if (argc < 2) {
+		fprintf(stderr, "Usage: %s <host:port>\n", argv[0]);
+		return 1;
+	}
+
+	char host[256] = "127.0.0.1";
+	int port = 8333;
+	sscanf(argv[1], "%255[^:]:%d", host, &port);
+
+	p2p_conn_t *conn = ckp2p_connect(host, port);
+	if (!conn) return 1;
+
+	LOGNOTICE("ckp2p running - ready for sample_submit_compact_block() calls from upstream ckpool");
+	while (42) sleep(60);
+
+	return 0;
+}
