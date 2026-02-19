@@ -1273,7 +1273,7 @@ static void parse_btcds(ckpool_t *ckp, const json_t *arr_val, const int arr_size
 		json_get_configstring(&ckp->btcdauth[i], val, "auth");
 		json_get_configstring(&ckp->btcdpass[i], val, "pass");
 		json_get_bool(&ckp->btcdnotify[i], val, "notify");
-		json_get_configstring(&ckp->p2purl[i], val, "p2purl");
+		json_get_string(&ckp->p2purl[i], val, "p2purl");
 	}
 }
 

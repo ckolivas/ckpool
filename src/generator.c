@@ -3322,6 +3322,17 @@ static void setup_servers(ckpool_t *ckp)
 		cs->ckp = ckp;
 		cksem_init(&cs->sem);
 		cksem_post(&cs->sem);
+
+		cs = &si->p2pcs;
+		if (!extract_sockaddr(si->p2purl, &cs->url, &cs->port)) {
+			LOGEMERG("Failed to extract address from p2purl %s", si->p2purl);
+			exit(1);
+		}
+		si->p2pconn = ckp2p_connect(cs->url, cs->port);
+		if (!si->p2pconn) {
+			LOGEMERG("Failed to ckp2p_connect in setup_servers");
+			exit(1);
+		}
 	}
 
 	create_pthread(&pth_watchdog, server_watchdog, ckp);

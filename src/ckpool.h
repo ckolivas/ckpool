@@ -125,6 +125,7 @@ struct server_instance {
 	connsock_t cs;
 
 	char *p2purl;
+	connsock_t p2pcs;
 	p2p_conn_t *p2pconn;
 };
 

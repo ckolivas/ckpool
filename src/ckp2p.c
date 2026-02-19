@@ -593,9 +593,11 @@ void submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar 
 	dealloc(hex);
 }
 
-p2p_conn_t *ckp2p_connect(const char *host, int port)
+p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
+	int port;
+
 	if (!conn) {
 		LOGERR("OOM in ckp2p_connect");
 		return NULL;
@@ -605,6 +607,7 @@ p2p_conn_t *ckp2p_connect(const char *host, int port)
 	conn->has_block = false;
 	conn->sock = -1;
 	strncpy(conn->host, host, sizeof(conn->host) - 1);
+	sscanf(charport, "%d", &port);
 	conn->port = port;
 	memset(conn->magic, 0, 4); // unset
 
