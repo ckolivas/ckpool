@@ -1266,14 +1266,12 @@ static void parse_btcds(ckpool_t *ckp, const json_t *arr_val, const int arr_size
 	ckp->btcdauth = ckzalloc(sizeof(char *) * arr_size);
 	ckp->btcdpass = ckzalloc(sizeof(char *) * arr_size);
 	ckp->btcdnotify = ckzalloc(sizeof(bool *) * arr_size);
-	ckp->p2purl = ckzalloc(sizeof(char *) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		val = json_array_get(arr_val, i);
 		json_get_configstring(&ckp->btcdurl[i], val, "url");
 		json_get_configstring(&ckp->btcdauth[i], val, "auth");
 		json_get_configstring(&ckp->btcdpass[i], val, "pass");
 		json_get_bool(&ckp->btcdnotify[i], val, "notify");
-		json_get_string(&ckp->p2purl[i], val, "p2purl");
 	}
 }
 
@@ -1443,6 +1441,7 @@ static void parse_config(ckpool_t *ckp)
 		if (arr_size)
 			parse_btcds(ckp, arr_val, arr_size);
 	}
+	json_get_string(&ckp->p2purl, json_conf, "p2purl");
 	json_get_string(&ckp->btcaddress, json_conf, "btcaddress");
 	json_get_string(&ckp->btcsig, json_conf, "btcsig");
 	if (ckp->btcsig && strlen(ckp->btcsig) > 38) {
@@ -1747,7 +1746,6 @@ int main(int argc, char **argv)
 		ckp.btcdauth = ckzalloc(sizeof(char *));
 		ckp.btcdpass = ckzalloc(sizeof(char *));
 		ckp.btcdnotify = ckzalloc(sizeof(bool));
-		ckp.p2purl = ckzalloc(sizeof(char *));
 	}
 	for (i = 0; i < ckp.btcds; i++) {
 		if (!ckp.btcdurl[i])
@@ -1756,9 +1754,9 @@ int main(int argc, char **argv)
 			ckp.btcdauth[i] = strdup("user");
 		if (!ckp.btcdpass[i])
 			ckp.btcdpass[i] = strdup("pass");
-		if (!ckp.p2purl[i])
-			ckp.p2purl[i] = strdup("localhost:8333");
 	}
+	if (!ckp.p2purl)
+		ckp.p2purl = strdup("localhost:8333");
 
 	ckp.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
 
@@ -1902,6 +1900,10 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &handler, NULL);
 
 	/* Launch separate processes from here */
+	if (prepare_ckp2p(&ckp)) {
+		LOGEMERG("Failed to start ckp2p2, exiting");
+		exit(1);
+	}
 	prepare_child(&ckp, &ckp.generator, generator, "generator");
 	prepare_child(&ckp, &ckp.stratifier, stratifier, "stratifier");
 	prepare_child(&ckp, &ckp.connector, connector, "connector");

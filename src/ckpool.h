@@ -18,12 +18,13 @@
 
 #include "libckpool.h"
 #include "uthash.h"
-#include "ckp2p.h"
 
 #define RPC_TIMEOUT 60
 
 struct ckpool_instance;
 typedef struct ckpool_instance ckpool_t;
+
+#include "ckp2p.h"
 
 struct ckmsg {
 	struct ckmsg *next;
@@ -123,10 +124,6 @@ struct server_instance {
 	bool notify;
 	bool alive;
 	connsock_t cs;
-
-	char *p2purl;
-	connsock_t p2pcs;
-	p2p_conn_t *p2pconn;
 };
 
 typedef struct server_instance server_instance_t;
@@ -238,7 +235,9 @@ struct ckpool_instance {
 	int nonce2length; // Extranonce2 length
 
 	/* p2p bitcoind data */
-	char **p2purl;
+	char *p2purl;
+	connsock_t p2pcs;
+	p2p_conn_t *p2pconn;
 
 	/* Difficulty settings */
 	int64_t mindiff; // Default 1

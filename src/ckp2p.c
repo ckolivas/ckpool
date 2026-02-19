@@ -9,7 +9,7 @@
 
 #include "libckpool.h"
 #include "sha2.h"
-#include "ckp2p.h"
+#include "ckpool.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -624,7 +624,7 @@ void submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar 
 	dealloc(hex);
 }
 
-p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
+static p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
 	int port, i;
@@ -708,4 +708,21 @@ static bool p2p_connect_socket(p2p_conn_t *conn)
 	LOGNOTICE("ckp2p connected to %s:%d (%s)", conn->host, conn->port, conn->netname);
 
 	return true;
+}
+
+int prepare_ckp2p(ckpool_t *ckp)
+{
+	connsock_t *cs;
+
+	cs = &ckp->p2pcs;
+	if (!extract_sockaddr(ckp->p2purl, &cs->url, &cs->port)) {
+		LOGEMERG("Failed to extract address from p2purl %s", ckp->p2purl);
+		return -1;
+	}
+	ckp->p2pconn = ckp2p_connect(cs->url, cs->port);
+	if (!ckp->p2pconn) {
+		LOGEMERG("Failed to ckp2p_connect in setup_servers");
+		return -1;
+	}
+	return 0;
 }
