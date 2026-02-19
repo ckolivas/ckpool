@@ -3316,6 +3316,7 @@ static void setup_servers(ckpool_t *ckp)
 		si->auth = ckp->btcdauth[i];
 		si->pass = ckp->btcdpass[i];
 		si->notify = ckp->btcdnotify[i];
+		si->p2purl = ckp->p2purl[i];
 		si->id = i;
 		cs = &si->cs;
 		cs->ckp = ckp;

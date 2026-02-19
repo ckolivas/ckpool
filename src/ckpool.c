@@ -1266,12 +1266,14 @@ static void parse_btcds(ckpool_t *ckp, const json_t *arr_val, const int arr_size
 	ckp->btcdauth = ckzalloc(sizeof(char *) * arr_size);
 	ckp->btcdpass = ckzalloc(sizeof(char *) * arr_size);
 	ckp->btcdnotify = ckzalloc(sizeof(bool *) * arr_size);
+	ckp->p2purl = ckzalloc(sizeof(char *) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		val = json_array_get(arr_val, i);
 		json_get_configstring(&ckp->btcdurl[i], val, "url");
 		json_get_configstring(&ckp->btcdauth[i], val, "auth");
 		json_get_configstring(&ckp->btcdpass[i], val, "pass");
 		json_get_bool(&ckp->btcdnotify[i], val, "notify");
+		json_get_configstring(&ckp->p2purl[i], val, "p2purl");
 	}
 }
 
@@ -1745,6 +1747,7 @@ int main(int argc, char **argv)
 		ckp.btcdauth = ckzalloc(sizeof(char *));
 		ckp.btcdpass = ckzalloc(sizeof(char *));
 		ckp.btcdnotify = ckzalloc(sizeof(bool));
+		ckp.p2purl = ckzalloc(sizeof(char *));
 	}
 	for (i = 0; i < ckp.btcds; i++) {
 		if (!ckp.btcdurl[i])
@@ -1753,6 +1756,8 @@ int main(int argc, char **argv)
 			ckp.btcdauth[i] = strdup("user");
 		if (!ckp.btcdpass[i])
 			ckp.btcdpass[i] = strdup("pass");
+		if (!ckp.p2purl[i])
+			ckp.p2purl[i] = strdup("localhost:8333");
 	}
 
 	ckp.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";

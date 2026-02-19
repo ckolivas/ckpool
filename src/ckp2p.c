@@ -9,6 +9,7 @@
 
 #include "libckpool.h"
 #include "sha2.h"
+#include "ckp2p.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -19,37 +20,14 @@
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
+#include <endian.h>
 
-#define MAX_SUBMITTED_BLOCKS 16
 #define MSG_BLOCK 2
 #define MSG_WITNESS_FLAG (1U << 30)
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
 #define RECONNECT_DELAY 5 // seconds to wait before reconnecting
-
-struct submitted_block {
-	struct submitted_block *next;
-	uchar blockhash[32];
-	uchar *cmpct_payload;
-	uint32_t cmpct_len;
-	uint64_t shortid_nonce;
-};
-
-typedef struct submitted_block submitted_block_t;
-
-typedef struct {
-	int sock;
-	uchar magic[4];
-	uchar genesis[32];
-	const char *netname;
-	bool handshake_done;
-	bool high_bw;
-	cklock_t submitted_lock;
-	submitted_block_t *submitted_blocks;
-	char host[256];
-	int port;
-} p2p_conn_t;
 
 static const struct {
 	const char *name;
@@ -61,7 +39,7 @@ static const struct {
 	{"testnet", 18333, {0x0b, 0x11, 0x09, 0x07}, {0x43,0x49,0x7f,0xd7,0xf8,0x26,0x95,0x71,0x08,0xf4,0xa3,0x0f,0xd9,0xce,0xc3,0xae,0xba,0x79,0x97,0x20,0x84,0xe9,0x0e,0xad,0x01,0xea,0x33,0x09,0x00,0x00,0x00,0x00}},
 	{"signet",  38333, {0x40, 0xcf, 0x03, 0x0a}, {0xdd,0x46,0x00,0x7f,0x9c,0x9d,0x8d,0x56,0xc7,0xd2,0xf5,0xa0,0xd4,0x96,0x6d,0x49,0x02,0x5f,0xdf,0xff,0x95,0x2c,0x42,0x25,0xe9,0x73,0x98,0x81,0x08,0x00,0x00,0x00}},
 	{"regtest", 18444, {0xfa, 0xbf, 0xb5, 0xda}, {0x0f,0x91,0x88,0xf1,0x3c,0xb7,0xb2,0xc7,0x1f,0x2a,0x33,0x5e,0x3a,0x4f,0xc3,0x28,0xbf,0x5b,0xeb,0x43,0x60,0x12,0xaf,0xca,0x59,0x0b,0x1a,0x11,0x46,0x6e,0x22,0x06}},
-	{NULL, 0, {0}}
+	{NULL, 0, {0}, {0}}
 };
 
 /* Check if magic is unset (all zeros) */
@@ -80,22 +58,25 @@ static int64_t parse_varint(const uchar *data, uint32_t dlen, uint32_t *pos)
 	if (c == 0xfd) {
 		if (*pos + 2 > dlen)
 			return -1;
-		uint16_t v;
-		memcpy(&v, data + *pos, 2);
+		uint16_t v_le;
+		memcpy(&v_le, data + *pos, 2);
+		uint16_t v = le16toh(v_le);
 		*pos += 2;
 		return v;
 	} else if (c == 0xfe) {
 		if (*pos + 4 > dlen)
 			return -1;
-		uint32_t v;
-		memcpy(&v, data + *pos, 4);
+		uint32_t v_le;
+		memcpy(&v_le, data + *pos, 4);
+		uint32_t v = le32toh(v_le);
 		*pos += 4;
 		return v;
 	} else {
 		if (*pos + 8 > dlen)
 			return -1;
-		uint64_t v;
-		memcpy(&v, data + *pos, 8);
+		uint64_t v_le;
+		memcpy(&v_le, data + *pos, 8);
+		uint64_t v = le64toh(v_le);
 		*pos += 8;
 		return v;
 	}
@@ -117,7 +98,8 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 	memcpy(hdr, conn->magic, 4);
 	memset(hdr + 4, 0, 12);
 	strncpy((char *)(hdr + 4), cmd, 12);
-	memcpy(hdr + 16, &plen, 4);
+	uint32_t plen_le = htole32(plen);
+	memcpy(hdr + 16, &plen_le, 4);
 
 	if (plen == 0) {
 		static const uchar empty_chksum[4] = {0x5d, 0xf6, 0xe0, 0xe2};
@@ -160,7 +142,9 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 	}
 
 	memcpy(cmd, hdr + 4, 12); cmd[12] = 0;
-	memcpy(plen, hdr + 16, 4);
+	uint32_t plen_le;
+	memcpy(&plen_le, hdr + 16, 4);
+	*plen = le32toh(plen_le);
 	memcpy(rec_chksum, hdr + 20, 4);
 
 	if (*plen == 0) {
@@ -174,6 +158,10 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 	}
 
 	*payload = ckalloc(*plen);
+	if (!*payload) {
+		LOGERR("OOM in p2p_recv");
+		return false;
+	}
 	if (read(conn->sock, *payload, *plen) != (ssize_t)*plen) {
 		dealloc(*payload);
 		return false;
@@ -199,8 +187,9 @@ static void handle_sendcmpct(p2p_conn_t *conn, uchar *payload, uint32_t len)
 {
 	if (len == 9) {
 		bool announce = (payload[0] != 0);
-		uint64_t ver;
-		memcpy(&ver, payload + 1, 8);
+		uint64_t ver_le;
+		memcpy(&ver_le, payload + 1, 8);
+		uint64_t ver = le64toh(ver_le);
 		if (ver == 1 || ver == 2) {
 			conn->high_bw = announce;
 			LOGINFO("Peer SENDCMPCT v%llu high-bw=%d", (unsigned long long)ver, conn->high_bw);
@@ -220,8 +209,9 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	for (int64_t i = 0; i < count; i++) {
 		if (pos + 36 > plen)
 			break;
-		uint32_t type;
-		memcpy(&type, payload + pos, 4);
+		uint32_t type_le;
+		memcpy(&type_le, payload + pos, 4);
+		uint32_t type = le32toh(type_le);
 		pos += 4;
 		uchar hash[32];
 		memcpy(hash, payload + pos, 32);
@@ -229,19 +219,17 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		if (type != MSG_CMPCT_BLOCK) {
 			uchar nf_payload[37];
 			nf_payload[0] = 1;
-			memcpy(nf_payload + 1, &type, 4);
+			uint32_t type_le = htole32(type);
+			memcpy(nf_payload + 1, &type_le, 4);
 			memcpy(nf_payload + 5, hash, 32);
 			p2p_send(conn, "notfound", nf_payload, 37);
 			continue;
 		}
-		ck_rlock(&conn->submitted_lock);
-		for (submitted_block_t *sb = conn->submitted_blocks; sb; sb = sb->next) {
-			if (!memcmp(sb->blockhash, hash, 32)) {
-				p2p_send(conn, "cmpctblock", sb->cmpct_payload, sb->cmpct_len);
-				break;
-			}
+		ck_rlock(&conn->block_lock);
+		if (conn->has_block && !memcmp(conn->blockhash, hash, 32)) {
+			p2p_send(conn, "cmpctblock", conn->cmpct_payload, conn->cmpct_len);
 		}
-		ck_runlock(&conn->submitted_lock);
+		ck_runlock(&conn->block_lock);
 	}
 	dealloc(payload);
 }
@@ -255,7 +243,8 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	uchar nf_payload[37];
 	nf_payload[0] = 1;
 	uint32_t type = MSG_BLOCK;
-	memcpy(nf_payload + 1, &type, 4);
+	uint32_t type_le = htole32(type);
+	memcpy(nf_payload + 1, &type_le, 4);
 	memcpy(nf_payload + 5, payload, 32); // blockhash
 	p2p_send(conn, "notfound", nf_payload, 37);
 	LOGDEBUG("GETBLOCKTXN - sent NOTFOUND for block");
@@ -274,8 +263,9 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	for (int64_t i = 0; i < count; i++) {
 		if (pos + 36 > plen)
 			break;
-		uint32_t type;
-		memcpy(&type, payload + pos, 4);
+		uint32_t type_le;
+		memcpy(&type_le, payload + pos, 4);
+		uint32_t type = le32toh(type_le);
 		pos += 4;
 		uchar hash[32];
 		memcpy(hash, payload + pos, 32);
@@ -285,7 +275,8 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 			uint32_t req_type = MSG_CMPCT_BLOCK;
 			uchar getdata_payload[37];
 			getdata_payload[0] = 1;
-			memcpy(getdata_payload + 1, &req_type, 4);
+			uint32_t req_type_le = htole32(req_type);
+			memcpy(getdata_payload + 1, &req_type_le, 4);
 			memcpy(getdata_payload + 5, hash, 32);
 			p2p_send(conn, "getdata", getdata_payload, 37);
 		}
@@ -297,7 +288,7 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	dealloc(payload);
 }
 
-static void sample_submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce);
+static void submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce);
 
 static void handle_cmpctblock(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
@@ -310,9 +301,10 @@ static void handle_cmpctblock(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	uchar h1[32], blockhash[32];
 	sha256(header, 80, h1);
 	sha256(h1, 32, blockhash);
-	uint64_t shortid_nonce;
-	memcpy(&shortid_nonce, payload + 80, 8);
-	sample_submit_compact_block(conn, blockhash, payload, plen, shortid_nonce);
+	uint64_t shortid_nonce_le;
+	memcpy(&shortid_nonce_le, payload + 80, 8);
+	uint64_t shortid_nonce = le64toh(shortid_nonce_le);
+	submit_compact_block(conn, blockhash, payload, plen, shortid_nonce);
 	dealloc(payload);
 }
 
@@ -427,7 +419,8 @@ static void *p2p_keepalive(void *arg)
 		if (!conn->handshake_done || conn->sock < 0) continue;
 
 		uint64_t nonce = ((uint64_t)rand() << 32) | rand();
-		p2p_send(conn, "ping", (uchar *)&nonce, 8);
+		uint64_t nonce_le = htole64(nonce);
+		p2p_send(conn, "ping", (uchar *)&nonce_le, 8);
 	}
 	return NULL;
 }
@@ -438,32 +431,37 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	memset(version_payload, 0, sizeof(version_payload));
 	int off = 0;
 
-	int32_t nversion = 70016;
-	memcpy(version_payload + off, &nversion, sizeof(nversion));
-	off += sizeof(nversion);
+	uint32_t nversion = 70016;
+	uint32_t nversion_le = htole32(nversion);
+	memcpy(version_payload + off, &nversion_le, sizeof(nversion_le));
+	off += sizeof(nversion_le);
 
 	uint64_t services = 9ULL;
-	memcpy(version_payload + off, &services, sizeof(services));
-	off += sizeof(services);
+	uint64_t services_le = htole64(services);
+	memcpy(version_payload + off, &services_le, sizeof(services_le));
+	off += sizeof(services_le);
 
-	int64_t ntime = (int64_t)time(NULL);
-	memcpy(version_payload + off, &ntime, sizeof(ntime));
-	off += sizeof(ntime);
+	uint64_t ntime = (uint64_t)time(NULL);
+	uint64_t ntime_le = htole64(ntime);
+	memcpy(version_payload + off, &ntime_le, sizeof(ntime_le));
+	off += sizeof(ntime_le);
 
 	// addr_recv: services 9, IPv4-mapped 127.0.0.1, port
 	uint64_t recv_services = services;
-	memcpy(version_payload + off, &recv_services, sizeof(recv_services));
-	off += sizeof(recv_services);
+	uint64_t recv_services_le = htole64(recv_services);
+	memcpy(version_payload + off, &recv_services_le, sizeof(recv_services_le));
+	off += sizeof(recv_services_le);
 	uchar recv_ip[16] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0x7f,0x00,0x00,0x01};
 	memcpy(version_payload + off, recv_ip, 16);
 	off += 16;
-	uint16_t recv_port = htons(port);
+	uint16_t recv_port = htons(port); // Ports are big-endian
 	memcpy(version_payload + off, &recv_port, sizeof(recv_port));
 	off += sizeof(recv_port);
 
 	// addr_from: services 9, all zeros ip, port 0 (dummy to prevent self-connection)
-	memcpy(version_payload + off, &services, sizeof(services));
-	off += sizeof(services);
+	uint64_t from_services_le = htole64(services);
+	memcpy(version_payload + off, &from_services_le, sizeof(from_services_le));
+	off += sizeof(from_services_le);
 	memset(version_payload + off, 0, 16); // ip all zero
 	off += 16;
 	uint16_t from_port = htons(0);
@@ -472,8 +470,9 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 
 	// nonce: random
 	uint64_t nnonce = ((uint64_t)rand() << 32) | rand();
-	memcpy(version_payload + off, &nnonce, sizeof(nnonce));
-	off += sizeof(nnonce);
+	uint64_t nnonce_le = htole64(nnonce);
+	memcpy(version_payload + off, &nnonce_le, sizeof(nnonce_le));
+	off += sizeof(nnonce_le);
 
 	// user_agent
 	const char *ua = "/ckp2p:1.0/";
@@ -483,9 +482,10 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	off += ualen;
 
 	// start_height: 0
-	int32_t height = 0;
-	memcpy(version_payload + off, &height, sizeof(height));
-	off += sizeof(height);
+	uint32_t height = 0;
+	uint32_t height_le = htole32(height);
+	memcpy(version_payload + off, &height_le, sizeof(height_le));
+	off += sizeof(height_le);
 
 	// relay: 1 (to enable TX relay and unsolicited INV/TX)
 	version_payload[off++] = 1;
@@ -536,8 +536,9 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	// Send getheaders with genesis locator and zero stop to request up to 2000 headers
 	uchar gethdr_payload[69];
 	memset(gethdr_payload, 0, sizeof(gethdr_payload));
-	int32_t protover = 70016;
-	memcpy(gethdr_payload, &protover, 4);
+	uint32_t protover = 70016;
+	uint32_t protover_le = htole32(protover);
+	memcpy(gethdr_payload, &protover_le, 4);
 	gethdr_payload[4] = 1; // hash_count varint=1
 	memcpy(gethdr_payload + 5, conn->genesis, 32);
 	// hash_stop remains all zeros
@@ -546,7 +547,7 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	return true;
 }
 
-void sample_submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce)
+void submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce)
 {
 	if (!conn) {
 		LOGERR("Cannot submit - no P2P connection object");
@@ -569,30 +570,21 @@ void sample_submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const
 		}
 	}
 
-	submitted_block_t *sb = ckzalloc(sizeof(*sb));
-	memcpy(sb->blockhash, blockhash, 32);
-	sb->cmpct_payload = ckalloc(cmpct_len);
-	memcpy(sb->cmpct_payload, cmpct_payload, cmpct_len);
-	sb->cmpct_len = cmpct_len;
-	sb->shortid_nonce = shortid_nonce;
-
-	ck_wlock(&conn->submitted_lock);
-	sb->next = conn->submitted_blocks;
-	conn->submitted_blocks = sb;
-
-	submitted_block_t *tmp = conn->submitted_blocks, *prev = NULL;
-	int count = 0;
-	while (tmp) {
-		if (++count > MAX_SUBMITTED_BLOCKS) {
-			if (prev) prev->next = NULL;
-			dealloc(tmp->cmpct_payload);
-			dealloc(tmp);
-			break;
-		}
-		prev = tmp;
-		tmp = tmp->next;
+	ck_wlock(&conn->block_lock);
+	if (conn->cmpct_payload)
+		dealloc(conn->cmpct_payload);
+	memcpy(conn->blockhash, blockhash, 32);
+	conn->cmpct_payload = ckalloc(cmpct_len);
+	if (!conn->cmpct_payload) {
+		LOGERR("OOM in submit_compact_block");
+		ck_wunlock(&conn->block_lock);
+		return;
 	}
-	ck_wunlock(&conn->submitted_lock);
+	memcpy(conn->cmpct_payload, cmpct_payload, cmpct_len);
+	conn->cmpct_len = cmpct_len;
+	conn->shortid_nonce = shortid_nonce;
+	conn->has_block = true;
+	ck_wunlock(&conn->block_lock);
 
 	p2p_send(conn, "cmpctblock", cmpct_payload, cmpct_len);
 
@@ -604,8 +596,13 @@ void sample_submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const
 p2p_conn_t *ckp2p_connect(const char *host, int port)
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
-	cklock_init(&conn->submitted_lock);
-	conn->submitted_blocks = NULL;
+	if (!conn) {
+		LOGERR("OOM in ckp2p_connect");
+		return NULL;
+	}
+	cklock_init(&conn->block_lock);
+	conn->cmpct_payload = NULL;
+	conn->has_block = false;
 	conn->sock = -1;
 	strncpy(conn->host, host, sizeof(conn->host) - 1);
 	conn->port = port;
@@ -679,9 +676,10 @@ static bool p2p_connect_socket(p2p_conn_t *conn)
 	return true;
 }
 
+#if 0
 int main(int argc, char **argv)
 {
-	srand((unsigned int)time(NULL));
+	srand((unsigned int)time(NULL) ^ getpid());
 
 	if (argc < 2) {
 		fprintf(stderr, "Usage: %s <host:port>\n", argv[0]);
@@ -695,8 +693,9 @@ int main(int argc, char **argv)
 	p2p_conn_t *conn = ckp2p_connect(host, port);
 	if (!conn) return 1;
 
-	LOGNOTICE("ckp2p running - ready for sample_submit_compact_block() calls from upstream ckpool");
+	LOGNOTICE("ckp2p running - ready for submit_compact_block() calls from upstream ckpool");
 	while (42) sleep(60);
 
 	return 0;
 }
+#endif

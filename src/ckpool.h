@@ -18,6 +18,7 @@
 
 #include "libckpool.h"
 #include "uthash.h"
+#include "ckp2p.h"
 
 #define RPC_TIMEOUT 60
 
@@ -122,6 +123,9 @@ struct server_instance {
 	bool notify;
 	bool alive;
 	connsock_t cs;
+
+	char *p2purl;
+	p2p_conn_t *p2pconn;
 };
 
 typedef struct server_instance server_instance_t;
@@ -231,6 +235,9 @@ struct ckpool_instance {
 	int blockpoll; // How frequently in ms to poll bitcoind for block updates
 	int nonce1length; // Extranonce1 length
 	int nonce2length; // Extranonce2 length
+
+	/* p2p bitcoind data */
+	char **p2purl;
 
 	/* Difficulty settings */
 	int64_t mindiff; // Default 1
