@@ -27,7 +27,6 @@
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
-#define RECONNECT_DELAY 5 // seconds to wait before reconnecting
 
 static const struct {
 	const char *name;
@@ -304,8 +303,10 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	dealloc(payload);
 }
 
+#if 0
 static void submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce);
 
+/* Function for testing cmpctblock validity by echoing back any received */
 static void handle_cmpctblock(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint64_t shortid_nonce_le, shortid_nonce;
@@ -324,6 +325,7 @@ static void handle_cmpctblock(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	submit_compact_block(conn, blockhash, payload, plen, shortid_nonce);
 	dealloc(payload);
 }
+#endif
 
 static bool p2p_connect_socket(p2p_conn_t *conn);
 
@@ -362,62 +364,65 @@ static void *p2p_reader(void *arg)
 		reconnect_delay = 0;
 		// Log all received messages with descriptive type, even if ignoring
 		if (!strcmp(cmd, "version")) {
-			LOGNOTICE("Received VERSION (%u bytes) - handling for handshake", plen);
+			LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
 		} else if (!strcmp(cmd, "verack")) {
-			LOGNOTICE("Received VERACK (%u bytes) - handling for handshake", plen);
+			LOGINFO("Received VERACK (%u bytes) - handling for handshake", plen);
 		} else if (!strcmp(cmd, "ping")) {
-			LOGNOTICE("Received PING (%u bytes) - replying with PONG", plen);
+			LOGINFO("Received PING (%u bytes) - replying with PONG", plen);
 			handle_ping(conn, payload, plen);
 			continue; // Skip dealloc since handler does it
 		} else if (!strcmp(cmd, "pong")) {
-			LOGNOTICE("Received PONG (%u bytes) - ignoring (keep-alive response)", plen);
+			LOGDEBUG("Received PONG (%u bytes) - ignoring (keep-alive response)", plen);
 		} else if (!strcmp(cmd, "sendcmpct")) {
-			LOGNOTICE("Received SENDCMPCT (%u bytes) - handling compact block negotiation", plen);
+			LOGINFO("Received SENDCMPCT (%u bytes) - handling compact block negotiation", plen);
 			handle_sendcmpct(conn, payload, plen);
 			continue; // Skip dealloc since handler does it
 		} else if (!strcmp(cmd, "getdata")) {
-			LOGNOTICE("Received GETDATA (%u bytes) - handling (request for compact block or tx)", plen);
+			LOGINFO("Received GETDATA (%u bytes) - handling (request for compact block or tx)", plen);
 			handle_getdata(conn, payload, plen);
 			continue; // Skip dealloc since handler does it
 		} else if (!strcmp(cmd, "getblocktxn")) {
-			LOGNOTICE("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
+			LOGINFO("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
 			handle_getblocktxn(conn, payload, plen);
 			continue; // Skip dealloc since handler does it
 		} else if (!strcmp(cmd, "inv")) {
 			handle_inv(conn, payload, plen);
 			continue;
 		} else if (!strcmp(cmd, "headers")) {
-			LOGNOTICE("Received HEADERS (%u bytes) - ignoring (block headers announcement)", plen);
+			LOGDEBUG("Received HEADERS (%u bytes) - ignoring (block headers announcement)", plen);
 		} else if (!strcmp(cmd, "cmpctblock")) {
+#if 0
 			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - handling (resend for validity check)", plen);
 			handle_cmpctblock(conn, payload, plen);
 			continue;
+#endif
+			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - ignoring (compact block data)", plen);
 		} else if (!strcmp(cmd, "tx")) {
-			LOGNOTICE("Received TX (%u bytes) - ignoring (transaction data)", plen);
+			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
 		} else if (!strcmp(cmd, "block")) {
 			LOGNOTICE("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
 		} else if (!strcmp(cmd, "blocktxn")) {
-			LOGNOTICE("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
+			LOGDEBUG("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
 		} else if (!strcmp(cmd, "getheaders")) {
-			LOGNOTICE("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
+			LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
 		} else if (!strcmp(cmd, "getblocks")) {
-			LOGNOTICE("Received GETBLOCKS (%u bytes) - ignoring (blocks request)", plen);
+			LOGDEBUG("Received GETBLOCKS (%u bytes) - ignoring (blocks request)", plen);
 		} else if (!strcmp(cmd, "getaddr")) {
-			LOGNOTICE("Received GETADDR (%u bytes) - ignoring (peer discovery request)", plen);
+			LOGDEBUG("Received GETADDR (%u bytes) - ignoring (peer discovery request)", plen);
 		} else if (!strcmp(cmd, "addr")) {
-			LOGNOTICE("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
+			LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
 		} else if (!strcmp(cmd, "addrv2")) {
-			LOGNOTICE("Received ADDRV2 (%u bytes) - ignoring (peer addresses v2)", plen);
+			LOGDEBUG("Received ADDRV2 (%u bytes) - ignoring (peer addresses v2)", plen);
 		} else if (!strcmp(cmd, "feefilter")) {
-			LOGNOTICE("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
+			LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
 		} else if (!strcmp(cmd, "reject")) {
-			LOGNOTICE("Received REJECT (%u bytes) - ignoring (rejection message)", plen);
+			LOGDEBUG("Received REJECT (%u bytes) - ignoring (rejection message)", plen);
 		} else if (!strcmp(cmd, "notfound")) {
-			LOGNOTICE("Received NOTFOUND (%u bytes) - ignoring (item not found)", plen);
+			LOGDEBUG("Received NOTFOUND (%u bytes) - ignoring (item not found)", plen);
 		} else if (!strcmp(cmd, "wtxidrelay")) {
-			LOGNOTICE("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
+			LOGDEBUG("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
 		} else if (!strcmp(cmd, "sendaddrv2")) {
-			LOGNOTICE("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
+			LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
 		} else {
 			LOGNOTICE("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
 		}
