@@ -327,7 +327,17 @@ static void handle_cmpctblock(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 }
 #endif
 
-static bool p2p_connect_socket(p2p_conn_t *conn);
+static bool p2p_connect_socket(p2p_conn_t *conn)
+{
+	conn->sock = connect_socket(conn->host, conn->charport);
+	if (conn->sock < 0) {
+		LOGERR("connect_socket failed in p2p_connect_socket");
+		return false;
+	}
+	LOGNOTICE("ckp2p connected to %s:%d (%s)", conn->host, conn->port, conn->netname);
+
+	return true;
+}
 
 static bool do_handshake(p2p_conn_t *conn, int port);
 
@@ -644,6 +654,7 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
 	conn->has_block = false;
 	conn->sock = -1;
 	strncpy(conn->host, host, sizeof(conn->host) - 1);
+	strncpy(conn->charport, charport, sizeof(conn->charport) - 1);
 	sscanf(charport, "%d", &port);
 	conn->port = port;
 	memset(conn->magic, 0, 4); // unset
@@ -681,39 +692,6 @@ err:
 		close(conn->sock);
 	dealloc(conn);
 	return NULL;
-}
-
-static bool p2p_connect_socket(p2p_conn_t *conn)
-{
-	conn->sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (conn->sock < 0) {
-		LOGERR("socket() failed");
-		return false;
-	}
-
-	struct sockaddr_in sa = {0};
-	sa.sin_family = AF_INET;
-	sa.sin_port = htons(conn->port);
-	if (inet_pton(AF_INET, conn->host, &sa.sin_addr) <= 0) {
-		struct hostent *h = gethostbyname(conn->host);
-		if (!h) {
-			close(conn->sock);
-			conn->sock = -1;
-			return false;
-		}
-		memcpy(&sa.sin_addr, h->h_addr, h->h_length);
-	}
-
-	if (connect(conn->sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		LOGERR("connect failed: %s", strerror(errno));
-		close(conn->sock);
-		conn->sock = -1;
-		return false;
-	}
-
-	LOGNOTICE("ckp2p connected to %s:%d (%s)", conn->host, conn->port, conn->netname);
-
-	return true;
 }
 
 int prepare_ckp2p(ckpool_t *ckp)
