@@ -527,6 +527,7 @@ static const int witnessdata_size = 36; // commitment header + hash
 static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 {
 	uint64_t *u64, g64, d64 = 0;
+	uint32_t *u32;
 	sdata_t *sdata = ckp->sdata;
 	char header[272];
 	int len, ofs = 0;
@@ -593,7 +594,8 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	LOGDEBUG("Coinb1: %s", wb->coinb1);
 	/* Coinbase 1 complete */
 
-	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xff", 4);
+	/* BIP54 requires the coinbase's nSequence be anything but the maximum value. */
+	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xfe", 4);
 	wb->coinb2len += 4;
 
 	// Generation value
@@ -639,7 +641,10 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 		wb->coinb3len += witnessdata_size;
 	}
 
-	wb->coinb3len += 4; // Blank lock
+	/* Set nLockTime to block height minus 1 as per BIP 54. */
+	u32 = (uint32_t *)&wb->coinb3bin[wb->coinb3len];
+	*u32 = htole32(wb->height - 1);
+	wb->coinb3len += 4;
 
 	if (!ckp->btcsolo) {
 		int coinbase_len, offset = 0;
@@ -6000,8 +6005,8 @@ static void check_best_diff(sdata_t *sdata, user_instance_t *user,worker_instanc
 #define JSON_ERR(err) json_string(SHARE_ERR(err))
 
 /* Needs to be entered with client holding a ref count. */
-static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
-			    const json_t *params_val, json_t **err_val)
+static json_t *parse_submit(stratum_instance_t *client, const json_t *params_val,
+			    json_t **err_val, enum share_err *err_code)
 {
 	bool share = false, result = false, invalid = true, submit = false, stale = false;
 	const char *workername, *job_id, *ntime, *version_mask;
@@ -6089,8 +6094,12 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 
 	share = true;
 
-	if (unlikely(!sdata->current_workbase))
+	if (unlikely(!sdata->current_workbase)) {
+		err = SE_NO_WORKBASE;
+		*err_val = JSON_ERR(err);
+		*err_code = err;
 		return json_boolean(false);
+	}
 
 	wb = get_workbase(sdata, id);
 	if (unlikely(!wb)) {
@@ -6315,6 +6324,7 @@ out:
 		LOGINFO("Invalid share from client %s: %s", client->identity, client->workername);
 	}
 	free(fname);
+	*err_code = err;
 	return json_boolean(result);
 }
 
@@ -7473,28 +7483,29 @@ static void parse_instance_msg(ckpool_t *ckp, sdata_t *sdata, smsg_t *msg, strat
 	parse_method(ckp, sdata, client, client_id, id_val, method, params);
 }
 
-static void srecv_process(ckpool_t *ckp, json_t *val)
+static void srecv_process(ckpool_t *ckp, json_t *sval)
 {
 	char address[INET6_ADDRSTRLEN], *buf = NULL;
 	bool noid = false, dropped = false;
 	sdata_t *sdata = ckp->sdata;
 	stratum_instance_t *client;
+	json_t * val;
 	smsg_t *msg;
 	int server;
 
-	if (unlikely(!val)) {
-		LOGWARNING("srecv_process received NULL val!");
+	if (unlikely(!sval)) {
+		LOGWARNING("srecv_process received NULL sval!");
 		return;
 	}
 
 	msg = ckzalloc(sizeof(smsg_t));
-	msg->json_msg = val;
+	msg->json_msg = sval;
 	val = json_object_get(msg->json_msg, "client_id");
 	if (unlikely(!val)) {
 		if (ckp->node)
 			parse_node_msg(ckp, sdata, msg->json_msg);
 		else {
-			buf = json_dumps(val, JSON_COMPACT);
+			buf = json_dumps(sval, JSON_COMPACT);
 			LOGWARNING("Failed to extract client_id from connector json smsg %s", buf);
 		}
 		goto out;
@@ -7505,7 +7516,7 @@ static void srecv_process(ckpool_t *ckp, json_t *val)
 
 	val = json_object_get(msg->json_msg, "address");
 	if (unlikely(!val)) {
-		buf = json_dumps(val, JSON_COMPACT);
+		buf = json_dumps(sval, JSON_COMPACT);
 		LOGWARNING("Failed to extract address from connector json smsg %s", buf);
 		goto out;
 	}
@@ -7514,7 +7525,7 @@ static void srecv_process(ckpool_t *ckp, json_t *val)
 
 	val = json_object_get(msg->json_msg, "server");
 	if (unlikely(!val)) {
-		buf = json_dumps(val, JSON_COMPACT);
+		buf = json_dumps(sval, JSON_COMPACT);
 		LOGWARNING("Failed to extract server from connector json smsg %s", buf);
 		goto out;
 	}
@@ -7603,6 +7614,7 @@ static void steal_json_id(json_t *val, json_params_t *jp)
 static void sshare_process(ckpool_t *ckp, json_params_t *jp)
 {
 	json_t *result_val, *json_msg, *err_val = NULL;
+	enum share_err err_code = SE_NONE;
 	stratum_instance_t *client;
 	sdata_t *sdata = ckp->sdata;
 	int64_t client_id;
@@ -7619,9 +7631,20 @@ static void sshare_process(ckpool_t *ckp, json_params_t *jp)
 		goto out_decref;
 	}
 	json_msg = json_object();
-	result_val = parse_submit(client, json_msg, jp->params, &err_val);
-	json_object_set_new_nocheck(json_msg, "result", result_val);
-	json_object_set_new_nocheck(json_msg, "error", err_val ? err_val : json_null());
+	result_val = parse_submit(client, jp->params, &err_val, &err_code);
+	if (err_val) {
+		json_t *err_array = json_array();
+
+		json_decref(result_val);
+		json_object_set_new_nocheck(json_msg, "result", json_null());
+		json_array_append_new(err_array, json_integer(SHARE_ERR_CODE(err_code)));
+		json_array_append_new(err_array, err_val);
+		json_array_append_new(err_array, json_null());
+		json_object_set_new_nocheck(json_msg, "error", err_array);
+	} else {
+		json_object_set_new_nocheck(json_msg, "result", result_val);
+		json_object_set_new_nocheck(json_msg, "error", json_null());
+	}
 	steal_json_id(json_msg, jp);
 	stratum_add_send(sdata, json_msg, client_id, SM_SHARERESULT);
 out_decref:

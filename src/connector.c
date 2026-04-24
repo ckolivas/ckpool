@@ -943,9 +943,19 @@ static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, co
 	if (found) {
 		bool result = false;
 
-		if (!json_get_bool(&result, val, "result")) {
-			LOGINFO("Failed to find result in trs share");
-			goto out;
+		{
+			json_t *res_val = json_object_get(val, "result");
+
+			if (!json_is_boolean(res_val)) {
+				json_t *err_val = json_object_get(val, "error");
+
+				if (unlikely(!(json_is_null(res_val) && err_val && !json_is_null(err_val)))) {
+					LOGINFO("Failed to find result in trs share");
+					goto out;
+				}
+				result = false;
+			} else
+				result = json_is_true(res_val);
 		}
 		if (!json_is_null(json_object_get(val, "error"))) {
 			LOGINFO("Got error for trs share");

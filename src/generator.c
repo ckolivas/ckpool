@@ -1765,9 +1765,19 @@ static int parse_share(gdata_t *gdata, proxy_instance_t *proxi, const char *buf)
 		goto out;
 	}
 	id = json_integer_value(idval);
-	if (unlikely(!json_get_bool(&result, val, "result"))) {
-		LOGINFO("Failed to find result in upstream json msg: %s", buf);
-		goto out;
+	{
+		json_t *res_val = json_object_get(val, "result");
+
+		if (!json_is_boolean(res_val)) {
+			json_t *err_val = json_object_get(val, "error");
+
+			if (unlikely(!(json_is_null(res_val) && err_val && !json_is_null(err_val)))) {
+				LOGINFO("Failed to find result in upstream json msg: %s", buf);
+				goto out;
+			}
+			result = false;
+		} else
+			result = json_is_true(res_val);
 	}
 
 	mutex_lock(&gdata->share_lock);

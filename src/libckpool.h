@@ -279,7 +279,8 @@ enum share_err {
 	SE_NTIME_INVALID,
 	SE_DUPE,
 	SE_HIGH_DIFF,
-	SE_INVALID_VERSION_MASK
+	SE_INVALID_VERSION_MASK,
+	SE_NO_WORKBASE
 };
 
 static const char __maybe_unused *share_errs[] = {
@@ -298,10 +299,44 @@ static const char __maybe_unused *share_errs[] = {
 	"Ntime out of range",
 	"Duplicate",
 	"Above target",
-	"Invalid version mask"
+	"Invalid version mask",
+	"No workbase"
 };
 
 #define SHARE_ERR(x) share_errs[((x) + 9)]
+
+/* Stratum V1 error codes for mining.submit responses.
+ * Origin: slush pool Stratum mining protocol specification
+ * (https://web.archive.org/web/20150307191254/http://mining.bitcoin.cz/stratum-mining)
+ *
+ *   20 - Other/Unknown
+ *   21 - Job not found (=stale)
+ *   22 - Duplicate share
+ *   23 - Low difficulty share
+ *   24 - Unauthorized worker
+ *   25 - Not subscribed
+ */
+static const int __maybe_unused share_err_codes[] = {
+	20, // SE_INVALID_NONCE2       - Other/Unknown
+	24, // SE_WORKER_MISMATCH      - Unauthorized worker
+	20, // SE_NO_NONCE             - Other/Unknown
+	20, // SE_NO_NTIME             - Other/Unknown
+	20, // SE_NO_NONCE2            - Other/Unknown
+	20, // SE_NO_JOBID             - Other/Unknown
+	20, // SE_NO_USERNAME          - Other/Unknown
+	20, // SE_INVALID_SIZE         - Other/Unknown
+	20, // SE_NOT_ARRAY            - Other/Unknown
+	 0, // SE_NONE
+	21, // SE_INVALID_JOBID        - Job not found
+	21, // SE_STALE                - Job not found (stale)
+	20, // SE_NTIME_INVALID        - Other/Unknown
+	22, // SE_DUPE                 - Duplicate share
+	23, // SE_HIGH_DIFF            - Low difficulty share
+	20, // SE_INVALID_VERSION_MASK - Other/Unknown
+	20, // SE_NO_WORKBASE          - Other/Unknown
+};
+
+#define SHARE_ERR_CODE(x) share_err_codes[((x) + 9)]
 
 typedef struct ckmutex mutex_t;
 
