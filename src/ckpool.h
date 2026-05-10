@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2018,2023,2025 Con Kolivas
+ * Copyright 2014-2018,2023,2025-2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -18,6 +18,8 @@
 
 #include "libckpool.h"
 #include "uthash.h"
+#include "yyjson.h"
+#include "yyjson_util.h"
 
 #define RPC_TIMEOUT 60
 
@@ -373,9 +375,10 @@ char *_ckdb_msg_call(const ckpool_t *ckp, const char *msg,  const char *file, co
 		     const int line);
 #define ckdb_msg_call(ckp, msg) _ckdb_msg_call(ckp, msg, __FILE__, __func__, __LINE__)
 
-json_t *json_rpc_call(connsock_t *cs, const char *rpc_req);
-json_t *json_rpc_response(connsock_t *cs, const char *rpc_req);
-void json_rpc_msg(connsock_t *cs, const char *rpc_req);
+yyjson_doc *yyjson_rpc_call(connsock_t *cs, const char *rpc_req);
+yyjson_doc *yyjson_rpc_response(connsock_t *cs, const char *rpc_req);
+void yyjson_rpc_msg(connsock_t *cs, const char *rpc_req);
+
 bool _send_json_msg(connsock_t *cs, const json_t *json_msg, const char *file, const char *func, const int line);
 #define send_json_msg(CS, JSON_MSG) _send_json_msg(CS, JSON_MSG, __FILE__, __func__, __LINE__)
 json_t *json_msg_result(const char *msg, json_t **res_val, json_t **err_val);

@@ -63,7 +63,7 @@ if $PREVIOUS_INSTALL; then
 fi
 
 # Main installation
-echo "Starting installation of Bitcoin Core v29.2 and CKPool-Solo. This requires sudo privileges."
+echo "Starting installation of Bitcoin Core v29.3 and CKPool-Solo. This requires sudo privileges."
 echo "Warning: Bitcoin Core will download up to ~675GB of blockchain data (or less if pruned). Ensure sufficient disk space."
 echo "Important: You cannot mine with CKPool-Solo until the Bitcoin Core blockchain is fully synchronized, which may take days depending on your hardware and network speed."
 
@@ -124,7 +124,7 @@ if [ "$available_space_gb" -lt "$required_space" ]; then
 fi
 
 # Prompt for assumevalid block hash
-read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 00000000000000000001e6a5aec8788183793b27370ef638b152b4d02f9f0787 at block 907465, or 0 to disable): " assumevalid_hash
+read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 000000000000000000012d5e7b4745f92b9cd60241854e38be68d9b182feabcb at block 944306, or 0 to disable): " assumevalid_hash
 if [ "$assumevalid_hash" = "0" ]; then
     assumevalid_line=""
     echo "Assumevalid disabled. Full blockchain verification will be performed."
@@ -132,7 +132,7 @@ elif [ -n "$assumevalid_hash" ]; then
     echo "Warning: Using assumevalid skips signature verification up to this block, reducing security. Ensure the hash is from a trusted source."
     assumevalid_line="assumevalid=$assumevalid_hash"
 else
-    assumevalid_line="assumevalid=00000000000000000001e6a5aec8788183793b27370ef638b152b4d02f9f0787"
+    assumevalid_line="assumevalid=000000000000000000012d5e7b4745f92b9cd60241854e38be68d9b182feabcb"
 fi
 
 # Prompt for donation to CKPool author
@@ -166,8 +166,8 @@ echo "Enabling persistent journal storage for easier log access..."
 mkdir -p /var/log/journal
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
-# Download and verify Bitcoin Core v29.2 tarball
-BITCOIN_VERSION="29.2"
+# Download and verify Bitcoin Core v29.3 tarball
+BITCOIN_VERSION="29.3"
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
     BITCOIN_TAR="bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"

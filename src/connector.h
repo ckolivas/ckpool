@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2016 Con Kolivas
+ * Copyright 2014-2016,2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -13,6 +13,7 @@
 int64_t connector_newclientid(ckpool_t *ckp);
 void connector_upstream_msg(ckpool_t *ckp, char *msg);
 void connector_add_message(ckpool_t *ckp, json_t *val);
+void connector_add_yymessage(ckpool_t *ckp, yyjson_mut_doc *doc);
 char *connector_stats(void *data, const int runtime);
 void connector_send_fd(ckpool_t *ckp, const int fdno, const int sockd);
 void *connector(void *arg);

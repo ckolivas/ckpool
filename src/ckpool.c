@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2020,2023,2025 Con Kolivas
+ * Copyright 2014-2020,2023,2025-2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -750,13 +750,12 @@ static const char *rpc_method(const char *rpc_req)
 
 /* All of these calls are made to bitcoind which prefers open/close instead
  * of persistent connections so cs->fd is always invalid. */
-static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool info_only)
+static yyjson_doc *_yyjson_rpc_call(connsock_t *cs, const char *rpc_req, const bool info_only)
 {
 	float timeout = RPC_TIMEOUT;
 	char *http_req = NULL;
-	json_error_t err_val;
 	char *warning = NULL;
-	json_t *val = NULL;
+	yyjson_doc *doc = NULL;
 	tv_t stt_tv, fin_tv;
 	double elapsed;
 	int len, ret;
@@ -852,11 +851,9 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
 			 elapsed, __func__, rpc_method(rpc_req));
 	}
 
-	val = json_loads(cs->buf, 0, &err_val);
-	if (!val) {
-		ASPRINTF(&warning, "JSON decode (%.10s...) failed(%d): %s",
-			 rpc_method(rpc_req), err_val.line, err_val.text);
-	}
+	doc = yyjson_read(cs->buf, strlen(cs->buf), 0);
+	if (!doc)
+		ASPRINTF(&warning, "JSON decode (%.10s...) failed", rpc_method(rpc_req));
 out_empty:
 	empty_socket(cs->fd);
 	empty_buffer(cs);
@@ -872,27 +869,27 @@ out:
 	free(http_req);
 	dealloc(cs->buf);
 	cksem_post(&cs->sem);
-	return val;
+	return doc;
 }
 
-json_t *json_rpc_call(connsock_t *cs, const char *rpc_req)
+yyjson_doc *yyjson_rpc_call(connsock_t *cs, const char *rpc_req)
 {
-	return _json_rpc_call(cs, rpc_req, false);
+	return _yyjson_rpc_call(cs, rpc_req, false);
 }
 
-json_t *json_rpc_response(connsock_t *cs, const char *rpc_req)
+yyjson_doc *yyjson_rpc_response(connsock_t *cs, const char *rpc_req)
 {
-	return _json_rpc_call(cs, rpc_req, true);
+	return _yyjson_rpc_call(cs, rpc_req, true);
 }
 
 /* For when we are submitting information that is not important and don't care
  * about the response. */
-void json_rpc_msg(connsock_t *cs, const char *rpc_req)
+void yyjson_rpc_msg(connsock_t *cs, const char *rpc_req)
 {
-	json_t *val = _json_rpc_call(cs, rpc_req, true);
+	yyjson_doc *doc = _yyjson_rpc_call(cs, rpc_req, true);
 
 	/* We don't care about the result */
-	json_decref(val);
+	yyjson_doc_free(doc);
 }
 
 static void terminate_oldpid(const ckpool_t *ckp, proc_instance_t *pi, const pid_t oldpid)
@@ -1762,7 +1759,7 @@ int main(int argc, char **argv)
 
 	/* Donations on testnet are meaningless but required for complete
 	 * testing. Testnet and regtest addresses */
-	ckp.tndonaddress = "tb1q5fyv7tue73y4zxezh2c685qpwx0cfngfxlrgxh";
+	ckp.tndonaddress = "tb1qdxclx2qxdh0g67j27v6y6ls0xm9cl2w2xktjq2";
 	ckp.rtdonaddress = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
 
 	if (!ckp.btcaddress && !ckp.btcsolo && !ckp.proxy)
