@@ -26,7 +26,6 @@ fi
 dnl Checks for programs
 AC_PROG_CC
 # gl_EARLY - maybe later
-AC_PROG_GCC_TRADITIONAL
 AM_PROG_CC_C_O
 LT_INIT([disable-shared])
 
