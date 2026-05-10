@@ -92,6 +92,48 @@ static void double_sha256_4(uchar chksum[4], const uchar *data, size_t len)
 	memcpy(chksum, h2, 4);
 }
 
+/* Read exactly len bytes (loops on partial reads) */
+static ssize_t read_exact(int sock, void *buf, size_t len)
+{
+	size_t left = len;
+	char *p = buf;
+
+	while (left > 0) {
+		ssize_t n = read(sock, p, left);
+		if (n <= 0) {
+			if (n == 0)
+				LOGERR("Peer closed connection");
+			else
+				LOGERR("read error: %s", strerror(errno));
+			return n;
+		}
+		left -= n;
+		p += n;
+	}
+	return (ssize_t)len;
+}
+
+/* Write exactly len bytes (loops on partial writes) */
+static ssize_t write_exact(int sock, const void *buf, size_t len)
+{
+	size_t left = len;
+	const char *p = buf;
+
+	while (left > 0) {
+		ssize_t n = write(sock, p, left);
+		if (n <= 0) {
+			if (n == 0)
+				LOGERR("write: peer closed connection");
+			else
+				LOGERR("write error: %s", strerror(errno));
+			return n;
+		}
+		left -= n;
+		p += n;
+	}
+	return (ssize_t)len;
+}
+
 static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, uint32_t plen)
 {
 	uchar hdr[24];
@@ -106,18 +148,18 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 
 	if (plen == 0) {
 		static const uchar empty_chksum[4] = {0x5d, 0xf6, 0xe0, 0xe2};
-
 		memcpy(chksum, empty_chksum, 4);
 	} else {
 		double_sha256_4(chksum, payload, plen);
 	}
 	memcpy(hdr + 20, chksum, 4);
 
-	if (write(conn->sock, hdr, 24) != 24 ||
-		(plen && write(conn->sock, payload, plen) != (ssize_t)plen))
+	if (write_exact(conn->sock, hdr, 24) != 24 ||
+		(plen && write_exact(conn->sock, payload, plen) != (ssize_t)plen)) {
 		LOGERR("p2p_send(%s) failed", cmd);
-	else
-		LOGNOTICE("Sent %s (%u bytes)", cmd, plen);
+		} else {
+			LOGNOTICE("Sent %s (%u bytes)", cmd, plen);
+		}
 }
 
 static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *plen)
@@ -125,14 +167,9 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 	uchar hdr[24];
 	uchar rec_magic[4];
 	uchar rec_chksum[4];
-	ssize_t nread = read(conn->sock, hdr, 24);
 	uint32_t plen_le;
 
-	if (nread != 24) {
-		if (nread == 0)
-			LOGERR("Peer closed connection");
-		else
-			LOGERR("Failed to read message header (%s)", strerror(errno));
+	if (read_exact(conn->sock, hdr, 24) != 24) {
 		return false;
 	}
 
@@ -152,7 +189,6 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 
 	if (*plen == 0) {
 		static const uchar empty_chksum[4] = {0x5d, 0xf6, 0xe0, 0xe2};
-
 		*payload = NULL;
 		if (memcmp(rec_chksum, empty_chksum, 4)) {
 			LOGERR("Checksum fail on %s (empty)", cmd);
@@ -166,15 +202,19 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 		LOGERR("OOM in p2p_recv");
 		return false;
 	}
-	if (read(conn->sock, *payload, *plen) != (ssize_t)*plen) {
+
+	if (read_exact(conn->sock, *payload, *plen) != (ssize_t)*plen) {
 		dealloc(*payload);
+		*payload = NULL;
 		return false;
 	}
+
 	uchar calc_chksum[4];
 	double_sha256_4(calc_chksum, *payload, *plen);
 	if (memcmp(calc_chksum, rec_chksum, 4)) {
 		LOGERR("Checksum fail on %s", cmd);
 		dealloc(*payload);
+		*payload = NULL;
 		return false;
 	}
 	return true;
@@ -472,7 +512,7 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	uchar version_payload[97] = {};
 	int off = 0;
 	uint64_t services, services_le, ntime, ntime_le, recv_services, recv_services_le,
-		 from_services_le, nnonce, nnonce_le;
+	from_services_le, nnonce, nnonce_le;
 	uint16_t recv_port, from_port;
 	// user_agent
 	const char *ua = "/ckp2p:1.0/";
