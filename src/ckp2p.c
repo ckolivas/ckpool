@@ -574,8 +574,8 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	memcpy(version_payload + off, &height_le, sizeof(height_le));
 	off += sizeof(height_le);
 
-	// relay: 1 (to enable TX relay and unsolicited INV/TX)
-	version_payload[off++] = 1;
+	// relay: 0 (to enable TX relay and unsolicited INV/TX)
+	version_payload[off++] = 0;
 
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 
@@ -719,6 +719,7 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
 	if (!do_handshake(conn, port))
 		goto err;
 
+	LOGNOTICE("ckp2p connected to bitcoin node %s:%s", host, charport);
 	pthread_t reader_thread;
 	create_pthread(&reader_thread, p2p_reader, conn);
 
@@ -728,6 +729,7 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
 	return conn;
 
 err:
+	LOGEMERG("ckp2p Failed to connect to bitcoin node %s:%s", host, charport);
 	if (conn->sock >= 0)
 		close(conn->sock);
 	dealloc(conn);
