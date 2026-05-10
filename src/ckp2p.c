@@ -102,9 +102,9 @@ static ssize_t read_exact(int sock, void *buf, size_t len)
 		ssize_t n = read(sock, p, left);
 		if (n <= 0) {
 			if (n == 0)
-				LOGERR("Peer closed connection");
+				LOGNOTICE("P2P Peer closed connection");
 			else
-				LOGERR("read error: %s", strerror(errno));
+				LOGERR("P2P read error: %s", strerror(errno));
 			return n;
 		}
 		left -= n;
@@ -123,9 +123,9 @@ static ssize_t write_exact(int sock, const void *buf, size_t len)
 		ssize_t n = write(sock, p, left);
 		if (n <= 0) {
 			if (n == 0)
-				LOGERR("write: peer closed connection");
+				LOGNOTICE("P2P write: peer closed connection");
 			else
-				LOGERR("write error: %s", strerror(errno));
+				LOGERR("P2P write error: %s", strerror(errno));
 			return n;
 		}
 		left -= n;
