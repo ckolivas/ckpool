@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2017,2023 Con Kolivas
+ * Copyright 2014-2017,2023,2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -440,7 +440,7 @@ retry:
 			send_unix_msg(umsg->sockd, "Failed");
 			goto reconnect;
 		} else {
-			char *s = json_dumps(gbt.json, JSON_NO_UTF8);
+			char *s = yyjson_write(gbt.gbtdoc, 0, NULL);
 
 			send_unix_msg(umsg->sockd, s);
 			free(s);
@@ -930,11 +930,12 @@ out:
 	return ret;
 }
 
-bool generator_checktxn(const ckpool_t *ckp, const char *txn, json_t **val)
+char *generator_checktxn(const ckpool_t *ckp, const char *txn)
 {
+	yyjson_doc *doc;
 	gdata_t *gdata = ckp->gdata;
 	server_instance_t *si;
-	bool ret = false;
+	char *ret = NULL;
 	connsock_t *cs;
 
 	si = gdata->current_si;
@@ -943,9 +944,13 @@ bool generator_checktxn(const ckpool_t *ckp, const char *txn, json_t **val)
 		goto out;
 	}
 	cs = &si->cs;
-	*val = validate_txn(cs, txn);
-	if (*val)
-		ret = true;
+	doc = validate_txn(cs, txn);
+	if (!doc) {
+		LOGWARNING("Invalid response to generator_checkaddr");
+		goto out;
+	}
+	ret = yyjson_write(doc, 0, NULL);
+	yyjson_doc_free(doc);
 out:
 	return ret;
 }
@@ -1765,9 +1770,19 @@ static int parse_share(gdata_t *gdata, proxy_instance_t *proxi, const char *buf)
 		goto out;
 	}
 	id = json_integer_value(idval);
-	if (unlikely(!json_get_bool(&result, val, "result"))) {
-		LOGINFO("Failed to find result in upstream json msg: %s", buf);
-		goto out;
+	{
+		json_t *res_val = json_object_get(val, "result");
+
+		if (!json_is_boolean(res_val)) {
+			json_t *err_val = json_object_get(val, "error");
+
+			if (unlikely(!(json_is_null(res_val) && err_val && !json_is_null(err_val)))) {
+				LOGINFO("Failed to find result in upstream json msg: %s", buf);
+				goto out;
+			}
+			result = false;
+		} else
+			result = json_is_true(res_val);
 	}
 
 	mutex_lock(&gdata->share_lock);

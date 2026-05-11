@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2017 Con Kolivas
+ * Copyright 2014-2017,2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -143,8 +143,8 @@ struct connector_data {
 
 	int64_t client_ids;
 
-	/* client message process queue */
-	ckmsgq_t *cmpq;
+	/* client yyjson message process queue */
+	ckmsgq_t *cympq;
 
 	/* client message event process queue */
 	ckmsgq_t *cevents;
@@ -514,8 +514,8 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, co
  * true if we will still be receiving messages from this client. */
 static bool parse_client_msg(ckpool_t *ckp, cdata_t *cdata, client_instance_t *client)
 {
+	yyjson_doc *sdoc;
 	int buflen, ret;
-	json_t *val;
 	char *eol;
 
 retry:
@@ -549,39 +549,53 @@ reparse:
 		return false;
 	}
 
-	if (!(val = json_loads(client->buf, JSON_DISABLE_EOF_CHECK, NULL))) {
+	/* Filter out non- or incomplete json */
+	if (unlikely(client->buf[0] != '{' ||
+	    !(sdoc = yyjson_read(client->buf, strlen(client->buf), YYJSON_READ_STOP_WHEN_DONE)))) {
 		char *buf = strdup("Invalid JSON, disconnecting\n");
 
 		LOGINFO("Client id %"PRId64" sent invalid json message %s", client->id, client->buf);
 		send_client(ckp, cdata, client->id, buf);
 		return false;
 	} else {
+		yyjson_mut_doc *doc = yyjson_doc_mut_copy(sdoc, NULL);
+		yyjson_mut_val *root = yyjson_mut_doc_get_root(doc);
+
+		yyjson_doc_free(sdoc);
+
 		if (client->passthrough) {
 			int64_t passthrough_id;
 
-			json_getdel_int64(&passthrough_id, val, "client_id");
+			passthrough_id = yyjson_mut_get_num(yyjson_mut_obj_get(root, "client_id"));
 			passthrough_id = (client->id << 32) | passthrough_id;
-			json_object_set_new_nocheck(val, "client_id", json_integer(passthrough_id));
+			yyjson_mut_obj_remove_key(root, "client_id");
+			yyjson_mut_obj_add_sint(doc, root, "client_id", passthrough_id);
 		} else {
-			if (ckp->redirector && !client->redirected && strstr(client->buf, "mining.submit"))
+			if (ckp->redirector && !client->redirected && strstr(client->buf, "mining.submit")) {
+				json_t *val = yyjson_to_json(doc);
+
 				parse_redirector_share(cdata, client, val);
-			json_object_set_new_nocheck(val, "client_id", json_integer(client->id));
-			json_object_set_new_nocheck(val, "address", json_string(client->address_name));
+				json_decref(val);
+			}
+			yyjson_mut_obj_add_sint(doc, root, "client_id", client->id);
+			yyjson_mut_obj_add_str(doc, root, "address", client->address_name);
 		}
-		json_object_set_new_nocheck(val, "server", json_integer(client->server));
+		yyjson_mut_obj_add_sint(doc, root, "server", client->server);
 
 		/* Do not send messages of clients we've already dropped. We
 		 * do this unlocked as the occasional false negative can be
 		 * filtered by the stratifier. */
 		if (likely(!client->invalid)) {
 			if (!ckp->passthrough)
-				stratifier_add_recv(ckp, val);
-			if (ckp->node)
-				stratifier_add_recv(ckp, json_deep_copy(val));
-			if (ckp->passthrough)
-				generator_add_send(ckp, val);
+				stratifier_add_yyrecv(ckp, doc);
+			else if (ckp->node)
+				stratifier_add_yyrecv(ckp, doc);
+			else if (ckp->passthrough) {
+				generator_add_send(ckp, yyjson_to_json(doc));
+				yyjson_mut_doc_free(doc);
+			}
 		} else
-			json_decref(val);
+			yyjson_mut_doc_free(doc);
 	}
 	client->bufofs -= buflen;
 	if (client->bufofs)
@@ -943,9 +957,19 @@ static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, co
 	if (found) {
 		bool result = false;
 
-		if (!json_get_bool(&result, val, "result")) {
-			LOGINFO("Failed to find result in trs share");
-			goto out;
+		{
+			json_t *res_val = json_object_get(val, "result");
+
+			if (!json_is_boolean(res_val)) {
+				json_t *err_val = json_object_get(val, "error");
+
+				if (unlikely(!(json_is_null(res_val) && err_val && !json_is_null(err_val)))) {
+					LOGINFO("Failed to find result in trs share");
+					goto out;
+				}
+				result = false;
+			} else
+				result = json_is_true(res_val);
 		}
 		if (!json_is_null(json_object_get(val, "error"))) {
 			LOGINFO("Got error for trs share");
@@ -1075,6 +1099,26 @@ static void send_client_json(ckpool_t *ckp, cdata_t *cdata, int64_t client_id, j
 	msg = json_dumps(json_msg, JSON_EOL | JSON_COMPACT);
 	send_client(ckp, cdata, client_id, msg);
 	json_decref(json_msg);
+}
+
+static void send_client_yyjson(ckpool_t *ckp, cdata_t *cdata, int64_t client_id, yyjson_mut_doc *doc)
+{
+	client_instance_t *client;
+	char *msg;
+
+	if (ckp->node && (client = ref_client_by_id(cdata, client_id))) {
+		yyjson_mut_doc *tmp_doc = yyjson_mut_doc_mut_copy(doc, NULL);
+		yyjson_mut_val *root = yyjson_mut_doc_get_root(tmp_doc);
+
+		yyjson_mut_obj_add_sint(tmp_doc, root, "client_id", client_id);
+		yyjson_mut_obj_add_str(tmp_doc, root, "address", client->address_name);
+		yyjson_mut_obj_add_sint(tmp_doc, root, "server", client->server);
+		dec_instance_ref(cdata, client);
+		stratifier_add_yyrecv(ckp, tmp_doc);
+	}
+	msg = yyjson_mut_write(doc, YYJSON_WRITE_NEWLINE_AT_END, NULL);
+	send_client(ckp, cdata, client_id, msg);
+	yyjson_mut_doc_free(doc);
 }
 
 /* When testing if a client exists, passthrough clients don't exist when their
@@ -1294,39 +1338,50 @@ out:
 	return ret;
 }
 
-static void client_message_processor(ckpool_t *ckp, json_t *json_msg)
+static void client_yymessage_processor(ckpool_t *ckp, yyjson_mut_doc *doc)
 {
 	cdata_t *cdata = ckp->cdata;
 	client_instance_t *client;
+	yyjson_mut_val *root = yyjson_mut_doc_get_root(doc);
 	int64_t client_id;
 
 	/* Extract the client id from the json message and remove its entry */
-	client_id = json_integer_value(json_object_get(json_msg, "client_id"));
-	json_object_del(json_msg, "client_id");
+	client_id = yyjson_mut_get_num(yyjson_mut_obj_get(root, "client_id"));
+	yyjson_mut_obj_remove_key(root, "client_id");
 	/* Put client_id back in for a passthrough subclient, passing its
 	 * upstream client_id instead of the passthrough's. */
 	if (subclient(client_id))
-		json_object_set_new_nocheck(json_msg, "client_id", json_integer(client_id & 0xffffffffll));
+		yyjson_mut_obj_add_sint(doc, root, "client_id", client_id & 0xffffffffll);
 
 	/* Flag redirector clients once they've been authorised */
 	if (ckp->redirector && (client = ref_client_by_id(cdata, client_id))) {
 		if (!client->redirected && !client->authorised) {
-			json_t *method_val = json_object_get(json_msg, "node.method");
-			const char *method = json_string_value(method_val);
+			yyjson_mut_val *method_val = yyjson_mut_obj_get(root, "node.method");
+			const char *method = yyjson_mut_get_str(method_val);
 
 			if (!safecmp(method, stratum_msgs[SM_AUTHRESULT]))
 				client->authorised = true;
 		}
 		dec_instance_ref(cdata, client);
 	}
-	send_client_json(ckp, cdata, client_id, json_msg);
+	send_client_yyjson(ckp, cdata, client_id, doc);
 }
 
 void connector_add_message(ckpool_t *ckp, json_t *val)
 {
 	cdata_t *cdata = ckp->cdata;
+	yyjson_mut_doc *doc = json_to_yyjson(val);
 
-	ckmsgq_add(cdata->cmpq, val);
+	json_decref(val);
+	if (likely(doc))
+		ckmsgq_add(cdata->cympq, doc);
+}
+
+void connector_add_yymessage(ckpool_t *ckp, yyjson_mut_doc *doc)
+{
+	cdata_t *cdata = ckp->cdata;
+
+	ckmsgq_add(cdata->cympq, doc);
 }
 
 /* Send the passthrough the terminate node.method */
@@ -1448,9 +1503,13 @@ retry:
 	/* The bulk of the messages will be json messages to send to clients
 	 * so look for them first. */
 	if (likely(buf[0] == '{')) {
-		json_t *val = json_loads(buf, JSON_DISABLE_EOF_CHECK, NULL);
+		yyjson_doc *sdoc = yyjson_read(buf, strlen(buf), YYJSON_READ_STOP_WHEN_DONE);
 
-		ckmsgq_add(cdata->cmpq, val);
+		if (likely(sdoc)) {
+			yyjson_mut_doc *doc = yyjson_doc_mut_copy(sdoc, NULL);
+			yyjson_doc_free(sdoc);
+			ckmsgq_add(cdata->cympq, doc);
+		}
 	} else if (cmdmatch(buf, "dropclient")) {
 		client_instance_t *client;
 
@@ -1636,7 +1695,7 @@ void *connector(void *arg)
 	if (tries)
 		LOGWARNING("Connector successfully bound to socket");
 
-	cdata->cmpq = create_ckmsgq(ckp, "cmpq", &client_message_processor);
+	cdata->cympq = create_ckmsgq(ckp, "cympq", &client_yymessage_processor);
 
 	if (ckp->remote && !setup_upstream(ckp, cdata))
 		goto out;
