@@ -790,11 +790,11 @@ static yyjson_doc *_yyjson_rpc_call(connsock_t *cs, const char *rpc_req, const b
 	}
 	http_req = ckalloc(len + 256); // Leave room for headers
 	sprintf(http_req,
-		 "POST / HTTP/1.1\n"
-		 "Authorization: Basic %s\n"
-		 "Host: %s:%s\n"
+		 "POST / HTTP/1.1\r\n"
+		 "Authorization: Basic %s\r\n"
+		 "Host: %s:%s\r\n"
 		 "Content-type: application/json\n"
-		 "Content-Length: %d\n\n%s",
+		 "Content-Length: %d\r\n\r\n%s",
 		 cs->auth, cs->url, cs->port, len, rpc_req);
 
 	len = strlen(http_req);
