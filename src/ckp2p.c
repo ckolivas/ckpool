@@ -747,9 +747,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 		return -1;
 	}
 	ckp->p2pconn = ckp2p_connect(cs->url, cs->port);
-	if (!ckp->p2pconn) {
-		LOGEMERG("Failed to ckp2p_connect in setup_servers");
-		return -1;
+	while (!ckp->p2pconn) {
+		LOGWARNING("Failed to ckp2p_connect in setup_servers");
+		sleep(5);
+		ckp->p2pconn = ckp2p_connect(cs->url, cs->port);
 	}
 	return 0;
 }
