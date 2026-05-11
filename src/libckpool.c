@@ -1644,6 +1644,28 @@ void b58tobin(char *b58bin, const char *b58)
 	}
 }
 
+void write_varint(uchar *buf, size_t *off, uint64_t v)
+{
+	if (v < 0xfd) {
+		buf[(*off)++] = (uchar)v;
+	} else if (v <= 0xffff) {
+		buf[(*off)++] = 0xfd;
+		uint16_t tmp = htole16((uint16_t)v);
+		memcpy(buf + *off, &tmp, 2);
+		*off += 2;
+	} else if (v <= 0xffffffffULL) {
+		buf[(*off)++] = 0xfe;
+		uint32_t tmp = htole32((uint32_t)v);
+		memcpy(buf + *off, &tmp, 4);
+		*off += 4;
+	} else {
+		buf[(*off)++] = 0xff;
+		uint64_t tmp = htole64(v);
+		memcpy(buf + *off, &tmp, 8);
+		*off += 8;
+	}
+}
+
 /* Does a safe string comparison tolerating zero length and NULL strings */
 int safecmp(const char *a, const char *b)
 {
