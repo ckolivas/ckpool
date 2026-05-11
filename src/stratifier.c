@@ -2063,9 +2063,13 @@ static char *
 process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	      const uchar *data, const uchar *hash, uchar *flip32, char *blockhash)
 {
+	uint64_t nonce_le, shortid_nonce;
 	char *gbt_block, varint[12];
 	int txns = wb->txns + 1;
+	ckpool_t *ckp = wb->ckp;
 	char hexcoinbase[1024];
+	size_t cmpct_len, off;
+	uchar *cmpct_payload;
 
 	flip_32(flip32, hash);
 	__bin2hex(blockhash, flip32, 32);
@@ -2091,6 +2095,41 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	strcat(gbt_block, varint);
 	__bin2hex(hexcoinbase, coinbase, cblen);
 	strcat(gbt_block, hexcoinbase);
+
+	/* Attempt to submit a compact block via p2p first */
+	shortid_nonce = ((uint64_t)rand() << 32) | rand();   /* random nonce */
+
+	/* Calculate exact size: header(80) + nonce(8) + varint(0) + varint(1) + varint(0) + coinbase */
+	cmpct_len = 80 + 8 + 1 + 1 + 1 + (size_t)cblen;
+	cmpct_payload = ckalloc(cmpct_len);
+	off = 0;
+
+	/* 1. Block header (80 bytes) */
+	memcpy(cmpct_payload + off, data, 80);
+	off += 80;
+
+	/* 2. shortid_nonce (LE) */
+	nonce_le = htole64(shortid_nonce);
+	memcpy(cmpct_payload + off, &nonce_le, 8);
+	off += 8;
+
+	/* 3. shortid count = 0 */
+	write_varint(cmpct_payload, &off, 0);
+
+	/* 4. prefilled txn count = 1 (only coinbase) */
+	write_varint(cmpct_payload, &off, 1);
+
+	/* 5. prefilled txn: index = 0 + coinbase transaction */
+	write_varint(cmpct_payload, &off, 0);
+	memcpy(cmpct_payload + off, coinbase, cblen);
+	off += cblen;
+
+	/* Submit via ckp2p */
+	submit_compact_block(ckp->p2pconn, hash, cmpct_payload, (uint32_t)off, shortid_nonce);
+
+	dealloc(cmpct_payload);
+	LOGNOTICE("P2P: Submitted compact block %s (prefilled coinbase only)", blockhash);
+
 	if (wb->txns)
 		realloc_strcat(&gbt_block, wb->txn_data);
 	return gbt_block;
