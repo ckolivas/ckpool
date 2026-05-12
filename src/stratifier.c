@@ -522,6 +522,35 @@ static void info_msg_entries(char_entry_t **entries)
 
 static const int witnessdata_size = 36; // commitment header + hash
 
+/* Minimal CScriptNum encoding of block height exactly as Bitcoin Core expects */
+static int ser_bip34_height(uint8_t *buf, uint32_t height)
+{
+	if (height == 0) {
+		buf[0] = 0x00;                  /* OP_0 */
+		return 1;
+	}
+	if (height <= 16) {
+		buf[0] = 0x50 + (uint8_t)height; /* OP_1 (0x51) … OP_16 (0x60) */
+		return 1;
+	}
+
+	/* General case: shortest little-endian bytes + push length */
+	uint8_t tmp[5];
+	int nlen = 0;
+	uint32_t h = height;
+	do {
+		tmp[nlen++] = h & 0xff;
+		h >>= 8;
+	} while (h);
+
+	if (tmp[nlen-1] & 0x80)
+		tmp[nlen++] = 0x00;             /* sign byte for positive number */
+
+	buf[0] = (uint8_t)nlen;             /* push length */
+	memcpy(buf + 1, tmp, nlen);
+	return nlen + 1;
+}
+
 static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 {
 	uint64_t u64, g64, d64 = 0;
@@ -543,7 +572,10 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
 
 	/* Put block height at start of template */
-	len = ser_number(wb->coinb1bin + ofs, wb->height);
+	if (unlikely(ckp->regtest))
+		len = ser_bip34_height(wb->coinb1bin + ofs, wb->height);
+	else
+		len = ser_number(wb->coinb1bin + ofs, wb->height);
 	ofs += len;
 
 	/* Followed by flag */
@@ -8874,6 +8906,7 @@ void *stratifier(void *arg)
 			ckp->donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
 			LOGNOTICE("BTC regtest donation address valid %s", ckp->donaddress);
+			ckp->regtest = true;
 		} else
 			LOGNOTICE("No valid donation address found");
 	}
