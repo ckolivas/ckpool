@@ -2157,7 +2157,7 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	off += cblen;
 
 	/* Submit via ckp2p */
-	submit_compact_block(ckp->p2pconn, hash, cmpct_payload, (uint32_t)off, shortid_nonce);
+	submit_compact_block(ckp, hash, cmpct_payload, (uint32_t)off, shortid_nonce);
 
 	dealloc(cmpct_payload);
 	LOGNOTICE("P2P: Submitted compact block %s (prefilled coinbase only)", blockhash);

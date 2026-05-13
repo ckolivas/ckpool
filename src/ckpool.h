@@ -237,9 +237,10 @@ struct ckpool_instance {
 	int nonce2length; // Extranonce2 length
 
 	/* p2p bitcoind data */
-	char *p2purl;
-	connsock_t p2pcs;
-	p2p_conn_t *p2pconn;
+	int p2purls;
+	char **p2purl;
+	connsock_t **p2pcs;
+	p2p_conn_t **p2pconn;
 
 	/* Difficulty settings */
 	int64_t mindiff; // Default 1

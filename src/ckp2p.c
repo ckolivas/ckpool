@@ -633,48 +633,50 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	return true;
 }
 
-void submit_compact_block(p2p_conn_t *conn, const uchar *blockhash, const uchar *cmpct_payload, uint32_t cmpct_len, uint64_t shortid_nonce)
+void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, const uchar *cmpct_payload,
+			  uint32_t cmpct_len, uint64_t shortid_nonce)
 {
 	char *hex;
+	int i;
 
-	if (!conn) {
-		LOGERR("Cannot submit - no P2P connection object");
-		return;
-	}
+	/* FIXME currently blocking in critical block submission path, make async */
+	for (i = 0; i < ckp->p2purls; i++) {
+		p2p_conn_t *conn = ckp->p2pconn[i];
 
-	if (conn->sock < 0 || !conn->handshake_done) {
-		LOGINFO("Connection not active - reconnecting for submission");
-		if (p2p_connect_socket(conn)) {
-			if (!do_handshake(conn, conn->port)) {
+		if (conn->sock < 0 || !conn->handshake_done) {
+			LOGINFO("Connection not active - reconnecting for submission");
+			if (p2p_connect_socket(conn)) {
+				if (!do_handshake(conn, conn->port)) {
+					LOGERR("Reconnect failed - cannot submit");
+					close(conn->sock);
+					conn->sock = -1;
+					conn->handshake_done = false;
+					return;
+				}
+			} else {
 				LOGERR("Reconnect failed - cannot submit");
-				close(conn->sock);
-				conn->sock = -1;
-				conn->handshake_done = false;
 				return;
 			}
-		} else {
-			LOGERR("Reconnect failed - cannot submit");
+		}
+
+		ck_wlock(&conn->block_lock);
+		if (conn->cmpct_payload)
+			dealloc(conn->cmpct_payload);
+		memcpy(conn->blockhash, blockhash, 32);
+		conn->cmpct_payload = ckalloc(cmpct_len);
+		if (!conn->cmpct_payload) {
+			LOGERR("OOM in submit_compact_block");
+			ck_wunlock(&conn->block_lock);
 			return;
 		}
-	}
-
-	ck_wlock(&conn->block_lock);
-	if (conn->cmpct_payload)
-		dealloc(conn->cmpct_payload);
-	memcpy(conn->blockhash, blockhash, 32);
-	conn->cmpct_payload = ckalloc(cmpct_len);
-	if (!conn->cmpct_payload) {
-		LOGERR("OOM in submit_compact_block");
+		memcpy(conn->cmpct_payload, cmpct_payload, cmpct_len);
+		conn->cmpct_len = cmpct_len;
+		conn->shortid_nonce = shortid_nonce;
+		conn->has_block = true;
 		ck_wunlock(&conn->block_lock);
-		return;
-	}
-	memcpy(conn->cmpct_payload, cmpct_payload, cmpct_len);
-	conn->cmpct_len = cmpct_len;
-	conn->shortid_nonce = shortid_nonce;
-	conn->has_block = true;
-	ck_wunlock(&conn->block_lock);
 
-	p2p_send(conn, "cmpctblock", cmpct_payload, cmpct_len);
+		p2p_send(conn, "cmpctblock", cmpct_payload, cmpct_len);
+	}
 
 	hex = bin2hex(blockhash, 32);
 	LOGINFO("Submitted compact block %s", hex);
@@ -740,17 +742,29 @@ err:
 int prepare_ckp2p(ckpool_t *ckp)
 {
 	connsock_t *cs;
+	int i;
 
-	cs = &ckp->p2pcs;
-	if (!extract_sockaddr(ckp->p2purl, &cs->url, &cs->port)) {
-		LOGEMERG("Failed to extract address from p2purl %s", ckp->p2purl);
-		return -1;
+	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
+	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
+	for (i = 0 ; i < ckp->p2purls ; i++) {
+		ckp->p2pcs[i] = ckzalloc(sizeof(connsock_t));
+		cs = ckp->p2pcs[i];
+		if (!extract_sockaddr(ckp->p2purl[i], &cs->url, &cs->port)) {
+			LOGEMERG("Failed to extract address from p2purl %s", ckp->p2purl[i]);
+			return -1;
+		}
 	}
-	ckp->p2pconn = ckp2p_connect(cs->url, cs->port);
-	while (!ckp->p2pconn) {
-		LOGWARNING("Failed to ckp2p_connect in setup_servers");
-		sleep(5);
-		ckp->p2pconn = ckp2p_connect(cs->url, cs->port);
+
+	for (i = 0 ; i < ckp->p2purls ; i++) {
+		cs = ckp->p2pcs[i];
+		ckp->p2pconn[i] = ckp2p_connect(cs->url, cs->port);
+		while (!ckp->p2pconn[i]) {
+			LOGWARNING("Failed to ckp2p_connect in setup_servers");
+			sleep(5);
+			ckp->p2pconn[i] = ckp2p_connect(cs->url, cs->port);
+		}
+		LOGWARNING("Connected ckp2p to bitcoin node %s", ckp->p2purl[i]);
 	}
+
 	return 0;
 }

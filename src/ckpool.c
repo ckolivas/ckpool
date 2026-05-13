@@ -1272,6 +1272,21 @@ static void parse_btcds(ckpool_t *ckp, const json_t *arr_val, const int arr_size
 	}
 }
 
+static void parse_p2purls(ckpool_t *ckp, const json_t *arr_val, const int arr_size)
+{
+	json_t *val;
+	int i;
+
+	ckp->p2purls = arr_size;
+	ckp->p2purl = ckzalloc(sizeof(char *) * arr_size);
+	for (i = 0; i < arr_size; i++) {
+		val = json_array_get(arr_val, i);
+
+		if (!_json_get_string(&ckp->p2purl[i], val, "p2purl"))
+			LOGWARNING("Invalid p2purl entry number %d", i);
+	}
+}
+
 static void parse_proxies(ckpool_t *ckp, const json_t *arr_val, const int arr_size)
 {
 	json_t *val;
@@ -1438,7 +1453,12 @@ static void parse_config(ckpool_t *ckp)
 		if (arr_size)
 			parse_btcds(ckp, arr_val, arr_size);
 	}
-	json_get_string(&ckp->p2purl, json_conf, "p2purl");
+	arr_val = json_object_get(json_conf, "p2purl");
+	if (arr_val && json_is_array(arr_val)) {
+		arr_size = json_array_size(arr_val);
+		if (arr_size)
+			parse_p2purls(ckp, arr_val, arr_size);
+	}
 	json_get_string(&ckp->btcaddress, json_conf, "btcaddress");
 	json_get_string(&ckp->btcsig, json_conf, "btcsig");
 	if (ckp->btcsig && strlen(ckp->btcsig) > 38) {
@@ -1752,8 +1772,11 @@ int main(int argc, char **argv)
 		if (!ckp.btcdpass[i])
 			ckp.btcdpass[i] = strdup("pass");
 	}
-	if (!ckp.p2purl)
-		ckp.p2purl = strdup("localhost:8333");
+	if (!ckp.p2purls) {
+		ckp.p2purls = 1;
+		ckp.p2purl = ckzalloc(sizeof(char *));
+		ckp.p2purl[0] = strdup("localhost:8333");
+	}
 
 	ckp.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
 
