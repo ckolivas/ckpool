@@ -199,10 +199,6 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 	}
 
 	*payload = ckalloc(*plen);
-	if (!*payload) {
-		LOGERR("OOM in p2p_recv");
-		return false;
-	}
 
 	if (read_exact(conn->sock, *payload, *plen) != (ssize_t)*plen) {
 		dealloc(*payload);
@@ -664,11 +660,6 @@ void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, const uchar *cm
 			dealloc(conn->cmpct_payload);
 		memcpy(conn->blockhash, blockhash, 32);
 		conn->cmpct_payload = ckalloc(cmpct_len);
-		if (!conn->cmpct_payload) {
-			LOGERR("OOM in submit_compact_block");
-			ck_wunlock(&conn->block_lock);
-			return;
-		}
 		memcpy(conn->cmpct_payload, cmpct_payload, cmpct_len);
 		conn->cmpct_len = cmpct_len;
 		conn->shortid_nonce = shortid_nonce;
@@ -688,10 +679,6 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
 	int port, i;
 
-	if (!conn) {
-		LOGERR("OOM in ckp2p_connect");
-		return NULL;
-	}
 	cklock_init(&conn->block_lock);
 	conn->cmpct_payload = NULL;
 	conn->has_block = false;
