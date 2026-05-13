@@ -178,6 +178,7 @@ static inline void flip_80(void *dest_p, const void *src_p)
 
 #define ckalloc(len) _ckalloc(len, __FILE__, __func__, __LINE__)
 #define ckzalloc(len) _ckzalloc(len, __FILE__, __func__, __LINE__)
+#define ckrealloc(ptr, size) _ckrealloc(ptr, size, __FILE__, __func__, __LINE__);
 
 #define dealloc(ptr) do { \
 	free(ptr); \
@@ -591,6 +592,7 @@ bool rotating_log(const char *path, const char *msg);
 void align_len(size_t *len);
 void realloc_strcat(char **ptr, const char *s);
 void trail_slash(char **buf);
+void *_ckrealloc(void *ptr, size_t size, const char *file, const char *func, const int line);
 void *_ckalloc(size_t len, const char *file, const char *func, const int line);
 void *json_ckalloc(size_t size);
 void *_ckzalloc(size_t len, const char *file, const char *func, const int line);

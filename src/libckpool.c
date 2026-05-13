@@ -1391,6 +1391,24 @@ void align_len(size_t *len)
 		*len += 4 - (*len % 4);
 }
 
+void *_ckrealloc(void *ptr, size_t size, const char *file, const char *func, const int line)
+{
+	int backoff = 1;
+	void *new_ptr;
+
+	while (42) {
+		new_ptr = realloc(ptr, size);
+		if (likely(new_ptr))
+			break;
+		if (backoff == 1)
+			fprintf(stderr, "Failed to realloc %d, retrying from %s %s:%d\n",
+				(int)size, file, func, line);
+		cksleep_ms(backoff);
+		backoff <<= 1;
+	}
+	return new_ptr;
+}
+
 /* Malloc failure should be fatal but keep backing off and retrying as the OS
  * will kill us eventually if it can't recover. */
 void realloc_strcat(char **ptr, const char *s)
@@ -1420,7 +1438,7 @@ void realloc_strcat(char **ptr, const char *s)
 		if (likely(new_ptr))
 			break;
 		if (backoff == 1)
-			fprintf(stderr, "Failed to realloc %d, retrying\n", (int)len);
+			fprintf(stderr, "Failed to realloc_strcat %d, retrying\n", (int)len);
 		cksleep_ms(backoff);
 		backoff <<= 1;
 	}

@@ -558,7 +558,7 @@ reparse:
 		send_client(ckp, cdata, client->id, buf);
 		return false;
 	} else {
-		yyjson_mut_doc *doc = yyjson_doc_mut_copy(sdoc, NULL);
+		yyjson_mut_doc *doc = yyjson_doc_mut_copy(sdoc, &ckyyalc);
 		yyjson_mut_val *root = yyjson_mut_doc_get_root(doc);
 
 		yyjson_doc_free(sdoc);
@@ -1107,7 +1107,7 @@ static void send_client_yyjson(ckpool_t *ckp, cdata_t *cdata, int64_t client_id,
 	char *msg;
 
 	if (ckp->node && (client = ref_client_by_id(cdata, client_id))) {
-		yyjson_mut_doc *tmp_doc = yyjson_mut_doc_mut_copy(doc, NULL);
+		yyjson_mut_doc *tmp_doc = yyjson_mut_doc_mut_copy(doc, &ckyyalc);
 		yyjson_mut_val *root = yyjson_mut_doc_get_root(tmp_doc);
 
 		yyjson_mut_obj_add_sint(tmp_doc, root, "client_id", client_id);
@@ -1506,7 +1506,7 @@ retry:
 		yyjson_doc *sdoc = yyjson_read(buf, strlen(buf), YYJSON_READ_STOP_WHEN_DONE);
 
 		if (likely(sdoc)) {
-			yyjson_mut_doc *doc = yyjson_doc_mut_copy(sdoc, NULL);
+			yyjson_mut_doc *doc = yyjson_doc_mut_copy(sdoc, &ckyyalc);
 			yyjson_doc_free(sdoc);
 			ckmsgq_add(cdata->cympq, doc);
 		}

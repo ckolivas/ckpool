@@ -191,7 +191,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	}
 
 	/* Store getblocktemplate for remainder of json components as is */
-	mut_doc = yyjson_mut_doc_new(NULL);
+	mut_doc = yyjson_mut_doc_new(&ckyyalc);
 	if (unlikely(!mut_doc)) {
 		LOGEMERG("Failed to allocate mut_doc");
 		exit(1);
@@ -235,7 +235,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	gbt->flags = strdup(flags);
 
 	/* Create immutable json for faster access in gbt */
-	gbt->gbtdoc = yyjson_mut_doc_imut_copy(mut_doc, NULL);
+	gbt->gbtdoc = yyjson_mut_doc_imut_copy(mut_doc, &ckyyalc);
 	gbt->gbtroot = yyjson_doc_get_root(gbt->gbtdoc);
 	yyjson_mut_doc_free(mut_doc);
 
