@@ -629,15 +629,27 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	return true;
 }
 
-void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, const uchar *cmpct_payload,
-			  uint32_t cmpct_len, uint64_t shortid_nonce)
+struct compact_block {
+	pthread_t pth;
+	ckpool_t *ckp;
+	uchar *blockhash;
+	uchar *cmpct_payload;
+	uint32_t cmpct_len;
+	uint64_t shortid_nonce;
+};
+
+typedef struct compact_block compact_block_t;
+
+static void *submission_thread(void *arg)
 {
+	compact_block_t *cbt = arg;
 	char *hex;
 	int i;
 
-	/* FIXME currently blocking in critical block submission path, make async */
-	for (i = 0; i < ckp->p2purls; i++) {
-		p2p_conn_t *conn = ckp->p2pconn[i];
+	pthread_detach(pthread_self());
+
+	for (i = 0; i < cbt->ckp->p2purls; i++) {
+		p2p_conn_t *conn = cbt->ckp->p2pconn[i];
 
 		if (conn->sock < 0 || !conn->handshake_done) {
 			LOGINFO("Connection not active - reconnecting for submission");
@@ -647,31 +659,48 @@ void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, const uchar *cm
 					close(conn->sock);
 					conn->sock = -1;
 					conn->handshake_done = false;
-					return;
+					break;
 				}
 			} else {
 				LOGERR("Reconnect failed - cannot submit");
-				return;
+				break;
 			}
 		}
 
 		ck_wlock(&conn->block_lock);
 		if (conn->cmpct_payload)
 			dealloc(conn->cmpct_payload);
-		memcpy(conn->blockhash, blockhash, 32);
-		conn->cmpct_payload = ckalloc(cmpct_len);
-		memcpy(conn->cmpct_payload, cmpct_payload, cmpct_len);
-		conn->cmpct_len = cmpct_len;
-		conn->shortid_nonce = shortid_nonce;
+		memcpy(conn->blockhash, cbt->blockhash, 32);
+		conn->cmpct_payload = ckalloc(cbt->cmpct_len);
+		memcpy(conn->cmpct_payload, cbt->cmpct_payload, cbt->cmpct_len);
+		conn->cmpct_len = cbt->cmpct_len;
+		conn->shortid_nonce = cbt->shortid_nonce;
 		conn->has_block = true;
 		ck_wunlock(&conn->block_lock);
 
-		p2p_send(conn, "cmpctblock", cmpct_payload, cmpct_len);
+		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
 	}
 
-	hex = bin2hex(blockhash, 32);
+	hex = bin2hex(cbt->blockhash, 32);
 	LOGINFO("Submitted compact block %s", hex);
-	dealloc(hex);
+	free(cbt);
+	free(hex);
+
+	return NULL;
+}
+
+void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, const uchar *cmpct_payload,
+			  uint32_t cmpct_len, uint64_t shortid_nonce)
+{
+	compact_block_t *cbt = ckalloc(sizeof(compact_block_t));
+
+	cbt->ckp = ckp;
+	cbt->blockhash = (uchar *)strdup((const char *)blockhash);
+	cbt->cmpct_payload = (uchar *)strdup((const char *)cmpct_payload);
+	cbt->cmpct_len = cmpct_len;
+	cbt->shortid_nonce = shortid_nonce;
+
+	create_pthread(&cbt->pth, submission_thread, cbt);
 }
 
 static p2p_conn_t *ckp2p_connect(const char *host, const char *charport)
