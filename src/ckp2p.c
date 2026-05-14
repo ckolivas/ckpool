@@ -632,7 +632,7 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 struct compact_block {
 	pthread_t pth;
 	ckpool_t *ckp;
-	uchar *blockhash;
+	uchar blockhash[32];
 	uchar *cmpct_payload;
 	uint32_t cmpct_len;
 	uint64_t shortid_nonce;
@@ -683,6 +683,7 @@ static void *submission_thread(void *arg)
 
 	hex = bin2hex(cbt->blockhash, 32);
 	LOGINFO("Submitted compact block %s", hex);
+	free(cbt->cmpct_payload);
 	free(cbt);
 	free(hex);
 
@@ -695,8 +696,9 @@ void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, const uchar *cm
 	compact_block_t *cbt = ckalloc(sizeof(compact_block_t));
 
 	cbt->ckp = ckp;
-	cbt->blockhash = (uchar *)strdup((const char *)blockhash);
-	cbt->cmpct_payload = (uchar *)strdup((const char *)cmpct_payload);
+	memcpy(cbt->blockhash, blockhash, 32);
+	cbt->cmpct_payload = ckalloc(cmpct_len);
+	memcpy(cbt->cmpct_payload, cmpct_payload, cmpct_len);
 	cbt->cmpct_len = cmpct_len;
 	cbt->shortid_nonce = shortid_nonce;
 
