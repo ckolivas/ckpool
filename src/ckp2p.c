@@ -105,7 +105,7 @@ static ssize_t read_exact(int sock, void *buf, size_t len)
 			if (n == 0)
 				LOGNOTICE("P2P Peer closed connection");
 			else
-				LOGERR("P2P read error: %s", strerror(errno));
+				LOGNOTICE("P2P read error: %s", strerror(errno));
 			return n;
 		}
 		left -= n;
@@ -743,6 +743,7 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
 	p2pendpoint_t *p2pe;
+	bool success = true;
 	int port, i;
 
 	cklock_init(&conn->block_lock);
@@ -770,12 +771,18 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	}
 
 	if (!p2p_connect_socket(conn))
-		goto err;
+		success = false;
 
-	if (!do_handshake(conn, port))
-		goto err;
+	if (success && !do_handshake(conn, port))
+		success = false;
 
-	LOGNOTICE("ckp2p connected to bitcoin node %s:%s", host, charport);
+	if (!success) {
+		LOGWARNING("ckp2p Failed to connect to bitcoin node %s:%s, deferring", host, charport);
+		if (conn->sock >= 0)
+			close(conn->sock);
+		conn->sock = -1;
+	} else
+		LOGWARNING("ckp2p connected to bitcoin node %s:%s", host, charport);
 	p2pe = ckzalloc(sizeof(p2pendpoint_t));
 	p2pe->ckp = ckp;
 	p2pe->conn = conn;
@@ -786,13 +793,6 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	create_pthread(&p2pe->keepalive_thread, p2p_keepalive, p2pe);
 
 	return conn;
-
-err:
-	LOGEMERG("ckp2p Failed to connect to bitcoin node %s:%s", host, charport);
-	if (conn->sock >= 0)
-		close(conn->sock);
-	dealloc(conn);
-	return NULL;
 }
 
 int prepare_ckp2p(ckpool_t *ckp)
@@ -814,12 +814,6 @@ int prepare_ckp2p(ckpool_t *ckp)
 	for (i = 0 ; i < ckp->p2purls ; i++) {
 		cs = ckp->p2pcs[i];
 		ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
-		if (!ckp->p2pconn[i]) {
-			LOGWARNING("Failed initial ckp2p_connect to %s, deferring",
-				   ckp->p2purl[i]);
-			continue;
-		}
-		LOGWARNING("Connected ckp2p to bitcoin node %s", ckp->p2purl[i]);
 	}
 
 	return 0;
