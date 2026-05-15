@@ -380,7 +380,7 @@ static bool do_handshake(p2p_conn_t *conn, int port);
 
 static void *p2p_reader(void *arg)
 {
-	static int reconnect_delay = 0;
+	static int reconnect_delay = 1;
 	p2p_conn_t *conn = arg;
 	char cmd[13];
 	uchar *payload;
@@ -398,7 +398,9 @@ static void *p2p_reader(void *arg)
 				}
 			}
 			if (conn->sock < 0) {
-				sleep(++reconnect_delay);
+				if (reconnect_delay < 512)
+					reconnect_delay *= 2;
+				sleep(reconnect_delay);
 				continue;
 			}
 		}
@@ -411,7 +413,7 @@ static void *p2p_reader(void *arg)
 			continue;
 		}
 
-		reconnect_delay = 0;
+		reconnect_delay = 1;
 		// Log all received messages with descriptive type, even if ignoring
 		if (!strcmp(cmd, "version")) {
 			LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
@@ -776,10 +778,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 	for (i = 0 ; i < ckp->p2purls ; i++) {
 		cs = ckp->p2pcs[i];
 		ckp->p2pconn[i] = ckp2p_connect(cs->url, cs->port);
-		while (!ckp->p2pconn[i]) {
-			LOGWARNING("Failed to ckp2p_connect in setup_servers");
-			sleep(5);
-			ckp->p2pconn[i] = ckp2p_connect(cs->url, cs->port);
+		if (!ckp->p2pconn[i]) {
+			LOGWARNING("Failed initial ckp2p_connect to %s, deferring",
+				   ckp->p2purl[i]);
+			continue;
 		}
 		LOGWARNING("Connected ckp2p to bitcoin node %s", ckp->p2purl[i]);
 	}
