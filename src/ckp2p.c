@@ -416,7 +416,7 @@ static void *p2p_reader(void *arg)
 		}
 
 		if (!p2p_recv(conn, cmd, &payload, &plen)) {
-			LOGERR("P2P recv failed - disconnecting");
+			LOGNOTICE("P2P recv failed - disconnecting");
 			close(conn->sock);
 			conn->sock = -1;
 			conn->handshake_done = false;
@@ -685,14 +685,14 @@ static void *submission_thread(void *arg)
 			LOGINFO("Connection not active - reconnecting for submission");
 			if (p2p_connect_socket(conn)) {
 				if (!do_handshake(conn, conn->port)) {
-					LOGERR("Reconnect failed - cannot submit");
+					LOGNOTICE("Reconnect failed - cannot submit");
 					close(conn->sock);
 					conn->sock = -1;
 					conn->handshake_done = false;
 					break;
 				}
 			} else {
-				LOGERR("Reconnect failed - cannot submit");
+				LOGNOTICE("Reconnect failed - cannot submit");
 				break;
 			}
 		}
