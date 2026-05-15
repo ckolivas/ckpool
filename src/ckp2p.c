@@ -103,9 +103,9 @@ static ssize_t read_exact(int sock, void *buf, size_t len)
 		ssize_t n = read(sock, p, left);
 		if (n <= 0) {
 			if (n == 0)
-				LOGNOTICE("P2P Peer closed connection");
+				LOGINFO("P2P Peer closed connection");
 			else
-				LOGNOTICE("P2P read error: %s", strerror(errno));
+				LOGINFO("P2P read error: %s", strerror(errno));
 			return n;
 		}
 		left -= n;
@@ -124,7 +124,7 @@ static ssize_t write_exact(int sock, const void *buf, size_t len)
 		ssize_t n = write(sock, p, left);
 		if (n <= 0) {
 			if (n == 0)
-				LOGNOTICE("P2P write: peer closed connection");
+				LOGINFO("P2P write: peer closed connection");
 			else
 				LOGERR("P2P write error: %s", strerror(errno));
 			return n;
@@ -159,7 +159,7 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 		(plen && write_exact(conn->sock, payload, plen) != (ssize_t)plen)) {
 		LOGERR("p2p_send(%s) failed", cmd);
 		} else {
-			LOGNOTICE("Sent %s (%u bytes)", cmd, plen);
+			LOGINFO("Sent %s (%u bytes)", cmd, plen);
 		}
 }
 
@@ -177,7 +177,7 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 	memcpy(rec_magic, hdr, 4);
 	if (magic_unset(conn->magic)) {
 		memcpy(conn->magic, rec_magic, 4);
-		LOGNOTICE("Auto-detected network magic %02x%02x%02x%02x", rec_magic[0], rec_magic[1], rec_magic[2], rec_magic[3]);
+		LOGINFO("Auto-detected network magic %02x%02x%02x%02x", rec_magic[0], rec_magic[1], rec_magic[2], rec_magic[3]);
 	} else if (memcmp(rec_magic, conn->magic, 4)) {
 		LOGERR("Magic mismatch");
 		return false;
@@ -334,7 +334,7 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		}
 	}
 	if (has_block)
-		LOGNOTICE("Received INV (%u bytes) - requesting cmpctblock for blocks", plen);
+		LOGINFO("Received INV (%u bytes) - requesting cmpctblock for blocks", plen);
 	else
 		LOGDEBUG("Received INV (%u bytes) - ignoring transaction announcements", plen);
 	dealloc(payload);
@@ -367,7 +367,7 @@ static bool p2p_connect_socket(p2p_conn_t *conn)
 {
 	conn->sock = connect_socket(conn->host, conn->charport);
 	if (conn->sock < 0) {
-		LOGERR("connect_socket failed in p2p_connect_socket");
+		LOGINFO("connect_socket failed in p2p_connect_socket");
 		return false;
 	}
 	LOGNOTICE("ckp2p connected to %s:%d (%s)", conn->host, conn->port, conn->netname);
@@ -417,7 +417,7 @@ static void *p2p_reader(void *arg)
 		}
 
 		if (!p2p_recv(conn, cmd, &payload, &plen)) {
-			LOGNOTICE("P2P recv failed - disconnecting");
+			LOGINFO("P2P recv failed - disconnecting");
 			close(conn->sock);
 			conn->sock = -1;
 			conn->handshake_done = false;
@@ -460,11 +460,11 @@ static void *p2p_reader(void *arg)
 			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - handling (resend to all nodes)", plen);
 			handle_cmpctblock(p2pe->ckp, payload, plen, p2pe->source);
 			continue;
-			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - ignoring (compact block data)", plen);
+			LOGINFO("Received CMPCTBLOCK (%u bytes) - ignoring (compact block data)", plen);
 		} else if (!strcmp(cmd, "tx")) {
 			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
 		} else if (!strcmp(cmd, "block")) {
-			LOGNOTICE("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
+			LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
 		} else if (!strcmp(cmd, "blocktxn")) {
 			LOGDEBUG("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
 		} else if (!strcmp(cmd, "getheaders")) {
@@ -488,7 +488,7 @@ static void *p2p_reader(void *arg)
 		} else if (!strcmp(cmd, "sendaddrv2")) {
 			LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
 		} else {
-			LOGNOTICE("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
+			LOGINFO("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
 		}
 
 		if (payload) dealloc(payload);
@@ -591,14 +591,14 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 
-	LOGNOTICE("Waiting for VERSION from peer...");
+	LOGINFO("Waiting for VERSION from peer...");
 
 	while (42) {
 		if (!p2p_recv(conn, cmd, &payload, &plen))
 			return false;
-		LOGNOTICE("Received %s (%u bytes)", cmd, plen);
+		LOGINFO("Received %s (%u bytes)", cmd, plen);
 		if (!strcmp(cmd, "version")) {
-			LOGNOTICE("Received VERSION from peer");
+			LOGINFO("Received VERSION from peer");
 			dealloc(payload);
 			break;
 		}
@@ -617,9 +617,9 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	while (42) {
 		if (!p2p_recv(conn, cmd, &payload, &plen))
 			return false;
-		LOGNOTICE("Received %s (%u bytes)", cmd, plen);
+		LOGINFO("Received %s (%u bytes)", cmd, plen);
 		if (!strcmp(cmd, "verack")) {
-			LOGNOTICE("Received VERACK - handshake complete");
+			LOGINFO("Received VERACK - handshake complete");
 			dealloc(payload);
 			break;
 		}
@@ -659,8 +659,8 @@ typedef struct compact_block compact_block_t;
 static void *submission_thread(void *arg)
 {
 	compact_block_t *cbt = arg;
+	int i, submitted = 0;
 	char *hex;
-	int i;
 
 	pthread_detach(pthread_self());
 
@@ -696,10 +696,12 @@ static void *submission_thread(void *arg)
 		ck_wunlock(&conn->block_lock);
 
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
+		submitted++;
 	}
 
 	hex = bin2hex(cbt->blockhash, 32);
-	LOGINFO("Submitted compact block %s", hex);
+	if (submitted)
+		LOGNOTICE("Submitted %d compact block%s %s", submitted, submitted > 1 ? "s" : "", hex);
 	free(cbt->cmpct_payload);
 	free(cbt);
 	free(hex);
@@ -767,12 +769,14 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 		success = false;
 
 	if (!success) {
-		LOGWARNING("ckp2p Failed to connect to bitcoin node %s:%s, deferring", host, charport);
+		LOGWARNING("ckp2p Failed to connect to bitcoin node %d - %s:%s, deferring",
+			   source, host, charport);
 		if (conn->sock >= 0)
 			close(conn->sock);
 		conn->sock = -1;
 	} else
-		LOGWARNING("ckp2p connected to bitcoin node %s:%s", host, charport);
+		LOGWARNING("ckp2p connected to bitcoin node %d - %s:%s", source, host, charport);
+
 	p2pe = ckzalloc(sizeof(p2pendpoint_t));
 	p2pe->ckp = ckp;
 	p2pe->conn = conn;
@@ -805,6 +809,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 		cs = ckp->p2pcs[i];
 		ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
 	}
+	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
 	return 0;
 }
