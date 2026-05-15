@@ -1079,28 +1079,6 @@ static void send_client(ckpool_t *ckp, cdata_t *cdata, const int64_t id, char *b
 		redirect_client(ckp, client);
 }
 
-static void send_client_json(ckpool_t *ckp, cdata_t *cdata, int64_t client_id, json_t *json_msg)
-{
-	client_instance_t *client;
-	char *msg;
-
-	if (ckp->node && (client = ref_client_by_id(cdata, client_id))) {
-		json_t *val = json_deep_copy(json_msg);
-
-		json_object_set_new_nocheck(val, "client_id", json_integer(client_id));
-		json_object_set_new_nocheck(val, "address", json_string(client->address_name));
-		json_object_set_new_nocheck(val, "server", json_integer(client->server));
-		dec_instance_ref(cdata, client);
-		stratifier_add_recv(ckp, val);
-	}
-	if (ckp->passthrough && client_id)
-		json_object_del(json_msg, "node.method");
-
-	msg = json_dumps(json_msg, JSON_EOL | JSON_COMPACT);
-	send_client(ckp, cdata, client_id, msg);
-	json_decref(json_msg);
-}
-
 static void send_client_yyjson(ckpool_t *ckp, cdata_t *cdata, int64_t client_id, yyjson_mut_doc *doc)
 {
 	client_instance_t *client;
@@ -1140,12 +1118,12 @@ static bool client_exists(cdata_t *cdata, int64_t id)
 
 static void passthrough_client(ckpool_t *ckp, cdata_t *cdata, client_instance_t *client)
 {
-	json_t *val;
+	yyjson_mut_doc *doc;
 
 	LOGINFO("Connector adding passthrough client %"PRId64, client->id);
 	client->passthrough = true;
-	JSON_CPACK(val, "{sb}", "result", true);
-	send_client_json(ckp, cdata, client->id, val);
+	doc = yyjson_mut_pack("{sb}", "result", true);
+	send_client_yyjson(ckp, cdata, client->id, doc);
 	if (!ckp->rmem_warn)
 		set_recvbufsize(ckp, client->fd, 1048576);
 	if (!ckp->wmem_warn)
