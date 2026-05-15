@@ -23,6 +23,7 @@ typedef struct {
 	char host[256];
 	char charport[32];
 	int port;
+	int reconnect;
 } p2p_conn_t;
 
 int prepare_ckp2p(ckpool_t *ckp);

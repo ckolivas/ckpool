@@ -389,7 +389,6 @@ typedef struct p2pendpoint p2pendpoint_t;
 
 static void *p2p_reader(void *arg)
 {
-	static int reconnect_delay = 1;
 	p2pendpoint_t *p2pe = arg;
 	p2p_conn_t *conn = p2pe->conn;
 	char cmd[13];
@@ -398,6 +397,8 @@ static void *p2p_reader(void *arg)
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pr");
+
+	conn->reconnect = 5;
 
 	while (42) {
 		if (conn->sock < 0) {
@@ -408,9 +409,9 @@ static void *p2p_reader(void *arg)
 				}
 			}
 			if (conn->sock < 0) {
-				if (reconnect_delay < 512)
-					reconnect_delay *= 2;
-				sleep(reconnect_delay);
+				if (conn->reconnect < 300)
+					conn->reconnect *= 2;
+				sleep(conn->reconnect);
 				continue;
 			}
 		}
@@ -420,13 +421,13 @@ static void *p2p_reader(void *arg)
 			close(conn->sock);
 			conn->sock = -1;
 			conn->handshake_done = false;
-			if (reconnect_delay < 512)
-				reconnect_delay *= 2;
-			sleep(reconnect_delay);
+			if (conn->reconnect < 300)
+				conn->reconnect *= 2;
+			sleep(conn->reconnect);
 			continue;
 		}
 
-		reconnect_delay = 1;
+		conn->reconnect = 5;
 		// Log all received messages with descriptive type, even if ignoring
 		if (!strcmp(cmd, "version")) {
 			LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
