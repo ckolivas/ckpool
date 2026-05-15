@@ -420,6 +420,9 @@ static void *p2p_reader(void *arg)
 			close(conn->sock);
 			conn->sock = -1;
 			conn->handshake_done = false;
+			if (reconnect_delay < 512)
+				reconnect_delay *= 2;
+			sleep(reconnect_delay);
 			continue;
 		}
 
