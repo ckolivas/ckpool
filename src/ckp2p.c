@@ -677,23 +677,23 @@ static void *submission_thread(void *arg)
 			continue;
 		}
 		if (!memcmp(conn->blockhash, cbt->blockhash, 32)) {
-			LOGDEBUG("Source node %d already has compact block", i);
+			LOGINFO("Source node %d already has compact block", i);
 			continue;
 		}
 
 		if (conn->sock < 0 || !conn->handshake_done) {
-			LOGINFO("Connection not active - reconnecting for submission");
+			LOGINFO("Connection %d not active - reconnecting for submission", i);
 			if (p2p_connect_socket(conn)) {
 				if (!do_handshake(conn, conn->port)) {
-					LOGNOTICE("Reconnect failed - cannot submit");
+					LOGNOTICE("Reconnect to %d failed - cannot submit", i);
 					close(conn->sock);
 					conn->sock = -1;
 					conn->handshake_done = false;
-					break;
+					continue;
 				}
 			} else {
-				LOGNOTICE("Reconnect failed - cannot submit");
-				break;
+				LOGNOTICE("Reconnect to %d failed - cannot submit", i);
+				continue;
 			}
 		}
 
