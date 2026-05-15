@@ -1571,6 +1571,7 @@ static struct option long_options[] = {
 	{"proxy",	no_argument,		0,	'p'},
 	{"quiet",	no_argument,		0,	'q'},
 	{"redirector",	no_argument,		0,	'R'},
+	{"relay",	no_argument,		0,	'r'},
 	{"sockdir",	required_argument,	0,	's'},
 	{"trusted",	no_argument,		0,	't'},
 	{"userproxy",	no_argument,		0,	'u'},
@@ -1621,7 +1622,7 @@ int main(int argc, char **argv)
 	if (!strcmp(appname, "ckproxy"))
 		ckp.proxy = true;
 
-	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRS:s:tu", long_options, &i)) != -1) {
+	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRrS:s:tu", long_options, &i)) != -1) {
 		switch (c) {
 			case 'B':
 				if (ckp.proxy)
@@ -1697,6 +1698,11 @@ int main(int argc, char **argv)
 					quit(1, "Cannot set a proxy type or passthrough and redirector modes");
 				ckp.proxy = ckp.passthrough = ckp.redirector = true;
 				break;
+			case 'r':
+				ckp.p2prelay = true;
+				if (ckp.proxy || ckp.redirector || ckp.node)
+					quit(1, "Cannot start as any other mode and relay only");
+				break;
 			case 's':
 				ckp.socket_dir = strdup(optarg);
 				break;
@@ -1722,6 +1728,8 @@ int main(int argc, char **argv)
 			ckp.name = "ckpassthrough";
 		else if (ckp.proxy)
 			ckp.name = "ckproxy";
+		else if (ckp.p2prelay)
+			ckp.name = "ckp2p";
 		else
 			ckp.name = "ckpool";
 	}
@@ -1785,7 +1793,7 @@ int main(int argc, char **argv)
 	ckp.tndonaddress = "tb1qdxclx2qxdh0g67j27v6y6ls0xm9cl2w2xktjq2";
 	ckp.rtdonaddress = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
 
-	if (!ckp.btcaddress && !ckp.btcsolo && !ckp.proxy)
+	if (!ckp.btcaddress && !ckp.btcsolo && !ckp.proxy && !ckp.p2prelay)
 		quit(0, "Non solo mining must have a btcaddress in config, aborting!");
 	if (!ckp.blockpoll)
 		ckp.blockpoll = 100;
@@ -1924,9 +1932,11 @@ int main(int argc, char **argv)
 		LOGEMERG("Failed to start ckp2p2, exiting");
 		exit(1);
 	}
-	prepare_child(&ckp, &ckp.generator, generator, "generator");
-	prepare_child(&ckp, &ckp.stratifier, stratifier, "stratifier");
-	prepare_child(&ckp, &ckp.connector, connector, "connector");
+	if (!ckp.p2prelay) {
+		prepare_child(&ckp, &ckp.generator, generator, "generator");
+		prepare_child(&ckp, &ckp.stratifier, stratifier, "stratifier");
+		prepare_child(&ckp, &ckp.connector, connector, "connector");
+	}
 
 	/* Shutdown from here if the listener is sent a shutdown message */
 	if (ckp.pth_listener)

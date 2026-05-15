@@ -207,6 +207,9 @@ struct ckpool_instance {
 	/* Are we a redirecting passthrough */
 	bool redirector;
 
+	/* Are we running as a p2p relay only */
+	bool p2prelay;
+
 	/* Are we running as a proxy */
 	bool proxy;
 
