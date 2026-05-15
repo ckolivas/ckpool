@@ -667,7 +667,13 @@ static void *submission_thread(void *arg)
 			LOGDEBUG("Skipping relaying compact block to source node %d", i);
 			continue;
 		}
+
 		conn = cbt->ckp->p2pconn[i];
+		if (!memcmp(conn->blockhash, cbt->blockhash, 32)) {
+			LOGDEBUG("Source node %d already has compact block", i);
+			continue;
+		}
+
 		if (conn->sock < 0 || !conn->handshake_done) {
 			LOGINFO("Connection not active - reconnecting for submission");
 			if (p2p_connect_socket(conn)) {
