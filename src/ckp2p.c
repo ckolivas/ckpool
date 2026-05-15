@@ -673,29 +673,15 @@ static void *submission_thread(void *arg)
 		}
 
 		conn = cbt->ckp->p2pconn[i];
-		if (!conn) {
-			LOGNOTICE("Node %d not connected", i);
-			continue;
-		}
+
 		if (!memcmp(conn->blockhash, cbt->blockhash, 32)) {
 			LOGINFO("Source node %d already has compact block", i);
 			continue;
 		}
 
 		if (conn->sock < 0 || !conn->handshake_done) {
-			LOGINFO("Connection %d not active - reconnecting for submission", i);
-			if (p2p_connect_socket(conn)) {
-				if (!do_handshake(conn, conn->port)) {
-					LOGNOTICE("Reconnect to %d failed - cannot submit", i);
-					close(conn->sock);
-					conn->sock = -1;
-					conn->handshake_done = false;
-					continue;
-				}
-			} else {
-				LOGNOTICE("Reconnect to %d failed - cannot submit", i);
-				continue;
-			}
+			LOGINFO("Connection %d not active - skipping submission", i);
+			continue;
 		}
 
 		ck_wlock(&conn->block_lock);
