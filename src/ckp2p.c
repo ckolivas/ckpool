@@ -669,6 +669,10 @@ static void *submission_thread(void *arg)
 		}
 
 		conn = cbt->ckp->p2pconn[i];
+		if (!conn) {
+			LOGNOTICE("Node %d not connected", i);
+			continue;
+		}
 		if (!memcmp(conn->blockhash, cbt->blockhash, 32)) {
 			LOGDEBUG("Source node %d already has compact block", i);
 			continue;
