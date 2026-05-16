@@ -7607,6 +7607,8 @@ static void node_client_msg(ckpool_t *ckp, json_t *val, stratum_instance_t *clie
 	params = json_object_get(val, "params");
 	res_val = json_object_get(val, "result");
 	switch (msg_type) {
+		yyjson_mut_doc *doc, *err_doc;
+		yyjson_mut_val *yyparams;
 		case SM_SHARE:
 			jp = create_json_params(client->id, method, params, id_val);
 			ckmsgq_add(sdata->sshareq, jp);
@@ -7618,8 +7620,8 @@ static void node_client_msg(ckpool_t *ckp, json_t *val, stratum_instance_t *clie
 			parse_diff(client, params);
 			break;
 		case SM_SUBSCRIBE:
-			yyjson_mut_doc *doc = json_to_yyjson(params);
-			yyjson_mut_val *yyparams = yyjson_mut_doc_get_root(doc);
+			doc = json_to_yyjson(params);
+			yyparams = yyjson_mut_doc_get_root(doc);
 			tmpdoc = parse_subscribe(client, client->id, yyparams);
 			if (tmpdoc)
 				yyjson_mut_doc_free(tmpdoc);
@@ -7629,7 +7631,7 @@ static void node_client_msg(ckpool_t *ckp, json_t *val, stratum_instance_t *clie
 			parse_subscribe_result(client, res_val);
 			break;
 		case SM_AUTH:
-			yyjson_mut_doc *err_doc = NULL;
+			err_doc = NULL;
 			doc = json_to_yyjson(params);
 			yyparams = yyjson_mut_doc_get_root(doc);
 			parse_authorise(client, yyparams, &err_doc);
