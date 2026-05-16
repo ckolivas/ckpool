@@ -265,13 +265,17 @@ static void send_notfound(p2p_conn_t *conn, uint32_t type, uchar *hash)
 static void send_getblocktxn(p2p_conn_t *conn, const uchar *blockhash,
                              const uint64_t *indexes, uint64_t nindexes)
 {
+	size_t max_len, pos;
+	uchar *payload;
+	uint64_t i;
+
 	if (nindexes == 0 || nindexes > 500)  // protocol sanity limit
 		return;
 
 	// Worst-case size: 32 + 9 (count varint) + nindexes*9
-	size_t max_len = 32 + 9 + nindexes * 9;
-	uchar *payload = ckalloc(max_len);
-	size_t pos = 0;
+	max_len = 32 + 9 + nindexes * 9;
+	payload = ckalloc(max_len);
+	pos = 0;
 
 	/* 32-byte block hash */
 	memcpy(payload, blockhash, 32);
@@ -281,9 +285,8 @@ static void send_getblocktxn(p2p_conn_t *conn, const uchar *blockhash,
 	write_varint(payload, &pos, nindexes);
 
 	/* each index as varint */
-	for (uint64_t i = 0; i < nindexes; i++) {
+	for (i = 0; i < nindexes; i++)
 		write_varint(payload, &pos, indexes[i]);
-	}
 
 	p2p_send(conn, "getblocktxn", payload, (uint32_t)pos);
 	dealloc(payload);
@@ -294,37 +297,40 @@ static void send_getblocktxn(p2p_conn_t *conn, const uchar *blockhash,
 static void calculate_missing_indexes(const uchar *payload, uint32_t plen,
                                       uint64_t **missing_out, uint64_t *count_out)
 {
+	uint64_t shortids_bytes, total_txs, i;
+	int64_t shortids_len, prefilled_len;
+	uint32_t pos;
+
 	*missing_out = NULL;
 	*count_out = 0;
 
 	if (plen < 88)
 		return;
 
-	uint32_t pos = 80 + 8;          /* skip header(80) + nonce(8) */
+	 pos = 80 + 8;          /* skip header(80) + nonce(8) */
 
-	int64_t shortids_len = parse_varint(payload, plen, &pos);
+	shortids_len = parse_varint(payload, plen, &pos);
 	if (shortids_len < 0)
 		return;
 
-	uint64_t shortids_bytes = (uint64_t)shortids_len * 6;
+	shortids_bytes = (uint64_t)shortids_len * 6;
 	if (pos + shortids_bytes > plen)
 		return;
 	pos += (uint32_t)shortids_bytes;
 
-	int64_t prefilled_len = parse_varint(payload, plen, &pos);
+	 prefilled_len = parse_varint(payload, plen, &pos);
 	if (prefilled_len < 0)
 		return;
 
-	uint64_t total_txs = (uint64_t)shortids_len + (uint64_t)prefilled_len;
+	total_txs = (uint64_t)shortids_len + (uint64_t)prefilled_len;
 	if (total_txs <= 1)             /* only coinbase */
 		return;
 
 	*count_out = total_txs - 1;
 	*missing_out = ckalloc(*count_out * sizeof(uint64_t));
 
-	for (uint64_t i = 0; i < *count_out; i++) {
+	for (i = 0; i < *count_out; i++)
 		(*missing_out)[i] = i + 1;  /* skip coinbase at index 0 */
-	}
 }
 
 static void handle_newblock(p2p_conn_t *conn, uchar *payload, uint32_t plen, char *showhash)
