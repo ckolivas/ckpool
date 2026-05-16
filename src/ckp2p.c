@@ -42,6 +42,12 @@ static const struct {
 	{NULL, 0, {0}, {0}}
 };
 
+static struct current_block {
+	uchar hash[32];
+	cklock_t lock;
+	uchar *txns;
+} curblock;
+
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
 {
@@ -258,6 +264,7 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
 	int64_t count = parse_varint(payload, plen, &pos);
+	bool new_block = false;
 
 	if (count < 0 || count > 500) { // basic sanity
 		dealloc(payload);
@@ -279,6 +286,21 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 			send_notfound(conn, type, hash);
 			continue;
 		}
+
+		ck_wlock(&curblock.lock);
+		if (memcmp(curblock.hash, hash, 32)) {
+			memcpy(curblock.hash, hash, 32);
+			new_block = true;
+		}
+		ck_wunlock(&curblock.lock);
+
+		if (new_block) {
+			char *blockhash = bin2hex(hash, 32);
+
+			LOGWARNING("New block hash detected: %s", blockhash);
+			free(blockhash);
+		}
+
 		ck_rlock(&conn->block_lock);
 		if (conn->has_block && !memcmp(conn->blockhash, hash, 32)) {
 			p2p_send(conn, "cmpctblock", conn->cmpct_payload, conn->cmpct_len);
@@ -808,6 +830,8 @@ int prepare_ckp2p(ckpool_t *ckp)
 {
 	connsock_t *cs;
 	int i;
+
+	cklock_init(&curblock.lock);
 
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
 	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
