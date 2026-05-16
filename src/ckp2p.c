@@ -242,6 +242,18 @@ static void handle_sendcmpct(p2p_conn_t *conn, uchar *payload, uint32_t len)
 		dealloc(payload);
 }
 
+static void send_notfound(p2p_conn_t *conn, uint32_t type, uchar *hash)
+{
+	uint32_t type_le;
+	uchar nf_payload[37];
+
+	nf_payload[0] = 1;
+	type_le = htole32(type);
+	memcpy(nf_payload + 1, &type_le, 4);
+	memcpy(nf_payload + 5, hash, 32);
+	p2p_send(conn, "notfound", nf_payload, 37);
+}
+
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -254,24 +266,17 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	for (int64_t i = 0; i < count; i++) {
 		uint32_t type_le, type;
 		bool responded = false;
+		uchar hash[32];
 
 		if (pos + 36 > plen)
 			break;
 		memcpy(&type_le, payload + pos, 4);
 		type = le32toh(type_le);
 		pos += 4;
-		uchar hash[32];
 		memcpy(hash, payload + pos, 32);
 		pos += 32;
 		if (type != MSG_CMPCT_BLOCK) {
-			uint32_t type_le;
-
-			uchar nf_payload[37];
-			nf_payload[0] = 1;
-			type_le = htole32(type);
-			memcpy(nf_payload + 1, &type_le, 4);
-			memcpy(nf_payload + 5, hash, 32);
-			p2p_send(conn, "notfound", nf_payload, 37);
+			send_notfound(conn, type, hash);
 			continue;
 		}
 		ck_rlock(&conn->block_lock);
@@ -281,16 +286,8 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		}
 		ck_runlock(&conn->block_lock);
 
-		if (!responded) {
-			// Tell Core we don't have it right now
-			uint32_t type_le = htole32(MSG_CMPCT_BLOCK);
-
-			uchar nf_payload[37];
-			nf_payload[0] = 1;
-			memcpy(nf_payload + 1, &type_le, 4);
-			memcpy(nf_payload + 5, hash, 32);
-			p2p_send(conn, "notfound", nf_payload, 37);
-		}
+		if (!responded)
+			send_notfound(conn, type, hash);
 	}
 	dealloc(payload);
 }
