@@ -673,6 +673,10 @@ static void *submission_thread(void *arg)
 		}
 
 		conn = cbt->ckp->p2pconn[i];
+		if (unlikely(!conn)) {
+			LOGDEBUG("Skipping relaying compact block to uninitialised node %d", i);
+			continue;
+		}
 
 		if (!memcmp(conn->blockhash, cbt->blockhash, 32)) {
 			LOGINFO("Source node %d already has compact block", i);
