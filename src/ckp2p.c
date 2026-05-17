@@ -242,6 +242,16 @@ static void handle_sendcmpct(p2p_conn_t *conn, uchar *payload, uint32_t len)
 		dealloc(payload);
 }
 
+/* Disconnect after sending any block response to prevent being
+ * asked for more info we don't have */
+static void disconnect_conn(p2p_conn_t *conn)
+{
+	LOGDEBUG("Disconnecting peer %d", conn->peer);
+	close(conn->sock);
+	conn->sock = -1;
+	conn->handshake_done = false;
+}
+
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -263,32 +273,22 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		pos += 4;
 		memcpy(hash, payload + pos, 32);
 		pos += 32;
-		if (type != MSG_CMPCT_BLOCK) {
-			LOGNOTICE("Peer %d requested full block (getdata) - cannot serve (disconnecting)",
-				  conn->peer);
-			close(conn->sock);
-			conn->sock = -1;
-			conn->handshake_done = false;
-			dealloc(payload);
-			return;   // exit early - no point continuing the loop
+
+		if (type == MSG_CMPCT_BLOCK) {
+			ck_rlock(&conn->block_lock);
+			if (conn->has_block && !memcmp(conn->blockhash, hash, 32)) {
+				p2p_send(conn, "cmpctblock", conn->cmpct_payload, conn->cmpct_len);
+				responded = true;
+			} else
+				LOGINFO("Peer %d requested cmpctblock we don't have", conn->peer);
+			ck_runlock(&conn->block_lock);
+		} else {
+			LOGINFO("Peer %d requested full block (getdata) - cannot serve",
+				conn->peer);
 		}
 
-		ck_rlock(&conn->block_lock);
-		if (conn->has_block && !memcmp(conn->blockhash, hash, 32)) {
-			p2p_send(conn, "cmpctblock", conn->cmpct_payload, conn->cmpct_len);
-			responded = true;
-		}
-		ck_runlock(&conn->block_lock);
-
-		if (!responded) {
-			LOGNOTICE("Peer %d requested cmpctblock we don't have - disconnecting",
-				  conn->peer);
-			close(conn->sock);
-			conn->sock = -1;
-			conn->handshake_done = false;
-			dealloc(payload);
-			return;
-		}
+		if (!responded || conn->peer > 0)
+			disconnect_conn(conn);
 	}
 	dealloc(payload);
 }
@@ -300,12 +300,10 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		return;
 	}
 
-	LOGNOTICE("Peer %d requested getblocktxn - cannot serve (disconnecting)", conn->peer);
+	LOGINFO("Peer %d requested getblocktxn - cannot serve", conn->peer);
 
 	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
-	close(conn->sock);
-	conn->sock = -1;
-	conn->handshake_done = false;
+	disconnect_conn(conn);
 
 	dealloc(payload);
 }
@@ -428,9 +426,7 @@ static void *p2p_reader(void *arg)
 
 		if (!p2p_recv(conn, cmd, &payload, &plen)) {
 			LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
-			close(conn->sock);
-			conn->sock = -1;
-			conn->handshake_done = false;
+			disconnect_conn(conn);
 			if (conn->reconnect < 300)
 				conn->reconnect *= 2;
 			sleep(conn->reconnect);
@@ -710,6 +706,13 @@ static void *submission_thread(void *arg)
 		ck_wunlock(&conn->block_lock);
 
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
+		/* Disconnect all remote peers to avoid inducing latency at
+		 * their end in case they ask for more information from ckp2p.
+		 * The local peer we can disconnect immediately if asked for
+		 * more information. */
+		if (conn->peer > 0)
+			disconnect_conn(conn);
+
 		submitted++;
 	}
 
