@@ -26,7 +26,7 @@
 #define MSG_WITNESS_FLAG (1U << 30)
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
-#define KEEPALIVE_INTERVAL 119
+#define KEEPALIVE_INTERVAL 60
 
 static const struct {
 	const char *name;
