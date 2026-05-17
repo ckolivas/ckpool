@@ -327,37 +327,11 @@ static void calculate_missing_indexes(const uchar *payload, uint32_t plen,
 	}
 }
 
-static void handle_newblock(p2p_conn_t *conn, uchar *payload, uint32_t plen, char *showhash)
-{
-	uchar h1[32], blockhash[32];
-	uint64_t *missing = NULL;
-	uint64_t nmissing = 0;
-	uchar header[80];
-
-	if (plen < 88)
-		return;
-
-	memcpy(header, payload, 80);
-	sha256(header, 80, h1);
-	sha256(h1, 32, blockhash);
-
-	/* === Request missing transactions from the peer that sent us the cmpctblock === */
-	calculate_missing_indexes(payload, plen, &missing, &nmissing);
-
-	if (nmissing > 0) {
-		send_getblocktxn(conn, blockhash, missing, nmissing);
-		LOGDEBUG("Sent GETBLOCKTXN requesting %d tx(s) for block %s",
-		         (int)nmissing, showhash);
-	}
-	if (missing)
-		dealloc(missing);
-
-}
-
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
 	int64_t count = parse_varint(payload, plen, &pos);
+	bool new_block = false;
 
 	if (count < 0 || count > 500) { // basic sanity
 		dealloc(payload);
@@ -378,6 +352,21 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		if (type != MSG_CMPCT_BLOCK) {
 			send_notfound(conn, type, hash);
 			continue;
+		}
+
+		ck_wlock(&curblock.lock);
+		if (memcmp(curblock.hash, hash, 32)) {
+			memcpy(curblock.hash, hash, 32);
+			dealloc(curblock.txns);
+			new_block = true;
+		}
+		ck_wunlock(&curblock.lock);
+
+		if (new_block) {
+			char *showhash = bin2hex(hash, 32);
+
+			LOGWARNING("New block hash detected: %s", showhash);
+			free(showhash);
 		}
 
 		ck_rlock(&conn->block_lock);
@@ -456,11 +445,9 @@ static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cm
 				uint32_t cmpct_len, uint64_t shortid_nonce, int source);
 
 /* Function for testing cmpctblock validity by echoing back any received */
-static void handle_cmpctblock(ckpool_t *ckp, p2p_conn_t *conn, uchar *payload, uint32_t plen,
-			      int source)
+static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int source)
 {
 	uint64_t shortid_nonce_le, shortid_nonce;
-	bool new_block = false;
 
 	if (plen < 88) {
 		dealloc(payload);
@@ -473,23 +460,6 @@ static void handle_cmpctblock(ckpool_t *ckp, p2p_conn_t *conn, uchar *payload, u
 	sha256(h1, 32, blockhash);
 	memcpy(&shortid_nonce_le, payload + 80, 8);
 	shortid_nonce = le64toh(shortid_nonce_le);
-
-	ck_wlock(&curblock.lock);
-	if (memcmp(curblock.hash, blockhash, 32)) {
-		memcpy(curblock.hash, blockhash, 32);
-		dealloc(curblock.txns);
-		new_block = true;
-	}
-	ck_wunlock(&curblock.lock);
-
-	if (new_block) {
-		char *showhash = bin2hex(blockhash, 32);
-
-		LOGWARNING("New block hash detected: %s", showhash);
-		handle_newblock(conn, payload, plen, showhash);
-		free(showhash);
-	}
-
 	relay_compact_block(ckp, blockhash, payload, plen, shortid_nonce, source);
 	/* payload is stolen and released by relay_compact_block */
 }
@@ -589,7 +559,7 @@ static void *p2p_reader(void *arg)
 			LOGDEBUG("Received HEADERS (%u bytes) - ignoring (block headers announcement)", plen);
 		} else if (!strcmp(cmd, "cmpctblock")) {
 			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - handling (resend to all nodes)", plen);
-			handle_cmpctblock(p2pe->ckp, conn, payload, plen, p2pe->source);
+			handle_cmpctblock(p2pe->ckp, payload, plen, p2pe->source);
 			continue;
 		} else if (!strcmp(cmd, "tx")) {
 			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
