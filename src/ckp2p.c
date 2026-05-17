@@ -166,7 +166,7 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 		(plen && write_exact(conn->sock, payload, plen) != (ssize_t)plen)) {
 		LOGERR("p2p_send(%s) failed", cmd);
 		} else {
-			LOGINFO("Sent %s (%u bytes)", cmd, plen);
+			LOGINFO("Sent %s (%u bytes) to peer %d", cmd, plen, conn->source);
 		}
 }
 
@@ -242,7 +242,8 @@ static void handle_sendcmpct(p2p_conn_t *conn, uchar *payload, uint32_t len)
 		ver = le64toh(ver_le);
 		if (ver == 1 || ver == 2) {
 			conn->high_bw = announce;
-			LOGINFO("Peer SENDCMPCT v%llu high-bw=%d", (unsigned long long)ver, conn->high_bw);
+			LOGINFO("Peer %d SENDCMPCT v%llu high-bw=%d", conn->source,
+				(unsigned long long)ver, conn->high_bw);
 		}
 	}
 	if (payload)
@@ -455,7 +456,7 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		// We have the transactions for this exact block — serve them
 		p2p_send(conn, "blocktxn", txns,txns_len);
 		free(txns);
-		LOGINFO("Served cached BLOCKTXN to peer");
+		LOGINFO("Served cached BLOCKTXN to peer %d", conn->source);
 	} else {
 		// Fallback for any other block or no data yet
 		uint32_t type, type_le;
@@ -466,7 +467,8 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		memcpy(nf_payload + 1, &type_le, 4);
 		memcpy(nf_payload + 5, payload, 32);
 		p2p_send(conn, "notfound", nf_payload, 37);
-		LOGINFO("GETBLOCKTXN - sent NOTFOUND (no cached data for this block)");
+		LOGINFO("GETBLOCKTXN - sent NOTFOUND  to peer %d (no cached data for this block)",
+			conn->source);
 	}
 
 	dealloc(payload);
@@ -506,9 +508,11 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		}
 	}
 	if (has_block)
-		LOGINFO("Received INV (%u bytes) - requesting cmpctblock for blocks", plen);
+		LOGINFO("Received INV (%u bytes) from peer %d - requesting cmpctblock for blocks",
+			conn->source, plen);
 	else
-		LOGDEBUG("Received INV (%u bytes) - ignoring transaction announcements", plen);
+		LOGDEBUG("Received INV (%u bytes) from peer %d - ignoring transaction announcements",
+			 conn->source, plen);
 	dealloc(payload);
 }
 
@@ -559,10 +563,12 @@ static bool p2p_connect_socket(p2p_conn_t *conn)
 {
 	conn->sock = connect_socket(conn->host, conn->charport);
 	if (conn->sock < 0) {
-		LOGINFO("connect_socket failed in p2p_connect_socket");
+		LOGINFO("connect_socket failed to peer %d in p2p_connect_socket",
+			conn->source);
 		return false;
 	}
-	LOGNOTICE("ckp2p connected to %s:%d (%s)", conn->host, conn->port, conn->netname);
+	LOGNOTICE("ckp2p connected to peer %d, %s:%d (%s)", conn->source, conn->host,
+		  conn->port, conn->netname);
 
 	return true;
 }
@@ -609,7 +615,7 @@ static void *p2p_reader(void *arg)
 		}
 
 		if (!p2p_recv(conn, cmd, &payload, &plen)) {
-			LOGINFO("P2P recv failed - disconnecting");
+			LOGINFO("P2P recv failed to peer %d - disconnecting", conn->source);
 			close(conn->sock);
 			conn->sock = -1;
 			conn->handshake_done = false;
@@ -686,7 +692,8 @@ static void *p2p_reader(void *arg)
 			LOGINFO("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
 		}
 
-		if (payload) dealloc(payload);
+		if (payload)
+			dealloc(payload);
 	}
 	return NULL;
 }
@@ -874,7 +881,7 @@ static void *submission_thread(void *arg)
 		}
 
 		if (!memcmp(conn->blockhash, cbt->blockhash, 32)) {
-			LOGINFO("Source node %d already has compact block", i);
+			LOGINFO("Peer %d already has compact block", i);
 			continue;
 		}
 
@@ -938,6 +945,7 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	int port, i;
 
 	cklock_init(&conn->block_lock);
+	conn->source = source;
 	conn->cmpct_payload = NULL;
 	conn->has_block = false;
 	conn->sock = -1;
