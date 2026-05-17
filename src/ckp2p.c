@@ -715,10 +715,8 @@ static void *submission_thread(void *arg)
 	}
 
 	hex = bin2hex(cbt->blockhash, 32);
-	if (submitted) {
-		LOGNOTICE("Submitted %d compact block%s to peer%s", submitted,
-			  submitted > 1 ? "s" : "", hex);
-	}
+	if (submitted)
+		LOGNOTICE("Submitted %d compact block%s %s", submitted, submitted > 1 ? "s" : "", hex);
 	free(cbt->cmpct_payload);
 	free(cbt);
 	free(hex);
