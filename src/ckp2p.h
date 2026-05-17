@@ -24,7 +24,6 @@ typedef struct {
 	char charport[32];
 	int port;
 	int reconnect;
-	int source;
 } p2p_conn_t;
 
 int prepare_ckp2p(ckpool_t *ckp);
