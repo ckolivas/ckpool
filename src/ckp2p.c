@@ -242,18 +242,6 @@ static void handle_sendcmpct(p2p_conn_t *conn, uchar *payload, uint32_t len)
 		dealloc(payload);
 }
 
-static void send_notfound(p2p_conn_t *conn, uint32_t type, uchar *hash)
-{
-	uint32_t type_le;
-	uchar nf_payload[37];
-
-	nf_payload[0] = 1;
-	type_le = htole32(type);
-	memcpy(nf_payload + 1, &type_le, 4);
-	memcpy(nf_payload + 5, hash, 32);
-	p2p_send(conn, "notfound", nf_payload, 37);
-}
-
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -276,9 +264,15 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		memcpy(hash, payload + pos, 32);
 		pos += 32;
 		if (type != MSG_CMPCT_BLOCK) {
-			send_notfound(conn, type, hash);
-			continue;
+			LOGNOTICE("Peer %d requested full block (getdata) - cannot serve (disconnecting)",
+				  conn->peer);
+			close(conn->sock);
+			conn->sock = -1;
+			conn->handshake_done = false;
+			dealloc(payload);
+			return;   // exit early - no point continuing the loop
 		}
+
 		ck_rlock(&conn->block_lock);
 		if (conn->has_block && !memcmp(conn->blockhash, hash, 32)) {
 			p2p_send(conn, "cmpctblock", conn->cmpct_payload, conn->cmpct_len);
@@ -286,28 +280,33 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		}
 		ck_runlock(&conn->block_lock);
 
-		if (!responded)
-			send_notfound(conn, type, hash);
+		if (!responded) {
+			LOGNOTICE("Peer %d requested cmpctblock we don't have - disconnecting",
+				  conn->peer);
+			close(conn->sock);
+			conn->sock = -1;
+			conn->handshake_done = false;
+			dealloc(payload);
+			return;
+		}
 	}
 	dealloc(payload);
 }
 
 static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
-	uint32_t type, type_le;
-
 	if (plen < 32) {
 		dealloc(payload);
 		return;
 	}
-	uchar nf_payload[37];
-	nf_payload[0] = 1;
-	type = MSG_BLOCK;
-	type_le = htole32(type);
-	memcpy(nf_payload + 1, &type_le, 4);
-	memcpy(nf_payload + 5, payload, 32); // blockhash
-	p2p_send(conn, "notfound", nf_payload, 37);
-	LOGDEBUG("GETBLOCKTXN - sent NOTFOUND for block");
+
+	LOGNOTICE("Peer %d requested getblocktxn - cannot serve (disconnecting)", conn->peer);
+
+	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
+	close(conn->sock);
+	conn->sock = -1;
+	conn->handshake_done = false;
+
 	dealloc(payload);
 }
 
