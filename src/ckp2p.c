@@ -260,73 +260,6 @@ static void send_notfound(p2p_conn_t *conn, uint32_t type, uchar *hash)
 	p2p_send(conn, "notfound", nf_payload, 37);
 }
 
-/* Send a GETBLOCKTXN request (BIP 152).
-   Uses write_varint() from libckpool.h (signature: buf, size_t *off, uint64_t v) */
-static void send_getblocktxn(p2p_conn_t *conn, const uchar *blockhash,
-                             const uint64_t *indexes, uint64_t nindexes)
-{
-	if (nindexes == 0 || nindexes > 500)  // protocol sanity limit
-		return;
-
-	// Worst-case size: 32 + 9 (count varint) + nindexes*9
-	size_t max_len = 32 + 9 + nindexes * 9;
-	uchar *payload = ckalloc(max_len);
-	size_t pos = 0;
-
-	/* 32-byte block hash */
-	memcpy(payload, blockhash, 32);
-	pos += 32;
-
-	/* varint count of indexes */
-	write_varint(payload, &pos, nindexes);
-
-	/* each index as varint */
-	for (uint64_t i = 0; i < nindexes; i++) {
-		write_varint(payload, &pos, indexes[i]);
-	}
-
-	p2p_send(conn, "getblocktxn", payload, (uint32_t)pos);
-	dealloc(payload);
-}
-
-/* Simple approximation: request every tx after the coinbase (index 0).
-   Safe and protocol-compliant for a minimal client. */
-static void calculate_missing_indexes(const uchar *payload, uint32_t plen,
-                                      uint64_t **missing_out, uint64_t *count_out)
-{
-	*missing_out = NULL;
-	*count_out = 0;
-
-	if (plen < 88)
-		return;
-
-	uint32_t pos = 80 + 8;          /* skip header(80) + nonce(8) */
-
-	int64_t shortids_len = parse_varint(payload, plen, &pos);
-	if (shortids_len < 0)
-		return;
-
-	uint64_t shortids_bytes = (uint64_t)shortids_len * 6;
-	if (pos + shortids_bytes > plen)
-		return;
-	pos += (uint32_t)shortids_bytes;
-
-	int64_t prefilled_len = parse_varint(payload, plen, &pos);
-	if (prefilled_len < 0)
-		return;
-
-	uint64_t total_txs = (uint64_t)shortids_len + (uint64_t)prefilled_len;
-	if (total_txs <= 1)             /* only coinbase */
-		return;
-
-	*count_out = total_txs - 1;
-	*missing_out = ckalloc(*count_out * sizeof(uint64_t));
-
-	for (uint64_t i = 0; i < *count_out; i++) {
-		(*missing_out)[i] = i + 1;  /* skip coinbase at index 0 */
-	}
-}
-
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -357,16 +290,15 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		ck_wlock(&curblock.lock);
 		if (memcmp(curblock.hash, hash, 32)) {
 			memcpy(curblock.hash, hash, 32);
-			dealloc(curblock.txns);
 			new_block = true;
 		}
 		ck_wunlock(&curblock.lock);
 
 		if (new_block) {
-			char *showhash = bin2hex(hash, 32);
+			char *blockhash = bin2hex(hash, 32);
 
-			LOGWARNING("New block hash detected: %s", showhash);
-			free(showhash);
+			LOGWARNING("New block hash detected: %s", blockhash);
+			free(blockhash);
 		}
 
 		ck_rlock(&conn->block_lock);
@@ -561,6 +493,7 @@ static void *p2p_reader(void *arg)
 			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - handling (resend to all nodes)", plen);
 			handle_cmpctblock(p2pe->ckp, payload, plen, p2pe->source);
 			continue;
+			LOGINFO("Received CMPCTBLOCK (%u bytes) - ignoring (compact block data)", plen);
 		} else if (!strcmp(cmd, "tx")) {
 			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
 		} else if (!strcmp(cmd, "block")) {
