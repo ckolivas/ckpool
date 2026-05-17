@@ -42,6 +42,11 @@ static const struct {
 	{NULL, 0, {0}, {0}}
 };
 
+static struct current_block {
+	uchar hash[32];
+	cklock_t lock;
+} curblock;
+
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
 {
@@ -355,6 +360,7 @@ static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cm
 static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int source)
 {
 	uint64_t shortid_nonce_le, shortid_nonce;
+	bool new_block = false;
 
 	if (plen < 88) {
 		dealloc(payload);
@@ -367,6 +373,21 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	sha256(h1, 32, blockhash);
 	memcpy(&shortid_nonce_le, payload + 80, 8);
 	shortid_nonce = le64toh(shortid_nonce_le);
+
+	ck_wlock(&curblock.lock);
+	if (memcmp(curblock.hash, blockhash, 32)) {
+		memcpy(curblock.hash, blockhash, 32);
+		new_block = true;
+	}
+	ck_wunlock(&curblock.lock);
+
+	if (new_block) {
+		char showhash[68];
+
+		__bin2hex(showhash, blockhash, 32);
+		LOGWARNING("New block hash detected: %s", showhash);
+	}
+
 	relay_compact_block(ckp, blockhash, payload, plen, shortid_nonce, source);
 	/* payload is stolen and released by relay_compact_block */
 }
@@ -810,6 +831,8 @@ int prepare_ckp2p(ckpool_t *ckp)
 {
 	connsock_t *cs;
 	int i;
+
+	cklock_init(&curblock.lock);
 
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
 	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
