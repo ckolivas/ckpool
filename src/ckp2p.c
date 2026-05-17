@@ -46,7 +46,6 @@ static struct current_block {
 	uchar hash[32];
 	cklock_t lock;
 	uchar *txns;
-	uint32_t txns_len;
 } curblock;
 
 /* Check if magic is unset (all zeros) */
@@ -261,7 +260,8 @@ static void send_notfound(p2p_conn_t *conn, uint32_t type, uchar *hash)
 	p2p_send(conn, "notfound", nf_payload, 37);
 }
 
-/* Send a GETBLOCKTXN request (BIP 152). */
+/* Send a GETBLOCKTXN request (BIP 152).
+   Uses write_varint() from libckpool.h (signature: buf, size_t *off, uint64_t v) */
 static void send_getblocktxn(p2p_conn_t *conn, const uchar *blockhash,
                              const uint64_t *indexes, uint64_t nindexes)
 {
@@ -289,35 +289,6 @@ static void send_getblocktxn(p2p_conn_t *conn, const uchar *blockhash,
 		write_varint(payload, &pos, indexes[i]);
 
 	p2p_send(conn, "getblocktxn", payload, (uint32_t)pos);
-	dealloc(payload);
-}
-
-static void handle_blocktxn(uchar *payload, uint32_t plen)
-{
-	bool stored = false;
-
-	if (plen < 32) {
-		dealloc(payload);
-		return;
-	}
-
-	uchar blockhash[32];
-	memcpy(blockhash, payload, 32);
-
-	ck_wlock(&curblock.lock);
-	if (!memcmp(curblock.hash, blockhash, 32) && !curblock.txns) {
-		stored = true;
-		curblock.txns = ckalloc(plen);
-		memcpy(curblock.txns, payload, plen);
-		curblock.txns_len = plen;
-	}
-	ck_wunlock(&curblock.lock);
-
-	if (stored)
-		LOGINFO("Stored BLOCKTXN (%u bytes) for current block", plen);
-	else
-		LOGDEBUG("Ignored BLOCKTXN");
-
 	dealloc(payload);
 }
 
@@ -430,45 +401,20 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 
 static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
-	uint64_t txns_len = 0;
-	bool serving = false;
-	uchar *txns = NULL;
+	uint32_t type, type_le;
 
 	if (plen < 32) {
 		dealloc(payload);
 		return;
 	}
-
-	uchar blockhash[32];
-	memcpy(blockhash, payload, 32);  // requested block hash
-
-	ck_rlock(&curblock.lock);
-	if (curblock.txns_len > 0 && !memcmp(curblock.hash, blockhash, 32)) {
-		txns_len = curblock.txns_len;
-		txns = ckalloc(curblock.txns_len);
-		memcpy(txns, curblock.txns, txns_len);
-		serving = true;
-	}
-	ck_runlock(&curblock.lock);
-
-	if (serving) {
-		// We have the transactions for this exact block — serve them
-		p2p_send(conn, "blocktxn", txns,txns_len);
-		free(txns);
-		LOGINFO("Served cached BLOCKTXN to peer");
-	} else {
-		// Fallback for any other block or no data yet
-		uint32_t type, type_le;
-		uchar nf_payload[37];
-		nf_payload[0] = 1;
-		type = MSG_BLOCK;
-		type_le = htole32(type);
-		memcpy(nf_payload + 1, &type_le, 4);
-		memcpy(nf_payload + 5, payload, 32);
-		p2p_send(conn, "notfound", nf_payload, 37);
-		LOGINFO("GETBLOCKTXN - sent NOTFOUND (no cached data for this block)");
-	}
-
+	uchar nf_payload[37];
+	nf_payload[0] = 1;
+	type = MSG_BLOCK;
+	type_le = htole32(type);
+	memcpy(nf_payload + 1, &type_le, 4);
+	memcpy(nf_payload + 5, payload, 32); // blockhash
+	p2p_send(conn, "notfound", nf_payload, 37);
+	LOGDEBUG("GETBLOCKTXN - sent NOTFOUND for block");
 	dealloc(payload);
 }
 
@@ -538,7 +484,6 @@ static void handle_cmpctblock(ckpool_t *ckp, p2p_conn_t *conn, uchar *payload, u
 	if (memcmp(curblock.hash, blockhash, 32)) {
 		memcpy(curblock.hash, blockhash, 32);
 		dealloc(curblock.txns);
-		curblock.txns_len = 0;
 		new_block = true;
 	}
 	ck_wunlock(&curblock.lock);
@@ -678,10 +623,6 @@ static void *p2p_reader(void *arg)
 			LOGDEBUG("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
 		} else if (!strcmp(cmd, "sendaddrv2")) {
 			LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
-		} else if (!strcmp(cmd, "blocktxn")) {
-			LOGDEBUG("Received BLOCKTXN (%u bytes) - storing transactions for current block", plen);
-			handle_blocktxn(payload, plen);
-			continue; // handler deallocs
 		} else {
 			LOGINFO("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
 		}
@@ -782,7 +723,7 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	off += sizeof(height_le);
 
 	// relay: 0 (to enable TX relay and unsolicited INV/TX)
-	version_payload[off++] = 1;
+	version_payload[off++] = 0;
 
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 
