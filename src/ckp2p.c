@@ -126,7 +126,7 @@ static ssize_t write_exact(int sock, const void *buf, size_t len)
 			if (n == 0)
 				LOGINFO("P2P write: peer closed connection");
 			else
-				LOGERR("P2P write error: %s", strerror(errno));
+				LOGNOTICE("P2P write error: %s", strerror(errno));
 			return n;
 		}
 		left -= n;
@@ -157,9 +157,9 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 
 	if (write_exact(conn->sock, hdr, 24) != 24 ||
 		(plen && write_exact(conn->sock, payload, plen) != (ssize_t)plen)) {
-		LOGERR("p2p_send(%s) failed", cmd);
+		LOGNOTICE("p2p_send(%s) failed to peer %d", cmd, conn->peer);
 		} else {
-			LOGINFO("Sent %s (%u bytes)", cmd, plen);
+			LOGINFO("Sent %s (%u bytes) to peer %d", cmd, plen, conn->peer);
 		}
 }
 
@@ -179,7 +179,7 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 		memcpy(conn->magic, rec_magic, 4);
 		LOGINFO("Auto-detected network magic %02x%02x%02x%02x", rec_magic[0], rec_magic[1], rec_magic[2], rec_magic[3]);
 	} else if (memcmp(rec_magic, conn->magic, 4)) {
-		LOGERR("Magic mismatch");
+		LOGNOTICE("Magic mismatch");
 		return false;
 	}
 
@@ -192,7 +192,7 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 		static const uchar empty_chksum[4] = {0x5d, 0xf6, 0xe0, 0xe2};
 		*payload = NULL;
 		if (memcmp(rec_chksum, empty_chksum, 4)) {
-			LOGERR("Checksum fail on %s (empty)", cmd);
+			LOGNOTICE("Checksum fail on %s (empty)", cmd);
 			return false;
 		}
 		return true;
@@ -209,7 +209,7 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 	uchar calc_chksum[4];
 	double_sha256_4(calc_chksum, *payload, *plen);
 	if (memcmp(calc_chksum, rec_chksum, 4)) {
-		LOGERR("Checksum fail on %s", cmd);
+		LOGNOTICE("Checksum fail on %s", cmd);
 		dealloc(*payload);
 		*payload = NULL;
 		return false;
@@ -378,10 +378,11 @@ static bool p2p_connect_socket(p2p_conn_t *conn)
 {
 	conn->sock = connect_socket(conn->host, conn->charport);
 	if (conn->sock < 0) {
-		LOGINFO("connect_socket failed in p2p_connect_socket");
+		LOGINFO("connect_socket failed in p2p_connect_socket to peer %d", conn->peer);
 		return false;
 	}
-	LOGNOTICE("ckp2p connected to %s:%d (%s)", conn->host, conn->port, conn->netname);
+	LOGNOTICE("ckp2p connected to peer %d, %s:%d (%s)", conn->peer, conn->host,
+		  conn->port, conn->netname);
 
 	return true;
 }
@@ -393,7 +394,6 @@ struct p2pendpoint {
 	pthread_t reader_thread;
 	pthread_t keepalive_thread;
 	p2p_conn_t *conn;
-	int source;
 };
 
 typedef struct p2pendpoint p2pendpoint_t;
@@ -428,7 +428,7 @@ static void *p2p_reader(void *arg)
 		}
 
 		if (!p2p_recv(conn, cmd, &payload, &plen)) {
-			LOGINFO("P2P recv failed - disconnecting");
+			LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
 			close(conn->sock);
 			conn->sock = -1;
 			conn->handshake_done = false;
@@ -468,10 +468,9 @@ static void *p2p_reader(void *arg)
 		} else if (!strcmp(cmd, "headers")) {
 			LOGDEBUG("Received HEADERS (%u bytes) - ignoring (block headers announcement)", plen);
 		} else if (!strcmp(cmd, "cmpctblock")) {
-			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - handling (resend to all nodes)", plen);
-			handle_cmpctblock(p2pe->ckp, payload, plen, p2pe->source);
+			LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
+			handle_cmpctblock(p2pe->ckp, payload, plen, conn->peer);
 			continue;
-			LOGINFO("Received CMPCTBLOCK (%u bytes) - ignoring (compact block data)", plen);
 		} else if (!strcmp(cmd, "tx")) {
 			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
 		} else if (!strcmp(cmd, "block")) {
@@ -639,7 +638,8 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	}
 
 	conn->handshake_done = true;
-	LOGNOTICE("P2P handshake complete on %s - ready for compact blocks", conn->netname);
+	LOGNOTICE("P2P handshake complete with peer %d on %s - ready for compact blocks",
+		  conn->peer, conn->netname);
 
 	// Send getheaders with genesis locator and zero stop to request up to 2000 headers
 	uchar gethdr_payload[69];
@@ -715,8 +715,10 @@ static void *submission_thread(void *arg)
 	}
 
 	hex = bin2hex(cbt->blockhash, 32);
-	if (submitted)
-		LOGNOTICE("Submitted %d compact block%s %s", submitted, submitted > 1 ? "s" : "", hex);
+	if (submitted) {
+		LOGNOTICE("Submitted %d compact block%s to peer%s", submitted,
+			  submitted > 1 ? "s" : "", hex);
+	}
 	free(cbt->cmpct_payload);
 	free(cbt);
 	free(hex);
@@ -754,6 +756,7 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	int port, i;
 
 	cklock_init(&conn->block_lock);
+	conn->peer = source;
 	conn->cmpct_payload = NULL;
 	conn->has_block = false;
 	conn->sock = -1;
@@ -795,7 +798,6 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	p2pe = ckzalloc(sizeof(p2pendpoint_t));
 	p2pe->ckp = ckp;
 	p2pe->conn = conn;
-	p2pe->source = source;
 
 	create_pthread(&p2pe->reader_thread, p2p_reader, p2pe);
 
