@@ -662,6 +662,8 @@ static void *p2p_reader(void *arg)
 			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
 		} else if (!strcmp(cmd, "block")) {
 			LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
+		} else if (!strcmp(cmd, "blocktxn")) {
+			LOGDEBUG("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
 		} else if (!strcmp(cmd, "getheaders")) {
 			LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
 		} else if (!strcmp(cmd, "getblocks")) {
