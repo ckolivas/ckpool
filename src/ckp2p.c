@@ -337,7 +337,7 @@ static void calculate_missing_indexes(const uchar *payload, uint32_t plen,
 	if (plen < 88)
 		return;
 
-	 pos = 80 + 8;          /* skip header(80) + nonce(8) */
+	pos = 80 + 8;          /* skip header(80) + nonce(8) */
 
 	shortids_len = parse_varint(payload, plen, &pos);
 	if (shortids_len < 0)
@@ -348,7 +348,7 @@ static void calculate_missing_indexes(const uchar *payload, uint32_t plen,
 		return;
 	pos += (uint32_t)shortids_bytes;
 
-	 prefilled_len = parse_varint(payload, plen, &pos);
+	prefilled_len = parse_varint(payload, plen, &pos);
 	if (prefilled_len < 0)
 		return;
 
@@ -357,6 +357,11 @@ static void calculate_missing_indexes(const uchar *payload, uint32_t plen,
 		return;
 
 	*count_out = total_txs - 1;
+
+	/* CRITICAL: Bitcoin nodes will not reply to huge requests */
+	if (*count_out > 400)           /* sane practical limit */
+		*count_out = 400;
+
 	*missing_out = ckalloc(*count_out * sizeof(uint64_t));
 
 	for (i = 0; i < *count_out; i++)
@@ -382,8 +387,8 @@ static void handle_newblock(p2p_conn_t *conn, uchar *payload, uint32_t plen, cha
 
 	if (nmissing > 0) {
 		send_getblocktxn(conn, blockhash, missing, nmissing);
-		LOGDEBUG("Sent GETBLOCKTXN requesting %d tx(s) for block %s",
-		         (int)nmissing, showhash);
+		LOGINFO("Sent GETBLOCKTXN to peer %d requesting %d tx(s) for block %s",
+			conn->source, (int)nmissing, showhash);
 	}
 	if (missing)
 		dealloc(missing);
@@ -655,7 +660,8 @@ static void *p2p_reader(void *arg)
 		} else if (!strcmp(cmd, "headers")) {
 			LOGDEBUG("Received HEADERS (%u bytes) - ignoring (block headers announcement)", plen);
 		} else if (!strcmp(cmd, "cmpctblock")) {
-			LOGNOTICE("Received CMPCTBLOCK (%u bytes) - handling (resend to all nodes)", plen);
+			LOGNOTICE("Received CMPCTBLOCK from peer %d, (%u bytes) - handling (resend to all nodes)",
+				  p2pe->source, plen);
 			handle_cmpctblock(p2pe->ckp, conn, payload, plen, p2pe->source);
 			continue;
 		} else if (!strcmp(cmd, "tx")) {
@@ -683,7 +689,7 @@ static void *p2p_reader(void *arg)
 		} else if (!strcmp(cmd, "sendaddrv2")) {
 			LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
 		} else if (!strcmp(cmd, "blocktxn")) {
-			LOGDEBUG("Received BLOCKTXN (%u bytes) - storing transactions for current block", plen);
+			LOGINFO("Received BLOCKTXN (%u bytes) - storing transactions for current block", plen);
 			handle_blocktxn(payload, plen);
 			continue; // handler deallocs
 		} else {
