@@ -535,7 +535,7 @@ static void *p2p_reader(void *arg)
 			handle_inv(conn, payload, plen);
 			continue;
 		} else if (!strcmp(cmd, "headers")) {
-			LOGINFO("Received HEADERS (%u bytes) - parsing tip and requesting cmpctblock", plen);
+			LOGINFO("Received HEADERS (%u bytes) - parsing tip if necessary", plen);
 			handle_headers(payload, plen);
 			continue;   /* handler already deallocates */
 		} else if (!strcmp(cmd, "cmpctblock")) {
