@@ -25,12 +25,13 @@ endif
 	yasm -f x64 -f elf64 -X gnu -g dwarf2 -D LINUX -o $@ $<
 
 noinst_LIBRARIES = libckpool.a
-libckpool_a_SOURCES = libckpool.c libckpool.h sha2.c sha2.h sha256_arm_shani.c sha256_code_release
+libckpool_a_SOURCES = libckpool.c sha2.c sha256_arm_shani.c sha256_code_release
 libckpool_a_LIBADD = $(native_objs)
 
 bin_PROGRAMS = ckpool ckpmsg notifier
-ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c uthash.h \
-		 utlist.h yyjson.c yyjson_util.c ckp2p.c
+ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
+		 yyjson.c yyjson_util.c ckp2p.c
+
 ckpool_LDADD = libckpool.a @JANSSON_LIBS@ @LIBS@
 
 ckpmsg_SOURCES = ckpmsg.c
