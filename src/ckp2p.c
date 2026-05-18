@@ -356,6 +356,15 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
 				uint32_t cmpct_len, uint64_t shortid_nonce, int source);
 
+static void display_newblock(uchar *blockhash)
+{
+	char fliphash[32], showhash[68];
+
+	swap_256(fliphash, blockhash);
+	__bin2hex(showhash, fliphash, 32);
+	LOGWARNING("New block hash detected: %s", showhash);
+}
+
 /* Function for testing cmpctblock validity by echoing back any received */
 static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int source)
 {
@@ -381,15 +390,59 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	}
 	ck_wunlock(&curblock.lock);
 
-	if (new_block) {
-		char showhash[68];
-
-		__bin2hex(showhash, blockhash, 32);
-		LOGWARNING("New block hash detected: %s", showhash);
-	}
+	if (new_block)
+		display_newblock(blockhash);
 
 	relay_compact_block(ckp, blockhash, payload, plen, shortid_nonce, source);
 	/* payload is stolen and released by relay_compact_block */
+}
+
+static void handle_headers(uchar *payload, uint32_t plen)
+{
+	uint32_t pos = 0, header_offset;
+	uchar blank[32] = {};
+	int64_t i, txcount, count;
+	bool first_block = false;
+
+	ck_rlock(&curblock.lock);
+	if (unlikely(!memcmp(curblock.hash, blank, 32)))
+		first_block = true;
+	ck_runlock(&curblock.lock);
+
+	if (likely(!first_block))
+		goto out;
+
+	count = parse_varint(payload, plen, &pos);
+	if (count <= 0 || count > 2000)   /* protocol limit */
+		goto out;
+
+	/* Find the *last* header in the message */
+	header_offset = (uint32_t)pos;
+	for (i = 1; i < count; i++) {   /* skip all but the last */
+		header_offset += 80;                /* header */
+		 txcount = parse_varint(payload, plen, &header_offset);
+		if (txcount < 0)
+			break;
+	}
+
+	if (header_offset + 80 > plen)
+		goto out;
+
+	/* Extract the last 80-byte header and compute its hash */
+	uchar header[80];
+	memcpy(header, payload + header_offset, 80);
+	uchar h1[32], blockhash[32];
+	sha256(header, 80, h1);
+	sha256(h1, 32, blockhash);
+
+	ck_wlock(&curblock.lock);
+	memcpy(curblock.hash, blockhash, 32);
+	ck_wunlock(&curblock.lock);
+
+	display_newblock(blockhash);
+
+out:
+	dealloc(payload);
 }
 
 static bool p2p_connect_socket(p2p_conn_t *conn)
@@ -482,7 +535,9 @@ static void *p2p_reader(void *arg)
 			handle_inv(conn, payload, plen);
 			continue;
 		} else if (!strcmp(cmd, "headers")) {
-			LOGDEBUG("Received HEADERS (%u bytes) - ignoring (block headers announcement)", plen);
+			LOGINFO("Received HEADERS (%u bytes) - parsing tip and requesting cmpctblock", plen);
+			handle_headers(payload, plen);
+			continue;   /* handler already deallocates */
 		} else if (!strcmp(cmd, "cmpctblock")) {
 			LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
 			handle_cmpctblock(p2pe->ckp, payload, plen, conn->peer);
@@ -687,7 +742,7 @@ static void *submission_thread(void *arg)
 {
 	compact_block_t *cbt = arg;
 	int i, submitted = 0;
-	char *hex;
+	char fliphash[32], hex[68];
 
 	pthread_detach(pthread_self());
 
@@ -737,12 +792,12 @@ static void *submission_thread(void *arg)
 		submitted++;
 	}
 
-	hex = bin2hex(cbt->blockhash, 32);
+	swap_256(fliphash, cbt->blockhash);
+	__bin2hex(hex, fliphash, 32);
 	if (submitted)
 		LOGNOTICE("Submitted %d compact block%s %s", submitted, submitted > 1 ? "s" : "", hex);
 	free(cbt->cmpct_payload);
 	free(cbt);
-	free(hex);
 
 	return NULL;
 }
