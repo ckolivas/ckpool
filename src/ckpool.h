@@ -245,6 +245,8 @@ struct ckpool_instance {
 	connsock_t **p2pcs;
 	p2p_conn_t **p2pconn;
 
+	char *externalip;
+
 	/* Difficulty settings */
 	int64_t mindiff; // Default 1
 	int64_t startdiff; // Default 42

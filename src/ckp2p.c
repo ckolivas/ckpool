@@ -326,6 +326,8 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 }
 
+uint32_t externalip;
+
 /* Send self-advertisement via addrv2 (BIP155) so other nodes can discover us.
  * Uses getsockname() on the live socket to automatically get our public IPv4 address. */
 static void send_self_addrv2(p2p_conn_t *conn)
@@ -333,7 +335,9 @@ static void send_self_addrv2(p2p_conn_t *conn)
 	struct sockaddr_in local;
 	socklen_t len = sizeof(local);
 
-	if (getsockname(conn->sock, (struct sockaddr *)&local, &len) < 0) {
+	if (externalip)
+		local.sin_addr.s_addr = externalip;
+	else if (getsockname(conn->sock, (struct sockaddr *)&local, &len) < 0) {
 		LOGDEBUG("getsockname failed for self-advertisement");
 		return;
 	}
@@ -1252,6 +1256,24 @@ int prepare_ckp2p(ckpool_t *ckp)
 	pthread_t accept_thread;
 
 	cklock_init(&curblock.lock);
+
+	if (ckp->externalip) {
+		connsock_t cslocal;
+		int ip;
+
+		if (!extract_sockaddr(ckp->externalip, &cslocal.url, &cslocal.port)) {
+			LOGEMERG("Failed to extract address from externalip %s", ckp->externalip);
+			return -1;
+		}
+		ip = inet_addr(cslocal.url);
+		free(cslocal.url);
+		free(cslocal.port);
+		if (ip < 0) {
+			LOGEMERG("Failed to extract inet_addr from externalip %s", ckp->externalip);
+			return - 1;
+		}
+		externalip = ip;
+	}
 
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
 	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);

@@ -1469,6 +1469,7 @@ static void parse_config(ckpool_t *ckp)
 		if (arr_size)
 			parse_p2purls(ckp, arr_val, arr_size);
 	}
+	json_get_string(&ckp->externalip, json_conf, "externalip");
 	json_get_string(&ckp->btcaddress, json_conf, "btcaddress");
 	json_get_string(&ckp->btcsig, json_conf, "btcsig");
 	if (ckp->btcsig && strlen(ckp->btcsig) > 38) {
