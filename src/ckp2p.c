@@ -792,19 +792,10 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 	return true;
 }
 
-struct p2pendpoint {
-	ckpool_t *ckp;
-	pthread_t reader_thread;
-	pthread_t keepalive_thread;
-	p2p_conn_t *conn;
-};
-
-typedef struct p2pendpoint p2pendpoint_t;
-
 static void *p2p_reader(void *arg)
 {
-	p2pendpoint_t *p2pe = arg;
-	p2p_conn_t *conn = p2pe->conn;
+	p2p_conn_t *conn = arg;
+	ckpool_t *ckp = conn->ckp;
 	bool active = false;
 	char cmd[13];
 	uchar *payload;
@@ -896,7 +887,7 @@ static void *p2p_reader(void *arg)
 			continue;   /* handler already deallocates */
 		} else if (!strcmp(cmd, "cmpctblock")) {
 			LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
-			handle_cmpctblock(p2pe->ckp, payload, plen, conn->peer);
+			handle_cmpctblock(ckp, payload, plen, conn->peer);
 			continue;
 		} else if (!strcmp(cmd, "tx")) {
 			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
@@ -1111,8 +1102,8 @@ void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_pa
 static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *charport, int source)
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
-	p2pendpoint_t *p2pe;
 	bool success = true;
+	pthread_t thread;
 	int port, i;
 
 	conn->ckp = ckp;
@@ -1159,13 +1150,9 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	} else
 		LOGWARNING("ckp2p connected to bitcoin node %d - %s:%s", source, host, charport);
 
-	p2pe = ckzalloc(sizeof(p2pendpoint_t));
-	p2pe->ckp = ckp;
-	p2pe->conn = conn;
+	create_pthread(&thread, p2p_reader, conn);
 
-	create_pthread(&p2pe->reader_thread, p2p_reader, p2pe);
-
-	create_pthread(&p2pe->keepalive_thread, p2p_keepalive, conn);
+	create_pthread(&thread, p2p_keepalive, conn);
 
 	return conn;
 }
@@ -1212,6 +1199,7 @@ static int create_p2p_listener(void)
 static void *p2p_acceptor(void *arg)
 {
 	ckpool_t *ckp = arg;
+	pthread_t pthread;
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pa");
@@ -1297,11 +1285,8 @@ static void *p2p_acceptor(void *arg)
 		LOGWARNING("Added incoming peer %d (%s:%d)", old, host, port_num);
 
 		/* Spawn exactly the same reader + keepalive threads as outgoing peers */
-		p2pendpoint_t *p2pe = ckzalloc(sizeof(p2pendpoint_t));
-		p2pe->ckp = ckp;
-		p2pe->conn = conn;
-		create_pthread(&p2pe->reader_thread, p2p_reader, p2pe);
-		create_pthread(&p2pe->keepalive_thread, p2p_keepalive, p2pe);
+		create_pthread(&pthread, p2p_reader, conn);
+		create_pthread(&pthread, p2p_keepalive, conn);
 	}
 
 	close(listen_sock);
