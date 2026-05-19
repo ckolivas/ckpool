@@ -432,7 +432,6 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	}
 	for (int64_t i = 0; i < count; i++) {
 		uint32_t type_le, type;
-		bool responded = false;
 		uchar hash[32];
 
 		if (pos + 36 > plen)
@@ -445,10 +444,9 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 
 		if (type == MSG_CMPCT_BLOCK) {
 			ck_rlock(&conn->block_lock);
-			if (conn->has_block && !memcmp(conn->blockhash, hash, 32)) {
+			if (conn->has_block && !memcmp(conn->blockhash, hash, 32))
 				p2p_send(conn, "cmpctblock", conn->cmpct_payload, conn->cmpct_len);
-				responded = true;
-			} else
+			else
 				LOGINFO("Peer %d requested cmpctblock we don't have", conn->peer);
 			ck_runlock(&conn->block_lock);
 		} else {
@@ -456,8 +454,7 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 				conn->peer);
 		}
 
-		if (!responded || conn->peer > 0)
-			disconnect_conn(conn);
+		disconnect_conn(conn);
 	}
 	dealloc(payload);
 }
@@ -849,6 +846,11 @@ static void *p2p_reader(void *arg)
 		if (!p2p_recv(conn, cmd, &payload, &plen)) {
 			LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
 			disconnect_conn(conn);
+
+			if (active) {
+				active = false;
+				active_conns--;
+			}
 			if (conn->reconnect < 300)
 				conn->reconnect *= 2;
 			sleep(conn->reconnect);
@@ -1036,11 +1038,8 @@ static void *submission_thread(void *arg)
 
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
 		/* Disconnect all remote peers to avoid inducing latency at
-		 * their end in case they ask for more information from ckp2p.
-		 * The local peer we can disconnect immediately if asked for
-		 * more information. */
-		if (conn->peer > 0)
-			disconnect_conn(conn);
+		 * their end in case they ask for more information from ckp2p.*/
+		disconnect_conn(conn);
 
 		submitted++;
 	}
