@@ -27,6 +27,7 @@
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
+#define EVICT_TIMEOUT 600
 
 static const struct {
 	const char *name;
@@ -163,9 +164,10 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 	if (write_exact(conn->sock, hdr, 24) != 24 ||
 		(plen && write_exact(conn->sock, payload, plen) != (ssize_t)plen)) {
 		LOGNOTICE("p2p_send(%s) failed to peer %d", cmd, conn->peer);
-		} else {
-			LOGINFO("Sent %s (%u bytes) to peer %d", cmd, plen, conn->peer);
-		}
+	} else {
+		tv_time(&conn->last_alive);
+		LOGINFO("Sent %s (%u bytes) to peer %d", cmd, plen, conn->peer);
+	}
 }
 
 static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *plen)
@@ -219,6 +221,8 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 		*payload = NULL;
 		return false;
 	}
+
+	tv_time(&conn->last_alive);
 	return true;
 }
 
@@ -483,6 +487,9 @@ static void *p2p_reader(void *arg)
 	conn->reconnect = 5;
 
 	while (42) {
+		if (unlikely(conn->evicted))
+			break;
+
 		if (conn->sock < 0) {
 			if (p2p_connect_socket(conn)) {
 				if (!do_handshake(conn, conn->port)) {
@@ -508,6 +515,7 @@ static void *p2p_reader(void *arg)
 		}
 
 		conn->reconnect = 5;
+
 		// Log all received messages with descriptive type, even if ignoring
 		if (!strcmp(cmd, "version")) {
 			LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
@@ -581,6 +589,7 @@ static void *p2p_keepalive(void *arg)
 {
 	p2pendpoint_t *p2pe = arg;
 	p2p_conn_t *conn = p2pe->conn;
+	tv_t now;
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pk");
@@ -589,8 +598,16 @@ static void *p2p_keepalive(void *arg)
 		uint64_t nonce, nonce_le;
 
 		sleep(KEEPALIVE_INTERVAL);
-		if (!conn->handshake_done || conn->sock < 0)
+		tv_time(&now);
+		if (!conn->handshake_done || conn->sock < 0) {
+			if (tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
+				LOGWARNING("Dropping peer %d unresponsive for %d seconds",
+					   conn->peer, EVICT_TIMEOUT);
+				conn->evicted = true;
+				break;
+			}
 			continue;
+		}
 
 		nonce = ((uint64_t)rand() << 32) | rand();
 		nonce_le = htole64(nonce);
@@ -841,6 +858,9 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	sscanf(charport, "%d", &port);
 	conn->port = port;
 	memset(conn->magic, 0, 4); // unset
+
+	/* Set initial attempted connection time */
+	tv_time(&conn->last_alive);
 
 	for (i = 0; netdefs[i].name; i++) {
 		if (netdefs[i].port == port) {
