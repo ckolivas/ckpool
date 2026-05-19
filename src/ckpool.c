@@ -263,6 +263,7 @@ out:
 	return ret;
 }
 
+#ifndef CKP2P
 /* Create a standalone thread that queues received unix messages for a proc
  * instance and adds them to linked list of received messages with their
  * associated receive socket, then signal the associated rmsg_cond for the
@@ -305,6 +306,7 @@ static void *unix_receiver(void *arg)
 
 	return NULL;
 }
+#endif
 
 /* Get the next message in the receive queue, or wait up to 5 seconds for
  * the next message, returning NULL if no message is received in that time. */
@@ -330,6 +332,7 @@ unix_msg_t *get_unix_msg(proc_instance_t *pi)
 	return umsg;
 }
 
+#ifndef CKP2P
 static void create_unix_receiver(proc_instance_t *pi)
 {
 	pthread_t pth;
@@ -339,6 +342,7 @@ static void create_unix_receiver(proc_instance_t *pi)
 
 	create_pthread(&pth, unix_receiver, pi);
 }
+#endif
 
 /* Put a sanity check on kill calls to make sure we are not sending them to
  * pid 0. */
@@ -420,11 +424,13 @@ retry:
 			ckp->loglevel = loglevel;
 			send_unix_msg(sockd, "success");
 		}
+#ifndef CKP2P
 	} else if (cmdmatch(buf, "getxfd")) {
 		int fdno = -1;
 
 		sscanf(buf, "getxfd%d", &fdno);
 		connector_send_fd(ckp, fdno, sockd);
+#endif
 	} else if (cmdmatch(buf, "accept")) {
 		LOGWARNING("Listener received accept message, accepting clients");
 		send_proc(ckp->connector, "accept");
@@ -451,6 +457,7 @@ retry:
 			}
 			execv(ckp->initial_args[0], (char *const *)ckp->initial_args);
 		}
+#ifndef CKP2P
 	} else if (cmdmatch(buf, "stratifierstats")) {
 		LOGDEBUG("Listener received stratifierstats request");
 		msg = stratifier_stats(ckp, ckp->sdata);
@@ -461,6 +468,7 @@ retry:
 		msg = connector_stats(ckp->cdata, 0);
 		send_unix_msg(sockd, msg);
 		dealloc(msg);
+#endif
 	} else if (cmdmatch(buf, "resetshares")) {
 		LOGWARNING("Resetting best shares");
 		send_proc(ckp->stratifier, buf);
@@ -1035,6 +1043,7 @@ static void open_process_sock(ckpool_t *ckp, const proc_instance_t *pi, unixsock
 		quit(1, "Failed to set %s to group id %d", us->path, ckp->gr_gid);
 }
 
+#ifndef CKP2P
 static void create_process_unixsock(proc_instance_t *pi)
 {
 	unixsock_t *us = &pi->us;
@@ -1043,6 +1052,7 @@ static void create_process_unixsock(proc_instance_t *pi)
 	name_process_sockname(us, pi);
 	open_process_sock(ckp, pi, us);
 }
+#endif
 
 static void write_namepid(proc_instance_t *pi)
 {
@@ -1545,6 +1555,7 @@ static void manage_old_instance(ckpool_t *ckp, proc_instance_t *pi)
 	}
 }
 
+#ifndef CKP2P
 static void prepare_child(ckpool_t *ckp, proc_instance_t *pi, void *process, char *name)
 {
 	pi->ckp = ckp;
@@ -1554,6 +1565,7 @@ static void prepare_child(ckpool_t *ckp, proc_instance_t *pi, void *process, cha
 	create_pthread(&pi->pth_process, process, pi);
 	create_unix_receiver(pi);
 }
+#endif
 
 static struct option long_options[] = {
 	{"btcsolo",	no_argument,		0,	'B'},
@@ -1718,6 +1730,13 @@ int main(int argc, char **argv)
 				break;
 		}
 	}
+
+
+#ifdef CKP2P
+	ckp.p2prelay = true;
+	if (ckp.proxy || ckp.node || ckp.btcsolo)
+		quit(1, "Cannot set any ckpool mode from standalone ckp2p binary");
+#endif
 
 	if (!ckp.name) {
 		if (ckp.node)
@@ -1932,12 +1951,13 @@ int main(int argc, char **argv)
 		LOGEMERG("Failed to start ckp2p2, exiting");
 		exit(1);
 	}
+#ifndef CKP2P
 	if (!ckp.p2prelay) {
 		prepare_child(&ckp, &ckp.generator, generator, "generator");
 		prepare_child(&ckp, &ckp.stratifier, stratifier, "stratifier");
 		prepare_child(&ckp, &ckp.connector, connector, "connector");
 	}
-
+#endif
 	/* Shutdown from here if the listener is sent a shutdown message */
 	if (ckp.pth_listener)
 		join_pthread(ckp.pth_listener);

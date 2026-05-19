@@ -24,18 +24,20 @@ endif
 %.A: %.asm
 	yasm -f x64 -f elf64 -X gnu -g dwarf2 -D LINUX -o $@ $<
 
-noinst_LIBRARIES = libckpool.a
-libckpool_a_SOURCES = libckpool.c sha2.c sha256_arm_shani.c sha256_code_release
-libckpool_a_LIBADD = $(native_objs)
+bin_PROGRAMS = ckpool ckpmsg
+EXTRA_PROGRAMS = ckp2p notifier
 
-bin_PROGRAMS = ckpool ckpmsg notifier
 ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
-		 yyjson.c yyjson_util.c ckp2p.c
-
+                 yyjson.c yyjson_util.c ckp2p.c
 ckpool_LDADD = libckpool.a @JANSSON_LIBS@ @LIBS@
 
 ckpmsg_SOURCES = ckpmsg.c
 ckpmsg_LDADD = libckpool.a @JANSSON_LIBS@
+
+ckp2p_SOURCES = ckpool.c bitcoin.c yyjson.c yyjson_util.c ckp2p.c
+ckp2p_LDADD = libckpool.a jansson-2.14/src/.libs/libjansson.a @LIBS@
+ckp2p_DEPENDENCIES = libckpool.a jansson-2.14/src/.libs/libjansson.a
+ckp2p_CPPFLAGS = -Ijansson-2.14/src -DCKP2P
 
 notifier_SOURCES = notifier.c
 notifier_LDADD = libckpool.a @JANSSON_LIBS@
