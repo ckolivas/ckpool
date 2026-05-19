@@ -28,7 +28,7 @@
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
 #define EVICT_TIMEOUT 3600
-#define CKP2P_LISTEN_PORT 9333
+#define CKP2P_LISTEN_PORT 8334
 
 static const struct {
 	const char *name;
