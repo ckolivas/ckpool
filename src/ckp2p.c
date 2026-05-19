@@ -380,8 +380,7 @@ static void send_self_addrv2(p2p_conn_t *conn)
 	pos += 2;
 
 	p2p_send(conn, "addrv2", payload, pos);
-	LOGINFO("Sent self addrv2 advertisement to peer %d (%s:%d)", conn->peer,
-		conn->host, conn->port);
+	LOGINFO("Sent self addrv2 advertisement to peer (%s:%d)", conn->host, conn->port);
 }
 
 static void handle_ping(p2p_conn_t *conn, uchar *payload, uint32_t len)
