@@ -1304,7 +1304,8 @@ int prepare_ckp2p(ckpool_t *ckp)
 			return - 1;
 		}
 		externalip = ip;
-	}
+	} else
+		externalport = CKP2P_LISTEN_PORT;
 
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
 	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
