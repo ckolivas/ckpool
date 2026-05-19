@@ -27,7 +27,7 @@
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
-#define EVICT_TIMEOUT 600
+#define EVICT_TIMEOUT 3600
 
 static const struct {
 	const char *name;
@@ -774,6 +774,10 @@ static void *submission_thread(void *arg)
 		conn = cbt->ckp->p2pconn[i];
 		if (unlikely(!conn)) {
 			LOGDEBUG("Skipping relaying compact block to uninitialised node %d", i);
+			continue;
+		}
+		if (conn->evicted) {
+			LOGDEBUG("Skipping relaying compact block to evicted node %d", i);
 			continue;
 		}
 
