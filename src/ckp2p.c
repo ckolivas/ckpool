@@ -1095,7 +1095,7 @@ static void *p2p_acceptor(void *arg)
 		conn->peer = old;
 		ckp->p2purls = old + 1;
 
-		LOGNOTICE("Added incoming peer %d (%s:%d) to p2purl / p2pconn list", old, host, port_num);
+		LOGWARNING("Added incoming peer %d (%s:%d)", old, host, port_num);
 
 		/* Spawn exactly the same reader + keepalive threads as outgoing peers */
 		p2pendpoint_t *p2pe = ckzalloc(sizeof(p2pendpoint_t));
