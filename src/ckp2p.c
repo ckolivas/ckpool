@@ -170,6 +170,12 @@ static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
 		struct in_addr ipv4;
 		memcpy(&ipv4.s_addr, ip + 12, 4);
 		inet_ntop(AF_INET, &ipv4, host_out, INET_ADDRSTRLEN);
+		if (!strncmp(host_out, "127", 3) || !strncmp(host_out, "192.168", 7) ||
+		    !strncmp(host_out, "10.",3) || !strncmp(host_out, "172", 3) ||
+		    !strncmp(host_out, "0.0.0.0", 7) || !strncmp(host_out, "169.254", 7)) {
+			LOGDEBUG("Peer advertised LAN address %s", host_out);
+			return false;
+		}
 		return true;
 	}
 
