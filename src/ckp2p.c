@@ -228,8 +228,7 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 }
 
 /* Build and send VERSION message (used by both outgoing and incoming handshakes).
- * Advertises CKP2P_LISTEN_PORT in addr_from so other ckp2p instances know
- * we accept incoming connections on port 9333. */
+ * Advertises CKP2P_LISTEN_PORT in addr_from. */
 static void send_version(p2p_conn_t *conn, int remote_port)
 {
 	uchar version_payload[97] = {};
@@ -290,6 +289,54 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 	version_payload[off++] = 0; /* relay = 0 */
 
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
+}
+
+/* Send self-advertisement via addrv2 (BIP155) so other nodes can discover us.
+ * Uses getsockname() on the live socket to automatically get our public IPv4 address.
+ * Always advertises the correct listening port (CKP2P_LISTEN_PORT). */
+static void send_self_addrv2(p2p_conn_t *conn)
+{
+	struct sockaddr_in local;
+	socklen_t len = sizeof(local);
+
+	if (getsockname(conn->sock, (struct sockaddr *)&local, &len) < 0) {
+		LOGDEBUG("getsockname failed for self-advertisement");
+		return;
+	}
+
+	/* Build addrv2 payload with exactly 1 address (our own) */
+	uchar payload[64]; /* plenty of room */
+	uint32_t pos = 0;
+
+	/* count = 1 (varint) */
+	payload[pos++] = 1;
+
+	/* time (uint32_t, current time) */
+	uint32_t now = (uint32_t)time(NULL);
+	uint32_t now_le = htole32(now);
+	memcpy(payload + pos, &now_le, 4);
+	pos += 4;
+
+	/* services (varint = 9) */
+	payload[pos++] = 9;
+
+	/* network ID = 1 (IPv4) */
+	payload[pos++] = 1;
+
+	/* address length (varint = 4) */
+	payload[pos++] = 4;
+
+	/* IPv4 address (network byte order) */
+	memcpy(payload + pos, &local.sin_addr.s_addr, 4);
+	pos += 4;
+
+	/* port (big-endian, our listening port) */
+	uint16_t port_be = htons(CKP2P_LISTEN_PORT);
+	memcpy(payload + pos, &port_be, 2);
+	pos += 2;
+
+	p2p_send(conn, "addrv2", payload, pos);
+	LOGINFO("Sent self addrv2 advertisement to peer %d (%s:%d)", conn->peer, conn->host, CKP2P_LISTEN_PORT);
 }
 
 static void handle_ping(p2p_conn_t *conn, uchar *payload, uint32_t len)
@@ -577,6 +624,9 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	LOGNOTICE("P2P handshake complete with peer %d on %s - ready for compact blocks",
 		  conn->peer, conn->netname);
 
+	/* Advertise ourselves to the network */
+	send_self_addrv2(conn);
+
 	// Send getheaders with genesis locator and zero stop to request up to 2000 headers
 	uchar gethdr_payload[69];
 	memset(gethdr_payload, 0, sizeof(gethdr_payload));
@@ -643,6 +693,9 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 	conn->handshake_done = true;
 	LOGNOTICE("P2P incoming handshake complete with peer on %s - ready for compact blocks",
 		  conn->netname);
+
+	/* Advertise ourselves to the network */
+	send_self_addrv2(conn);
 
 	/* Also request current tip (same as outgoing) */
 	uchar gethdr_payload[69];
@@ -1134,7 +1187,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
-	/* Start listener thread for incoming ckp2p connections on port 9333 */
+	/* Start listener thread for incoming ckp2p connections on port 8335 */
 	create_pthread(&accept_thread, p2p_acceptor, ckp);
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", CKP2P_LISTEN_PORT);
 
