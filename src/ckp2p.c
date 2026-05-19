@@ -28,6 +28,7 @@
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
 #define EVICT_TIMEOUT 3600
+#define CKP2P_LISTEN_PORT 9333
 
 static const struct {
 	const char *name;
@@ -224,6 +225,71 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 
 	tv_time(&conn->last_alive);
 	return true;
+}
+
+/* Build and send VERSION message (used by both outgoing and incoming handshakes).
+ * Advertises CKP2P_LISTEN_PORT in addr_from so other ckp2p instances know
+ * we accept incoming connections on port 9333. */
+static void send_version(p2p_conn_t *conn, int remote_port)
+{
+	uchar version_payload[97] = {};
+	int off = 0;
+	uint32_t nversion = 70016;
+	uint32_t nversion_le = htole32(nversion);
+	memcpy(version_payload + off, &nversion_le, sizeof(nversion_le));
+	off += sizeof(nversion_le);
+
+	uint64_t services = 9ULL;
+	uint64_t services_le = htole64(services);
+	memcpy(version_payload + off, &services_le, sizeof(services_le));
+	off += sizeof(services_le);
+
+	uint64_t ntime = (uint64_t)time(NULL);
+	uint64_t ntime_le = htole64(ntime);
+	memcpy(version_payload + off, &ntime_le, sizeof(ntime_le));
+	off += sizeof(ntime_le);
+
+	/* addr_recv (remote peer) */
+	uint64_t recv_services_le = htole64(services);
+	memcpy(version_payload + off, &recv_services_le, sizeof(recv_services_le));
+	off += sizeof(recv_services_le);
+	uchar recv_ip[16] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0x7f,0x00,0x00,0x01};
+	memcpy(version_payload + off, recv_ip, 16);
+	off += 16;
+	uint16_t recv_port_be = htons(remote_port);
+	memcpy(version_payload + off, &recv_port_be, sizeof(recv_port_be));
+	off += sizeof(recv_port_be);
+
+	/* addr_from: advertise ourselves as listening on CKP2P_LISTEN_PORT */
+	uint64_t from_services_le = htole64(services);
+	memcpy(version_payload + off, &from_services_le, sizeof(from_services_le));
+	off += sizeof(from_services_le);
+	memset(version_payload + off, 0, 16);
+	off += 16;
+	uint16_t from_port_be = htons(CKP2P_LISTEN_PORT);
+	memcpy(version_payload + off, &from_port_be, sizeof(from_port_be));
+	off += sizeof(from_port_be);
+
+	/* nonce */
+	uint64_t nnonce = ((uint64_t)rand() << 32) | rand();
+	uint64_t nnonce_le = htole64(nnonce);
+	memcpy(version_payload + off, &nnonce_le, sizeof(nnonce_le));
+	off += sizeof(nnonce_le);
+
+	const char *ua = "/ckp2p:1.0/";
+	uchar ualen = (uchar)strlen(ua);
+	version_payload[off++] = ualen;
+	memcpy(version_payload + off, ua, ualen);
+	off += ualen;
+
+	uint32_t height = 0;
+	uint32_t height_le = htole32(height);
+	memcpy(version_payload + off, &height_le, sizeof(height_le));
+	off += sizeof(height_le);
+
+	version_payload[off++] = 0; /* relay = 0 */
+
+	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 }
 
 static void handle_ping(p2p_conn_t *conn, uchar *payload, uint32_t len)
@@ -462,7 +528,134 @@ static bool p2p_connect_socket(p2p_conn_t *conn)
 	return true;
 }
 
-static bool do_handshake(p2p_conn_t *conn, int port);
+static bool do_handshake(p2p_conn_t *conn, int port)
+{
+	char cmd[13];
+	uchar *payload;
+	uint32_t plen;
+	uint32_t protover, protover_le;
+
+	send_version(conn, port);
+
+	LOGINFO("Waiting for VERSION from peer...");
+
+	while (42) {
+		if (!p2p_recv(conn, cmd, &payload, &plen))
+			return false;
+		LOGINFO("Received %s (%u bytes)", cmd, plen);
+		if (!strcmp(cmd, "version")) {
+			LOGINFO("Received VERSION from peer");
+			dealloc(payload);
+			break;
+		}
+		if (payload)
+			dealloc(payload);
+	}
+
+	p2p_send(conn, "wtxidrelay", NULL, 0);
+	p2p_send(conn, "sendaddrv2", NULL, 0);
+
+	uchar sc[9] = {0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // high_bw=1, ver=2
+	p2p_send(conn, "sendcmpct", sc, 9);
+
+	p2p_send(conn, "verack", NULL, 0);
+
+	while (42) {
+		if (!p2p_recv(conn, cmd, &payload, &plen))
+			return false;
+		LOGINFO("Received %s (%u bytes)", cmd, plen);
+		if (!strcmp(cmd, "verack")) {
+			LOGINFO("Received VERACK - handshake complete");
+			dealloc(payload);
+			break;
+		}
+		if (payload)
+			dealloc(payload);
+	}
+
+	conn->handshake_done = true;
+	LOGNOTICE("P2P handshake complete with peer %d on %s - ready for compact blocks",
+		  conn->peer, conn->netname);
+
+	// Send getheaders with genesis locator and zero stop to request up to 2000 headers
+	uchar gethdr_payload[69];
+	memset(gethdr_payload, 0, sizeof(gethdr_payload));
+	protover = 70016;
+	protover_le = htole32(protover);
+	memcpy(gethdr_payload, &protover_le, 4);
+	gethdr_payload[4] = 1; // hash_count varint=1
+	memcpy(gethdr_payload + 5, conn->genesis, 32);
+	// hash_stop remains all zeros
+	p2p_send(conn, "getheaders", gethdr_payload, sizeof(gethdr_payload));
+
+	return true;
+}
+
+/* Server-side handshake for incoming connections (peer sends VERSION first) */
+static bool do_incoming_handshake(p2p_conn_t *conn)
+{
+	char cmd[13];
+	uchar *payload = NULL;
+	uint32_t plen;
+
+	/* Wait for VERSION from the incoming peer */
+	LOGINFO("Waiting for VERSION from incoming peer...");
+	while (42) {
+		if (!p2p_recv(conn, cmd, &payload, &plen))
+			return false;
+		LOGINFO("Received %s (%u bytes)", cmd, plen);
+		if (!strcmp(cmd, "version")) {
+			LOGINFO("Received VERSION from incoming peer");
+			if (payload) dealloc(payload);
+			break;
+		}
+		if (payload)
+			dealloc(payload);
+	}
+
+	/* Send our VERSION (advertises CKP2P_LISTEN_PORT) */
+	send_version(conn, conn->port);
+
+	/* Negotiation messages (same as outgoing) */
+	p2p_send(conn, "wtxidrelay", NULL, 0);
+	p2p_send(conn, "sendaddrv2", NULL, 0);
+
+	uchar sc[9] = {0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; /* high_bw=1, ver=2 */
+	p2p_send(conn, "sendcmpct", sc, 9);
+
+	p2p_send(conn, "verack", NULL, 0);
+
+	/* Wait for VERACK */
+	LOGINFO("Waiting for VERACK from incoming peer...");
+	while (42) {
+		if (!p2p_recv(conn, cmd, &payload, &plen))
+			return false;
+		LOGINFO("Received %s (%u bytes)", cmd, plen);
+		if (!strcmp(cmd, "verack")) {
+			LOGINFO("Received VERACK - handshake complete for incoming peer");
+			if (payload) dealloc(payload);
+			break;
+		}
+		if (payload)
+			dealloc(payload);
+	}
+
+	conn->handshake_done = true;
+	LOGNOTICE("P2P incoming handshake complete with peer on %s - ready for compact blocks",
+		  conn->netname);
+
+	/* Also request current tip (same as outgoing) */
+	uchar gethdr_payload[69];
+	memset(gethdr_payload, 0, sizeof(gethdr_payload));
+	uint32_t protover = 70016;
+	uint32_t protover_le = htole32(protover);
+	memcpy(gethdr_payload, &protover_le, 4);
+	gethdr_payload[4] = 1; /* hash_count varint=1 */
+	memcpy(gethdr_payload + 5, conn->genesis, 32);
+	p2p_send(conn, "getheaders", gethdr_payload, sizeof(gethdr_payload));
+
+	return true;
+}
 
 struct p2pendpoint {
 	ckpool_t *ckp;
@@ -614,133 +807,6 @@ static void *p2p_keepalive(void *arg)
 		p2p_send(conn, "ping", (uchar *)&nonce_le, 8);
 	}
 	return NULL;
-}
-
-static bool do_handshake(p2p_conn_t *conn, int port)
-{
-	uint32_t nversion, nversion_le, height, height_le, protover, protover_le;
-	uchar version_payload[97] = {};
-	int off = 0;
-	uint64_t services, services_le, ntime, ntime_le, recv_services, recv_services_le,
-	from_services_le, nnonce, nnonce_le;
-	uint16_t recv_port, from_port;
-	// user_agent
-	const char *ua = "/ckp2p:1.0/";
-	char cmd[13];
-	uchar *payload;
-	uint32_t plen;
-
-	nversion = 70016;
-	nversion_le = htole32(nversion);
-	memcpy(version_payload + off, &nversion_le, sizeof(nversion_le));
-	off += sizeof(nversion_le);
-
-	services = 9ULL;
-	services_le = htole64(services);
-	memcpy(version_payload + off, &services_le, sizeof(services_le));
-	off += sizeof(services_le);
-
-	ntime = (uint64_t)time(NULL);
-	ntime_le = htole64(ntime);
-	memcpy(version_payload + off, &ntime_le, sizeof(ntime_le));
-	off += sizeof(ntime_le);
-
-	// addr_recv: services 9, IPv4-mapped 127.0.0.1, port
-	recv_services = services;
-	recv_services_le = htole64(recv_services);
-	memcpy(version_payload + off, &recv_services_le, sizeof(recv_services_le));
-	off += sizeof(recv_services_le);
-	uchar recv_ip[16] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0x7f,0x00,0x00,0x01};
-	memcpy(version_payload + off, recv_ip, 16);
-	off += 16;
-	recv_port = htons(port); // Ports are big-endian
-	memcpy(version_payload + off, &recv_port, sizeof(recv_port));
-	off += sizeof(recv_port);
-
-	// addr_from: services 9, all zeros ip, port 0 (dummy to prevent self-connection)
-	from_services_le = htole64(services);
-	memcpy(version_payload + off, &from_services_le, sizeof(from_services_le));
-	off += sizeof(from_services_le);
-	memset(version_payload + off, 0, 16); // ip all zero
-	off += 16;
-	from_port = htons(0);
-	memcpy(version_payload + off, &from_port, sizeof(from_port));
-	off += sizeof(from_port);
-
-	// nonce: random
-	nnonce = ((uint64_t)rand() << 32) | rand();
-	nnonce_le = htole64(nnonce);
-	memcpy(version_payload + off, &nnonce_le, sizeof(nnonce_le));
-	off += sizeof(nnonce_le);
-
-	uchar ualen = (uchar)strlen(ua);
-	version_payload[off++] = ualen;
-	memcpy(version_payload + off, ua, ualen);
-	off += ualen;
-
-	// start_height: 0
-	height = 0;
-	height_le = htole32(height);
-	memcpy(version_payload + off, &height_le, sizeof(height_le));
-	off += sizeof(height_le);
-
-	// relay: 0 (to enable TX relay and unsolicited INV/TX)
-	version_payload[off++] = 0;
-
-	p2p_send(conn, "version", version_payload, sizeof(version_payload));
-
-	LOGINFO("Waiting for VERSION from peer...");
-
-	while (42) {
-		if (!p2p_recv(conn, cmd, &payload, &plen))
-			return false;
-		LOGINFO("Received %s (%u bytes)", cmd, plen);
-		if (!strcmp(cmd, "version")) {
-			LOGINFO("Received VERSION from peer");
-			dealloc(payload);
-			break;
-		}
-		if (payload)
-			dealloc(payload);
-	}
-
-	p2p_send(conn, "wtxidrelay", NULL, 0);
-	p2p_send(conn, "sendaddrv2", NULL, 0);
-
-	uchar sc[9] = {0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // high_bw=1, ver=2
-	p2p_send(conn, "sendcmpct", sc, 9);
-
-	p2p_send(conn, "verack", NULL, 0);
-
-	while (42) {
-		if (!p2p_recv(conn, cmd, &payload, &plen))
-			return false;
-		LOGINFO("Received %s (%u bytes)", cmd, plen);
-		if (!strcmp(cmd, "verack")) {
-			LOGINFO("Received VERACK - handshake complete");
-			dealloc(payload);
-			break;
-		}
-		if (payload)
-			dealloc(payload);
-	}
-
-	conn->handshake_done = true;
-	LOGNOTICE("P2P handshake complete with peer %d on %s - ready for compact blocks",
-		  conn->peer, conn->netname);
-
-	// Send getheaders with genesis locator and zero stop to request up to 2000 headers
-	uchar gethdr_payload[69];
-	memset(gethdr_payload, 0, sizeof(gethdr_payload));
-	protover = 70016;
-	protover_le = htole32(protover);
-	memcpy(gethdr_payload, &protover_le, 4);
-	gethdr_payload[4] = 1; // hash_count varint=1
-	memcpy(gethdr_payload + 5, conn->genesis, 32);
-	// hash_stop remains all zeros
-	p2p_send(conn, "getheaders", gethdr_payload, sizeof(gethdr_payload));
-
-	return true;
 }
 
 struct compact_block {
@@ -906,10 +972,148 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	return conn;
 }
 
+/* Listener socket creator (all interfaces) */
+static int create_p2p_listener(void)
+{
+	int sock;
+	struct sockaddr_in sin;
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0) {
+		LOGEMERG("Failed to create ckp2p listener socket: %s", strerror(errno));
+		return -1;
+	}
+
+	int opt = 1;
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = INADDR_ANY;
+	sin.sin_port = htons(CKP2P_LISTEN_PORT);
+
+	if (bind(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+		LOGEMERG("Failed to bind ckp2p listener port %d: %s", CKP2P_LISTEN_PORT, strerror(errno));
+		close(sock);
+		return -1;
+	}
+
+	if (listen(sock, 32) < 0) {
+		LOGEMERG("Failed to listen on ckp2p port %d: %s", CKP2P_LISTEN_PORT, strerror(errno));
+		close(sock);
+		return -1;
+	}
+
+	LOGNOTICE("ckp2p listening on 0.0.0.0:%d for incoming P2P connections", CKP2P_LISTEN_PORT);
+	return sock;
+}
+
+/* Acceptor thread – accepts incoming connections, runs full handshake,
+ * adds them to the p2purl / p2pconn lists, and spawns reader/keepalive threads
+ * exactly like outgoing peers. */
+static void *p2p_acceptor(void *arg)
+{
+	ckpool_t *ckp = arg;
+
+	pthread_detach(pthread_self());
+	rename_proc("ckp2pa");
+
+	int listen_sock = create_p2p_listener();
+	if (listen_sock < 0)
+		return NULL;
+
+	while (42) {
+		struct sockaddr_in client_addr;
+		socklen_t clen = sizeof(client_addr);
+		int newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
+		if (newsock < 0) {
+			if (errno != EINTR)
+				LOGDEBUG("accept error: %s", strerror(errno));
+			continue;
+		}
+
+		char host[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &client_addr.sin_addr, host, sizeof(host));
+		int port_num = ntohs(client_addr.sin_port);
+		char serv[16];
+		snprintf(serv, sizeof(serv), "%d", port_num);
+
+		LOGNOTICE("Incoming ckp2p connection from %s:%d", host, port_num);
+
+		p2p_conn_t *conn = ckzalloc(sizeof(*conn));
+		cklock_init(&conn->block_lock);
+		conn->sock = newsock;
+		strncpy(conn->host, host, sizeof(conn->host) - 1);
+		strncpy(conn->charport, serv, sizeof(conn->charport) - 1);
+		conn->port = port_num;
+		memset(conn->magic, 0, 4); /* auto-detect */
+		memcpy(conn->genesis, netdefs[0].genesis, 32);
+		conn->netname = netdefs[0].name;
+		conn->cmpct_payload = NULL;
+		conn->has_block = false;
+		tv_time(&conn->last_alive);
+		conn->reconnect = 5;
+		conn->handshake_done = false;
+		conn->evicted = false;
+
+		if (!do_incoming_handshake(conn)) {
+			LOGINFO("Incoming handshake failed from %s:%d", host, port_num);
+			close(newsock);
+			dealloc(conn);
+			continue;
+		}
+
+		/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
+		int old = ckp->p2purls;
+
+		/* p2purl */
+		char **old_p2purl = ckp->p2purl;
+		ckp->p2purl = ckalloc(sizeof(char *) * (old + 1));
+		if (old > 0)
+			memcpy(ckp->p2purl, old_p2purl, sizeof(char *) * old);
+		char *new_url = ckalloc(strlen(host) + strlen(serv) + 2);
+		sprintf(new_url, "%s:%s", host, serv);
+		ckp->p2purl[old] = new_url;
+		if (old_p2purl) dealloc(old_p2purl);
+
+		/* p2pcs (for API consistency) */
+		connsock_t **old_p2pcs = ckp->p2pcs;
+		ckp->p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
+		if (old > 0)
+			memcpy(ckp->p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
+		ckp->p2pcs[old] = NULL;
+		if (old_p2pcs) dealloc(old_p2pcs);
+
+		/* p2pconn */
+		p2p_conn_t **old_p2pconn = ckp->p2pconn;
+		ckp->p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
+		if (old > 0)
+			memcpy(ckp->p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
+		ckp->p2pconn[old] = conn;
+		if (old_p2pconn) dealloc(old_p2pconn);
+
+		conn->peer = old;
+		ckp->p2purls = old + 1;
+
+		LOGNOTICE("Added incoming peer %d (%s:%d) to p2purl / p2pconn list", old, host, port_num);
+
+		/* Spawn exactly the same reader + keepalive threads as outgoing peers */
+		p2pendpoint_t *p2pe = ckzalloc(sizeof(p2pendpoint_t));
+		p2pe->ckp = ckp;
+		p2pe->conn = conn;
+		create_pthread(&p2pe->reader_thread, p2p_reader, p2pe);
+		create_pthread(&p2pe->keepalive_thread, p2p_keepalive, p2pe);
+	}
+
+	close(listen_sock);
+	return NULL;
+}
+
 int prepare_ckp2p(ckpool_t *ckp)
 {
 	connsock_t *cs;
 	int i;
+	pthread_t accept_thread;
 
 	cklock_init(&curblock.lock);
 
@@ -929,6 +1133,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 		ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
+
+	/* Start listener thread for incoming ckp2p connections on port 9333 */
+	create_pthread(&accept_thread, p2p_acceptor, ckp);
+	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", CKP2P_LISTEN_PORT);
 
 	return 0;
 }
