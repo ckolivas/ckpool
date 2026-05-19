@@ -142,24 +142,27 @@ static ssize_t write_exact(int sock, const void *buf, size_t len)
 	return (ssize_t)len;
 }
 
-/* Parse the addr_from field from a VERSION message payload (BIP 155 style).
- * Returns true if a valid IPv4 listening address/port was extracted. */
+/* Parse the addr_from field from a VERSION message payload.
+ * Returns true only if a valid IPv4 listening address AND port (>0) was extracted. */
 static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
                                     char *host_out, int *port_out)
 {
-	if (plen < 72)          /* version(4) + services(8) + time(8) + addr_recv(26) + addr_from(26) */
+	if (plen < 72)          /* minimum size for addr_from */
 		return false;
 
-	/* addr_from starts at byte 46 in the VERSION payload */
+	/* addr_from is always at byte offset 46 (after version+services+time+addr_recv) */
 	const uchar *addr_from = payload + 46;
 
-	/* Skip services (8 bytes) inside net_addr */
+	/* services (8 bytes) inside net_addr */
 	const uchar *ip = addr_from + 8;
 
-	/* Port is big-endian at offset 16 of the net_addr (after services) */
+	/* Port is big-endian at offset 16 of the net_addr */
 	uint16_t port_be;
 	memcpy(&port_be, ip + 16, 2);
 	*port_out = ntohs(port_be);
+
+	if (*port_out == 0 || *port_out > 65535)
+		return false;
 
 	/* IPv4-mapped address (::ffff:0.0.0.0/96) is the common case */
 	static const uchar v4mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
@@ -167,7 +170,7 @@ static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
 		struct in_addr ipv4;
 		memcpy(&ipv4.s_addr, ip + 12, 4);
 		inet_ntop(AF_INET, &ipv4, host_out, INET_ADDRSTRLEN);
-		return (*port_out > 0 && *port_out <= 65535);
+		return true;
 	}
 
 	/* IPv6 not supported by ckp2p yet */
@@ -690,18 +693,14 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 
 			/* Try to extract the peer's real listening address/port from addr_from */
 			char adv_host[INET_ADDRSTRLEN] = {0};
-			int adv_port = 0;
+			int adv_port = 8333; /* Try 8333 if we don't get it */
 			if (parse_version_addr_from(payload, plen, adv_host, &adv_port)) {
 				LOGNOTICE("Peer %d advertised listening address %s:%d - updating reconnection info",
 					  conn->peer, adv_host, adv_port);
 				strncpy(conn->host, adv_host, sizeof(conn->host) - 1);
 				snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
-				conn->port = adv_port;
-			} else {
-				LOGWARNING("Could not parse listening address from VERSION for peer %d - will evict on disconnect",
-					   conn->peer);
-				conn->evicted = true;   /* prevent reconnection to ephemeral port */
 			}
+			conn->port = adv_port;
 
 			if (payload) dealloc(payload);
 			break;
