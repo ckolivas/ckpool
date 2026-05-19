@@ -954,7 +954,7 @@ static void *p2p_keepalive(void *arg)
 #endif
 		sleep(KEEPALIVE_INTERVAL);
 		tv_time(&now);
-		if (!conn->handshake_done || conn->sock < 0) {
+		if (conn->peer && (!conn->handshake_done || conn->sock < 0)) {
 			if (conn->incoming_only) {
 				conn->evicted = true;
 				break;
