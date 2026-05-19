@@ -142,6 +142,38 @@ static ssize_t write_exact(int sock, const void *buf, size_t len)
 	return (ssize_t)len;
 }
 
+/* Parse the addr_from field from a VERSION message payload (BIP 155 style).
+ * Returns true if a valid IPv4 listening address/port was extracted. */
+static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
+                                    char *host_out, int *port_out)
+{
+	if (plen < 72)          /* version(4) + services(8) + time(8) + addr_recv(26) + addr_from(26) */
+		return false;
+
+	/* addr_from starts at byte 46 in the VERSION payload */
+	const uchar *addr_from = payload + 46;
+
+	/* Skip services (8 bytes) inside net_addr */
+	const uchar *ip = addr_from + 8;
+
+	/* Port is big-endian at offset 16 of the net_addr (after services) */
+	uint16_t port_be;
+	memcpy(&port_be, ip + 16, 2);
+	*port_out = ntohs(port_be);
+
+	/* IPv4-mapped address (::ffff:0.0.0.0/96) is the common case */
+	static const uchar v4mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+	if (memcmp(ip, v4mapped, 12) == 0) {
+		struct in_addr ipv4;
+		memcpy(&ipv4.s_addr, ip + 12, 4);
+		inet_ntop(AF_INET, &ipv4, host_out, INET_ADDRSTRLEN);
+		return (*port_out > 0 && *port_out <= 65535);
+	}
+
+	/* IPv6 not supported by ckp2p yet */
+	return false;
+}
+
 static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, uint32_t plen)
 {
 	uchar hdr[24];
@@ -292,8 +324,7 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 }
 
 /* Send self-advertisement via addrv2 (BIP155) so other nodes can discover us.
- * Uses getsockname() on the live socket to automatically get our public IPv4 address.
- * Always advertises the correct listening port (CKP2P_LISTEN_PORT). */
+ * Uses getsockname() on the live socket to automatically get our public IPv4 address. */
 static void send_self_addrv2(p2p_conn_t *conn)
 {
 	struct sockaddr_in local;
@@ -305,7 +336,7 @@ static void send_self_addrv2(p2p_conn_t *conn)
 	}
 
 	/* Build addrv2 payload with exactly 1 address (our own) */
-	uchar payload[64]; /* plenty of room */
+	uchar payload[64];
 	uint32_t pos = 0;
 
 	/* count = 1 (varint) */
@@ -656,6 +687,22 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 		LOGINFO("Received %s (%u bytes)", cmd, plen);
 		if (!strcmp(cmd, "version")) {
 			LOGINFO("Received VERSION from incoming peer");
+
+			/* Try to extract the peer's real listening address/port from addr_from */
+			char adv_host[INET_ADDRSTRLEN] = {0};
+			int adv_port = 0;
+			if (parse_version_addr_from(payload, plen, adv_host, &adv_port)) {
+				LOGNOTICE("Peer %d advertised listening address %s:%d - updating reconnection info",
+					  conn->peer, adv_host, adv_port);
+				strncpy(conn->host, adv_host, sizeof(conn->host) - 1);
+				snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
+				conn->port = adv_port;
+			} else {
+				LOGWARNING("Could not parse listening address from VERSION for peer %d - will evict on disconnect",
+					   conn->peer);
+				conn->evicted = true;   /* prevent reconnection to ephemeral port */
+			}
+
 			if (payload) dealloc(payload);
 			break;
 		}
