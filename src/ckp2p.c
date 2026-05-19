@@ -49,6 +49,9 @@ static struct current_block {
 	cklock_t lock;
 } curblock;
 
+uint32_t externalip;
+int externalport;
+
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
 {
@@ -331,8 +334,6 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 }
-
-uint32_t externalip;
 
 /* Send self-advertisement via addrv2 (BIP155) so other nodes can discover us.
  * Uses getsockname() on the live socket to automatically get our public IPv4 address. */
@@ -1134,21 +1135,21 @@ static int create_p2p_listener(void)
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
 	sin.sin_addr.s_addr = INADDR_ANY;
-	sin.sin_port = htons(CKP2P_LISTEN_PORT);
+	sin.sin_port = htons(externalport);
 
 	if (bind(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-		LOGEMERG("Failed to bind ckp2p listener port %d: %s", CKP2P_LISTEN_PORT, strerror(errno));
+		LOGEMERG("Failed to bind ckp2p listener port %d: %s", externalport, strerror(errno));
 		close(sock);
 		return -1;
 	}
 
 	if (listen(sock, 32) < 0) {
-		LOGEMERG("Failed to listen on ckp2p port %d: %s", CKP2P_LISTEN_PORT, strerror(errno));
+		LOGEMERG("Failed to listen on ckp2p port %d: %s", externalport, strerror(errno));
 		close(sock);
 		return -1;
 	}
 
-	LOGNOTICE("ckp2p listening on 0.0.0.0:%d for incoming P2P connections", CKP2P_LISTEN_PORT);
+	LOGNOTICE("ckp2p listening on 0.0.0.0:%d for incoming P2P connections", externalport);
 	return sock;
 }
 
@@ -1271,6 +1272,9 @@ int prepare_ckp2p(ckpool_t *ckp)
 			return -1;
 		}
 		ip = inet_addr(cslocal.url);
+		sscanf(cslocal.port, "%d", &externalport);
+		if (!externalport)
+			externalport = CKP2P_LISTEN_PORT;
 		free(cslocal.url);
 		free(cslocal.port);
 		if (ip < 0) {
@@ -1299,7 +1303,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 
 	/* Start listener thread for incoming ckp2p connections on port 8335 */
 	create_pthread(&accept_thread, p2p_acceptor, ckp);
-	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", CKP2P_LISTEN_PORT);
+	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
 
 	return 0;
 }
