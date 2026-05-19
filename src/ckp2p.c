@@ -49,8 +49,10 @@ static struct current_block {
 	cklock_t lock;
 } curblock;
 
-uint32_t externalip;
-int externalport;
+static uint32_t externalip;
+static int externalport;
+static int total_conns;
+static int active_conns;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -805,6 +807,7 @@ static void *p2p_reader(void *arg)
 {
 	p2pendpoint_t *p2pe = arg;
 	p2p_conn_t *conn = p2pe->conn;
+	bool active = false;
 	char cmd[13];
 	uchar *payload;
 	uint32_t plen;
@@ -831,6 +834,11 @@ static void *p2p_reader(void *arg)
 				}
 			}
 			if (conn->sock < 0) {
+				if (active) {
+					active = false;
+					active_conns--;
+				}
+
 				if (conn->reconnect < 300)
 					conn->reconnect *= 2;
 				sleep(conn->reconnect);
@@ -845,6 +853,10 @@ static void *p2p_reader(void *arg)
 				conn->reconnect *= 2;
 			sleep(conn->reconnect);
 			continue;
+		}
+		if (!active) {
+			active = true;
+			active_conns++;
 		}
 
 		conn->reconnect = 5;
@@ -915,6 +927,9 @@ static void *p2p_reader(void *arg)
 
 		if (payload) dealloc(payload);
 	}
+
+	if (active)
+		active_conns--;
 	return NULL;
 }
 
@@ -926,10 +941,15 @@ static void *p2p_keepalive(void *arg)
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pk");
+	total_conns++;
 
 	while (42) {
 		uint64_t nonce, nonce_le;
-
+#ifdef CKP2P
+		printf("Peers:%d, Connections:%d, Active:%d            \r", conn->ckp->p2purls,
+		       total_conns, active_conns);
+		fflush(NULL);
+#endif
 		sleep(KEEPALIVE_INTERVAL);
 		tv_time(&now);
 		if (!conn->handshake_done || conn->sock < 0) {
@@ -950,6 +970,8 @@ static void *p2p_keepalive(void *arg)
 		nonce_le = htole64(nonce);
 		p2p_send(conn, "ping", (uchar *)&nonce_le, 8);
 	}
+
+	total_conns--;
 	return NULL;
 }
 
