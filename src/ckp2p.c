@@ -53,6 +53,7 @@ static uint32_t externalip;
 static int externalport;
 static int total_conns;
 static int active_conns;
+static bool finished_init = false;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -935,10 +936,39 @@ static void *p2p_reader(void *arg)
 	return NULL;
 }
 
+/* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
+static void dump_peers(ckpool_t *ckp)
+{
+	int count = 0, i;
+	FILE *fp;
+
+	fp = fopen("peers.conf", "we");
+	if (unlikely(!fp)) {
+		LOGERR("Unable to fopen peers.conf in dump_peers");
+		return;
+	}
+	fprintf(fp, "{\n\"p2purl\" : [");
+
+	for (i = 0; i < ckp->p2purls; i++) {
+		p2p_conn_t *conn = ckp->p2pconn[i];
+
+		if (!conn)
+			continue;
+		if (conn->evicted)
+			continue;
+		if (conn->incoming_only)
+			continue;
+		fprintf(fp, "%s\n\t\"%s:%d\"", count++ ? "," : "", conn->host, conn->port);
+	}
+	fprintf(fp, "\n]\n}\n");
+	fclose(fp);
+	LOGINFO("Stored %d peers in peers.conf", count);
+}
+
 static void *p2p_keepalive(void *arg)
 {
-	p2pendpoint_t *p2pe = arg;
-	p2p_conn_t *conn = p2pe->conn;
+	p2p_conn_t *conn = arg;
+	ckpool_t *ckp = conn->ckp;
 	tv_t now;
 
 	pthread_detach(pthread_self());
@@ -948,11 +978,13 @@ static void *p2p_keepalive(void *arg)
 	while (42) {
 		uint64_t nonce, nonce_le;
 #ifdef CKP2P
-		printf("Peers:%d, Connections:%d, Active:%d            \r", conn->ckp->p2purls,
+		printf("Peers:%d, Connections:%d, Active:%d            \r", ckp->p2purls,
 		       total_conns, active_conns);
 		fflush(NULL);
 #endif
 		sleep(KEEPALIVE_INTERVAL);
+		if (!conn->peer && finished_init)
+			dump_peers(ckp);
 		tv_time(&now);
 		if (conn->peer && (!conn->handshake_done || conn->sock < 0)) {
 			if (conn->incoming_only) {
@@ -1133,7 +1165,7 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 
 	create_pthread(&p2pe->reader_thread, p2p_reader, p2pe);
 
-	create_pthread(&p2pe->keepalive_thread, p2p_keepalive, p2pe);
+	create_pthread(&p2pe->keepalive_thread, p2p_keepalive, conn);
 
 	return conn;
 }
@@ -1326,6 +1358,8 @@ int prepare_ckp2p(ckpool_t *ckp)
 	/* Start listener thread for incoming ckp2p connections on port 8335 */
 	create_pthread(&accept_thread, p2p_acceptor, ckp);
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
+
+	finished_init = true;
 
 	return 0;
 }
