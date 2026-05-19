@@ -675,6 +675,26 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	return true;
 }
 
+static bool dup_peer(ckpool_t *ckp, const char *host, const char *charport)
+{
+	bool ret = false;
+	int i;
+
+	for (i = 0; i < ckp->p2purls; i++) {
+		p2p_conn_t *conn = ckp->p2pconn[i];
+
+		if (!conn)
+			continue;
+		if (conn->evicted)
+			continue;
+		if (!strcmp(conn->host, host) && !strcmp(conn->charport, charport)) {
+			ret = true;
+			break;
+		}
+	}
+	return ret;
+}
+
 /* Server-side handshake for incoming connections (peer sends VERSION first) */
 static bool do_incoming_handshake(p2p_conn_t *conn)
 {
@@ -695,14 +715,19 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 			char adv_host[INET_ADDRSTRLEN] = {0};
 			int adv_port = 8333; /* Try 8333 if we don't get it */
 			if (parse_version_addr_from(payload, plen, adv_host, &adv_port)) {
-				LOGNOTICE("Peer %d advertised listening address %s:%d - updating reconnection info",
-					  conn->peer, adv_host, adv_port);
+				LOGNOTICE("Peer advertised listening address %s:%d - updating reconnection info",
+					  adv_host, adv_port);
 				strncpy(conn->host, adv_host, sizeof(conn->host) - 1);
 				snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
 			}
 			conn->port = adv_port;
+			if (dup_peer(conn->ckp, conn->host, conn->charport)) {
+				LOGNOTICE("Duplicate incoming peer %s:%s, will not reconnect if dropped", conn->host, conn->charport);
+				conn->incoming_only = true;
+			}
 
-			if (payload) dealloc(payload);
+			if (payload)
+				dealloc(payload);
 			break;
 		}
 		if (payload)
@@ -783,6 +808,11 @@ static void *p2p_reader(void *arg)
 			break;
 
 		if (conn->sock < 0) {
+			if (conn->incoming_only) {
+				conn->evicted = true;
+				break;
+			}
+
 			if (p2p_connect_socket(conn)) {
 				if (!do_handshake(conn, conn->port)) {
 					close(conn->sock);
@@ -892,6 +922,10 @@ static void *p2p_keepalive(void *arg)
 		sleep(KEEPALIVE_INTERVAL);
 		tv_time(&now);
 		if (!conn->handshake_done || conn->sock < 0) {
+			if (conn->incoming_only) {
+				conn->evicted = true;
+				break;
+			}
 			if (tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
 				LOGWARNING("Dropping peer %d unresponsive for %d seconds",
 					   conn->peer, EVICT_TIMEOUT);
@@ -1017,6 +1051,7 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	bool success = true;
 	int port, i;
 
+	conn->ckp = ckp;
 	cklock_init(&conn->block_lock);
 	conn->peer = source;
 	conn->cmpct_payload = NULL;
@@ -1140,6 +1175,7 @@ static void *p2p_acceptor(void *arg)
 		LOGNOTICE("Incoming ckp2p connection from %s:%d", host, port_num);
 
 		p2p_conn_t *conn = ckzalloc(sizeof(*conn));
+		conn->ckp = ckp;
 		cklock_init(&conn->block_lock);
 		conn->sock = newsock;
 		strncpy(conn->host, host, sizeof(conn->host) - 1);

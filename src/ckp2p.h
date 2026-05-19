@@ -8,6 +8,7 @@
  */
 
 typedef struct {
+	ckpool_t *ckp;
 	int sock;
 	uchar magic[4];
 	uchar genesis[32];
@@ -27,6 +28,7 @@ typedef struct {
 	int peer;
 	tv_t last_alive;
 	bool evicted;
+	bool incoming_only;
 } p2p_conn_t;
 
 int prepare_ckp2p(ckpool_t *ckp);
