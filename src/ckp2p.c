@@ -28,6 +28,7 @@
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
 #define EVICT_TIMEOUT 3600
+#define P2P_LISTEN_PORT 8333
 #define CKP2P_LISTEN_PORT 8335
 
 static const struct {
@@ -686,7 +687,7 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	return true;
 }
 
-static bool dup_peer(ckpool_t *ckp, const char *host, const char *charport)
+static bool dup_peer(ckpool_t *ckp, const char *host, int port)
 {
 	bool ret = false;
 	int i;
@@ -698,7 +699,7 @@ static bool dup_peer(ckpool_t *ckp, const char *host, const char *charport)
 			continue;
 		if (conn->evicted)
 			continue;
-		if (!strcmp(conn->host, host) && !strcmp(conn->charport, charport)) {
+		if (!strcmp(conn->host, host) && (conn->port == port)) {
 			ret = true;
 			break;
 		}
@@ -724,15 +725,18 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 
 			/* Try to extract the peer's real listening address/port from addr_from */
 			char adv_host[INET_ADDRSTRLEN] = {0};
-			int adv_port = 8333; /* Try 8333 if we don't get it */
+			int adv_port = 0;
+
 			if (parse_version_addr_from(payload, plen, adv_host, &adv_port)) {
 				LOGNOTICE("Peer advertised listening address %s:%d - updating reconnection info",
 					  adv_host, adv_port);
 				strncpy(conn->host, adv_host, sizeof(conn->host) - 1);
 				snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
 			}
+			if (!adv_port)
+				adv_port = P2P_LISTEN_PORT; /* Set to default if we don't get it */
 			conn->port = adv_port;
-			if (dup_peer(conn->ckp, conn->host, conn->charport)) {
+			if (dup_peer(conn->ckp, conn->host, conn->port)) {
 				LOGNOTICE("Duplicate incoming peer %s:%s, will not reconnect if dropped", conn->host, conn->charport);
 				conn->incoming_only = true;
 			}
