@@ -2,6 +2,7 @@ SUBDIRS	= jansson-2.14
 
 ACLOCAL_AMFLAGS = -I m4
 AM_CPPFLAGS =  -I$(top_srcdir)/src/jansson-2.14/src
+AM_CPPFLAGS += -D_GNU_SOURCE
 
 native_objs :=
 
