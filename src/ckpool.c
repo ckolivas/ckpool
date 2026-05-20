@@ -1928,6 +1928,10 @@ int main(int argc, char **argv)
 	open_process_sock(&ckp, &ckp.main, &ckp.main.us);
 
 	ret = sysconf(_SC_OPEN_MAX);
+#if CKP2P
+	if (!ckp.maxclients)
+		ckp.maxclients = 2048;
+#endif
 	if (ckp.maxclients > ret * 9 / 10) {
 		LOGWARNING("Cannot set maxclients to %d due to max open file limit of %d, reducing to %d",
 			   ckp.maxclients, ret, ret * 9 / 10);

@@ -871,7 +871,7 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	if (!finished_init)
 		return;
 
-	if (total_conns > ckp->maxclients / 2) {
+	if (total_conns > ckp->maxclients) {
 		LOGDEBUG("Half max client limit reached, not adding more p2p clients");
 		return;
 	}
@@ -1503,6 +1503,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 	} else
 		externalport = CKP2P_LISTEN_PORT;
 
+	if (ckp->p2purls > ckp->maxclients) {
+		LOGWARNING("Limiting peers to %d", ckp->p2purls);
+		ckp->p2purls = ckp->maxclients;
+	}
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
 	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
 	for (i = 0 ; i < ckp->p2purls ; i++) {
