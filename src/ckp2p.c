@@ -429,7 +429,6 @@ static void evict_peer(ckpool_t *ckp, int peer)
 {
 	p2p_conn_t *conn = ckp->p2pconn[peer];
 
-	LOGWARNING("Evicting peer %d", peer);
 	conn->evicted = true;
 	disconnect_conn(conn);
 }
@@ -584,12 +583,11 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	}
 	uchar header[80];
 	memcpy(header, payload, 80);
-
 	memcpy(&block_bits, header + 72, 4);
+	block_bits = le32toh(block_bits);
+
 	/* We only trust source peer 0 to get the current network diff */
 	if (!source) {
-		block_bits = le32toh(block_bits);
-
 		if (block_bits != current_bits) {
 			LOGWARNING("Current bits set to %u", block_bits);
 
@@ -675,7 +673,7 @@ static void handle_headers(int peer, uchar *payload, uint32_t plen)
 	current_bits = received_bits;
 	ck_wunlock(&curblock.lock);
 
-	LOGWARNING("current_bits set to %u", received_bits);
+	LOGWARNING("current_bits set to 0x%08x", received_bits);
 
 	display_newblock(blockhash);
 
