@@ -1930,7 +1930,7 @@ int main(int argc, char **argv)
 	ret = sysconf(_SC_OPEN_MAX);
 #if CKP2P
 	if (!ckp.maxclients)
-		ckp.maxclients = 2048;
+		ckp.maxclients = 1024;
 #endif
 	if (ckp.maxclients > ret * 9 / 10) {
 		LOGWARNING("Cannot set maxclients to %d due to max open file limit of %d, reducing to %d",

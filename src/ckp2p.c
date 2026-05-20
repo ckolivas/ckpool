@@ -56,6 +56,7 @@ static int total_conns;
 static int active_conns;
 static bool finished_init = false;
 static cklock_t peerlock;
+static uint32_t current_bits = 0x1d00ffff;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -424,6 +425,15 @@ static void disconnect_conn(p2p_conn_t *conn)
 	conn->handshake_done = false;
 }
 
+static void evict_peer(ckpool_t *ckp, int peer)
+{
+	p2p_conn_t *conn = ckp->p2pconn[peer];
+
+	LOGWARNING("Evicting peer %d", peer);
+	conn->evicted = true;
+	disconnect_conn(conn);
+}
+
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -529,11 +539,44 @@ static void display_newblock(uchar *blockhash)
 	LOGWARNING("New block hash detected: %s", showhash);
 }
 
+/* Standard Bitcoin target-from-bits conversion (used by libckpool internally) */
+static void target_from_bits(uchar *target, uint32_t bits)
+{
+	int nsize = (bits >> 24) & 0xff;
+	uint32_t mant = bits & 0x007fffff;
+
+	memset(target, 0, 32);
+
+	if (nsize <= 3) {
+		mant >>= 8 * (3 - nsize);
+		target[31 - nsize] = mant & 0xff;
+	} else {
+		target[32 - nsize] = (mant >> 16) & 0xff;
+		target[33 - nsize] = (mant >> 8) & 0xff;
+		target[34 - nsize] = mant & 0xff;
+	}
+}
+
+/* Returns true if block hash meets the target (little-endian comparison) */
+static bool hash_meets_target(const uchar *hash, uint32_t bits)
+{
+	uchar target[32];
+	target_from_bits(target, bits);
+
+	/* Compare hash (little-endian) <= target (little-endian) */
+	for (int i = 31; i >= 0; i--) {
+		if (hash[i] < target[i]) return true;
+		if (hash[i] > target[i]) return false;
+	}
+	return true;   /* exact match is valid */
+}
+
 /* Function for testing cmpctblock validity by echoing back any received */
 static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int source)
 {
 	uint64_t shortid_nonce_le, shortid_nonce;
 	bool new_block = false;
+	uint32_t block_bits;
 
 	if (plen < 88) {
 		dealloc(payload);
@@ -541,9 +584,33 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	}
 	uchar header[80];
 	memcpy(header, payload, 80);
+
+	memcpy(&block_bits, header + 72, 4);
+	/* We only trust source peer 0 to get the current network diff */
+	if (!source) {
+		block_bits = le32toh(block_bits);
+
+		if (block_bits != current_bits) {
+			LOGWARNING("Current bits set to %u", block_bits);
+
+			ck_wlock(&curblock.lock);
+			current_bits = block_bits;
+			ck_wunlock(&curblock.lock);
+		}
+	}
+
 	uchar h1[32], blockhash[32];
 	sha256(header, 80, h1);
 	sha256(h1, 32, blockhash);
+
+	if (!hash_meets_target(blockhash, block_bits)) {
+		LOGWARNING("Compact block from peer %d does not meet current difficulty target - dropping",
+			   source);
+		dealloc(payload);
+		evict_peer(ckp, source);
+		return;
+	}
+
 	memcpy(&shortid_nonce_le, payload + 80, 8);
 	shortid_nonce = le64toh(shortid_nonce_le);
 
@@ -561,7 +628,7 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	/* payload is stolen and released by relay_compact_block */
 }
 
-static void handle_headers(uchar *payload, uint32_t plen)
+static void handle_headers(int peer, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0, header_offset;
 	uchar blank[32] = {};
@@ -569,7 +636,7 @@ static void handle_headers(uchar *payload, uint32_t plen)
 	bool first_block = false;
 
 	ck_rlock(&curblock.lock);
-	if (unlikely(!memcmp(curblock.hash, blank, 32)))
+	if (unlikely(!peer && !memcmp(curblock.hash, blank, 32)))
 		first_block = true;
 	ck_runlock(&curblock.lock);
 
@@ -584,7 +651,7 @@ static void handle_headers(uchar *payload, uint32_t plen)
 	header_offset = (uint32_t)pos;
 	for (i = 1; i < count; i++) {   /* skip all but the last */
 		header_offset += 80;                /* header */
-		 txcount = parse_varint(payload, plen, &header_offset);
+		txcount = parse_varint(payload, plen, &header_offset);
 		if (txcount < 0)
 			break;
 	}
@@ -599,9 +666,16 @@ static void handle_headers(uchar *payload, uint32_t plen)
 	sha256(header, 80, h1);
 	sha256(h1, 32, blockhash);
 
+	uint32_t received_bits;
+	memcpy(&received_bits, header + 72, 4);
+	received_bits = le32toh(received_bits);
+
+	/* Update global current difficulty */
 	ck_wlock(&curblock.lock);
-	memcpy(curblock.hash, blockhash, 32);
+	current_bits = received_bits;
 	ck_wunlock(&curblock.lock);
+
+	LOGWARNING("current_bits set to %u", received_bits);
 
 	display_newblock(blockhash);
 
@@ -888,6 +962,7 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	memcpy(conn->magic, netdefs[0].magic, 4);
 	memcpy(conn->genesis, netdefs[0].genesis, 32);
 	conn->netname = netdefs[0].name;
+	conn->peer = -1;
 
 	tv_time(&conn->last_alive);
 
@@ -1057,7 +1132,7 @@ static void *p2p_reader(void *arg)
 			continue;
 		} else if (!strcmp(cmd, "headers")) {
 			LOGINFO("Received HEADERS (%u bytes) - parsing tip if necessary", plen);
-			handle_headers(payload, plen);
+			handle_headers(conn->peer, payload, plen);
 			continue;   /* handler already deallocates */
 		} else if (!strcmp(cmd, "cmpctblock")) {
 			LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
@@ -1423,6 +1498,7 @@ static void *p2p_acceptor(void *arg)
 		conn->reconnect = 5;
 		conn->handshake_done = false;
 		conn->evicted = false;
+		conn->peer = -1;
 
 		if (!do_incoming_handshake(conn)) {
 			LOGINFO("Incoming handshake failed from %s:%d", host, port_num);
