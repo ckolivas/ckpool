@@ -55,6 +55,7 @@ static int externalport;
 static int total_conns;
 static int active_conns;
 static bool finished_init = false;
+static cklock_t peerlock;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -692,6 +693,7 @@ static bool dup_peer(ckpool_t *ckp, const char *host, int port)
 	bool ret = false;
 	int i;
 
+	ck_rlock(&peerlock);
 	for (i = 0; i < ckp->p2purls; i++) {
 		p2p_conn_t *conn = ckp->p2pconn[i];
 
@@ -704,6 +706,8 @@ static bool dup_peer(ckpool_t *ckp, const char *host, int port)
 			break;
 		}
 	}
+	ck_runlock(&peerlock);
+
 	return ret;
 }
 
@@ -815,6 +819,7 @@ static void *add_peer(void *arg)
 		goto out;
 	}
 
+	ck_wlock(&peerlock);
 	/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
 	int old = ckp->p2purls;
 
@@ -846,6 +851,7 @@ static void *add_peer(void *arg)
 
 	conn->peer = old;
 	ckp->p2purls = old + 1;
+	ck_wunlock(&peerlock);
 
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
 
@@ -1110,6 +1116,7 @@ static void dump_peers(ckpool_t *ckp)
 	}
 	fprintf(fp, "{\n\"p2purl\" : [");
 
+	ck_rlock(&peerlock);
 	for (i = 0; i < ckp->p2purls; i++) {
 		p2p_conn_t *conn = ckp->p2pconn[i];
 		struct in6_addr addr;
@@ -1127,6 +1134,8 @@ static void dump_peers(ckpool_t *ckp)
 		else
 			fprintf(fp, "%s\n\t\"%s:%d\"", count++ ? "," : "", conn->host, conn->port);
 	}
+	ck_runlock(&peerlock);
+
 	fprintf(fp, "\n]\n}\n");
 	fclose(fp);
 	LOGINFO("Stored %d peers in peers.conf", count);
@@ -1193,10 +1202,15 @@ static void *submission_thread(void *arg)
 	compact_block_t *cbt = arg;
 	int i, submitted = 0;
 	char fliphash[32], hex[68];
+	int p2purls;
 
 	pthread_detach(pthread_self());
 
-	for (i = 0; i < cbt->ckp->p2purls; i++) {
+	ck_rlock(&peerlock);
+	p2purls = cbt->ckp->p2purls;
+	ck_runlock(&peerlock);
+
+	for (i = 0; i < p2purls; i++) {
 		p2p_conn_t *conn;
 
 		if (i == cbt->source) {
@@ -1426,6 +1440,7 @@ static void *p2p_acceptor(void *arg)
 			continue;
 		}
 
+		ck_wlock(&peerlock);
 		/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
 		int old = ckp->p2purls;
 
@@ -1457,6 +1472,7 @@ static void *p2p_acceptor(void *arg)
 
 		conn->peer = old;
 		ckp->p2purls = old + 1;
+		ck_wunlock(&peerlock);
 
 		LOGWARNING("Added incoming peer %d (%s:%d)", old, host, port_num);
 
@@ -1476,6 +1492,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 	pthread_t accept_thread;
 
 	cklock_init(&curblock.lock);
+	cklock_init(&peerlock);
 
 	if (ckp->externalip) {
 		connsock_t cslocal;
