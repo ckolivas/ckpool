@@ -942,6 +942,7 @@ static void dump_peers(ckpool_t *ckp)
 
 	for (i = 0; i < ckp->p2purls; i++) {
 		p2p_conn_t *conn = ckp->p2pconn[i];
+		struct in6_addr addr;
 
 		if (!conn)
 			continue;
@@ -949,7 +950,12 @@ static void dump_peers(ckpool_t *ckp)
 			continue;
 		if (conn->incoming_only)
 			continue;
-		fprintf(fp, "%s\n\t\"%s:%d\"", count++ ? "," : "", conn->host, conn->port);
+
+		/* check if host is ipv6 */
+		if (inet_pton(AF_INET6, conn->host, &addr) == 1)
+			fprintf(fp, "%s\n\t\"[%s]:%d\"", count++ ? "," : "", conn->host, conn->port);
+		else
+			fprintf(fp, "%s\n\t\"%s:%d\"", count++ ? "," : "", conn->host, conn->port);
 	}
 	fprintf(fp, "\n]\n}\n");
 	fclose(fp);
