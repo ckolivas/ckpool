@@ -871,7 +871,7 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	if (!finished_init)
 		return;
 
-	if (total_conns > ckp->maxclients) {
+	if (total_conns >= ckp->maxclients) {
 		LOGDEBUG("Half max client limit reached, not adding more p2p clients");
 		return;
 	}
@@ -1388,7 +1388,11 @@ static void *p2p_acceptor(void *arg)
 	while (42) {
 		struct sockaddr_in client_addr;
 		socklen_t clen = sizeof(client_addr);
-		int newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
+		int newsock;
+
+		while (total_conns >= ckp->maxclients)
+			sleep(KEEPALIVE_INTERVAL);
+		newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
 		if (newsock < 0) {
 			if (errno != EINTR)
 				LOGDEBUG("accept error: %s", strerror(errno));
