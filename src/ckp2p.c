@@ -731,11 +731,11 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 				LOGNOTICE("Peer advertised listening address %s:%d - updating reconnection info",
 					  adv_host, adv_port);
 				strncpy(conn->host, adv_host, sizeof(conn->host) - 1);
-				snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
 			}
 			if (!adv_port)
 				adv_port = P2P_LISTEN_PORT; /* Set to default if we don't get it */
 			conn->port = adv_port;
+			snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
 			if (dup_peer(conn->ckp, conn->host, conn->port)) {
 				LOGNOTICE("Duplicate incoming peer %s:%s, will not reconnect if dropped", conn->host, conn->charport);
 				conn->incoming_only = true;
