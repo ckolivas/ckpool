@@ -796,9 +796,96 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 	return true;
 }
 
+static void *p2p_reader(void *arg);
+static void *p2p_keepalive(void *arg);
+
+static void *add_peer(void *arg)
+{
+	p2p_conn_t *conn = arg;
+	ckpool_t *ckp = conn->ckp;
+	pthread_t pthread;
+
+	pthread_detach(pthread_self());
+	rename_proc("ckp2pap");
+
+	if (!p2p_connect_socket(conn) || !do_handshake(conn, conn->port)) {
+		LOGINFO("No immediate connection to %s:%d, dropping", conn->host,
+			conn->port);
+		dealloc(conn);
+		goto out;
+	}
+
+	/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
+	int old = ckp->p2purls;
+
+	/* p2purl */
+	char **old_p2purl = ckp->p2purl;
+	ckp->p2purl = ckalloc(sizeof(char *) * (old + 1));
+	if (old > 0)
+		memcpy(ckp->p2purl, old_p2purl, sizeof(char *) * old);
+	char *new_url = ckalloc(strlen(conn->host) + strlen(conn->charport) + 2);
+	sprintf(new_url, "%s:%s", conn->host, conn->charport);
+	ckp->p2purl[old] = new_url;
+	if (old_p2purl) dealloc(old_p2purl);
+
+	/* p2pcs (for API consistency) */
+	connsock_t **old_p2pcs = ckp->p2pcs;
+	ckp->p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
+	if (old > 0)
+		memcpy(ckp->p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
+	ckp->p2pcs[old] = NULL;
+	if (old_p2pcs) dealloc(old_p2pcs);
+
+	/* p2pconn */
+	p2p_conn_t **old_p2pconn = ckp->p2pconn;
+	ckp->p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
+	if (old > 0)
+		memcpy(ckp->p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
+	ckp->p2pconn[old] = conn;
+	if (old_p2pconn) dealloc(old_p2pconn);
+
+	conn->peer = old;
+	ckp->p2purls = old + 1;
+
+	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
+
+	create_pthread(&pthread, p2p_reader, conn);
+	create_pthread(&pthread, p2p_keepalive, conn);
+
+out:
+	return NULL;
+}
+
+static void add_peer_async(ckpool_t *ckp, const char *host, int port)
+{
+	pthread_t pthread;
+	p2p_conn_t *conn;
+
+	LOGINFO("New addrv2: %s:%d", host, port);
+	if (!finished_init)
+		return;
+
+	conn = ckzalloc(sizeof(*conn));
+	conn->ckp = ckp;
+	cklock_init(&conn->block_lock);
+	conn->cmpct_payload = NULL;
+	conn->has_block = false;
+	conn->sock = -1;
+	strncpy(conn->host, host, sizeof(conn->host) - 1);
+	snprintf(conn->charport, sizeof(conn->charport), "%d", port);
+	conn->port = port;
+	memcpy(conn->magic, netdefs[0].magic, 4);
+	memcpy(conn->genesis, netdefs[0].genesis, 32);
+	conn->netname = netdefs[0].name;
+
+	tv_time(&conn->last_alive);
+
+	create_pthread(&pthread, add_peer, conn);
+}
+
 /* Parse an ADDRV2 message and extract/log all host:port pairs.
  * Supports IPv4 (netid=1) and IPv6 (netid=2). */
-static void parse_addrv2(uchar *data, uint32_t dlen)
+static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 {
 	uint32_t pos = 0;
 	int i, count = parse_varint(data, dlen, &pos);
@@ -856,7 +943,10 @@ static void parse_addrv2(uchar *data, uint32_t dlen)
 		if (port == 0)
 			port = 8333;   /* default Bitcoin port if not specified */
 
-		LOGNOTICE("addrv2: %s:%d", host, port);
+		if (!dup_peer(ckp, host, port))
+			add_peer_async(ckp, host, port);
+		else
+			LOGINFO("Dup addrv2: %s:%d", host, port);
 
 	next:
 		continue;
@@ -978,7 +1068,7 @@ static void *p2p_reader(void *arg)
 			LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
 		} else if (!strcmp(cmd, "addrv2")) {
 			LOGINFO("Received ADDRV2 (%u bytes)", plen);
-			parse_addrv2(payload, plen);
+			parse_addrv2(ckp, payload, plen);
 			continue; // Handler deallocates
 		} else if (!strcmp(cmd, "feefilter")) {
 			LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
