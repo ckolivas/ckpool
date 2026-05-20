@@ -796,6 +796,75 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 	return true;
 }
 
+/* Parse an ADDRV2 message and extract/log all host:port pairs.
+ * Supports IPv4 (netid=1) and IPv6 (netid=2). */
+static void parse_addrv2(uchar *data, uint32_t dlen)
+{
+	uint32_t pos = 0;
+	int i, count = parse_varint(data, dlen, &pos);
+
+	if (count < 0 || count > 1000) {   /* sanity limit */
+		LOGINFO("Invalid or oversized addrv2 count (%d)", count);
+		return;
+	}
+
+	if (count == 0) {
+		LOGDEBUG("Received empty addrv2");
+		return;
+	}
+
+	LOGINFO("Received addrv2 with %d address(es)", count);
+
+	for (i = 0; i < count; i++) {
+		if (pos + 4 > dlen) break;               /* timestamp */
+		pos += 4;                                /* skip timestamp (uint32) */
+
+		int64_t services = parse_varint(data, dlen, &pos);
+		if (services < 0) break;
+
+		int64_t netid = parse_varint(data, dlen, &pos);
+		if (netid < 0) break;
+
+		int64_t addrlen = parse_varint(data, dlen, &pos);
+		if (addrlen < 0 || pos + addrlen + 2 > dlen) break;
+
+		char host[INET6_ADDRSTRLEN] = {0};
+		uint16_t port = 0;
+
+		if (netid == 1 && addrlen == 4) {            /* IPv4 */
+			struct in_addr ip;
+			memcpy(&ip.s_addr, data + pos, 4);
+			inet_ntop(AF_INET, &ip, host, sizeof(host));
+			pos += 4;
+		} else if (netid == 2 && addrlen == 16) {    /* IPv6 */
+			struct in6_addr ip6;
+			memcpy(&ip6, data + pos, 16);
+			inet_ntop(AF_INET6, &ip6, host, sizeof(host));
+			pos += 16;
+		} else {
+			/* Unknown network type or Tor/I2P/etc. – skip */
+			pos += addrlen;
+			goto next;
+		}
+
+		/* Port is always big-endian (network order) */
+		uint16_t port_be;
+		memcpy(&port_be, data + pos, 2);
+		port = ntohs(port_be);
+		pos += 2;
+
+		if (port == 0)
+			port = 8333;   /* default Bitcoin port if not specified */
+
+		LOGNOTICE("addrv2: %s:%d", host, port);
+
+	next:
+		continue;
+	}
+
+	dealloc(data);
+}
+
 static void *p2p_reader(void *arg)
 {
 	p2p_conn_t *conn = arg;
@@ -908,7 +977,9 @@ static void *p2p_reader(void *arg)
 		} else if (!strcmp(cmd, "addr")) {
 			LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
 		} else if (!strcmp(cmd, "addrv2")) {
-			LOGDEBUG("Received ADDRV2 (%u bytes) - ignoring (peer addresses v2)", plen);
+			LOGINFO("Received ADDRV2 (%u bytes)", plen);
+			parse_addrv2(payload, plen);
+			continue; // Handler deallocates
 		} else if (!strcmp(cmd, "feefilter")) {
 			LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
 		} else if (!strcmp(cmd, "reject")) {
