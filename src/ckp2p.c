@@ -865,6 +865,11 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	if (!finished_init)
 		return;
 
+	if (total_conns > ckp->maxclients / 2) {
+		LOGDEBUG("Half max client limit reached, not adding more p2p clients");
+		return;
+	}
+
 	conn = ckzalloc(sizeof(*conn));
 	conn->ckp = ckp;
 	cklock_init(&conn->block_lock);
