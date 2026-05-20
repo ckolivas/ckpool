@@ -1292,7 +1292,6 @@ void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_pa
 static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *charport, int source)
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
-	bool success = true;
 	pthread_t thread;
 	int port, i;
 
@@ -1301,6 +1300,7 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	conn->peer = source;
 	conn->cmpct_payload = NULL;
 	conn->has_block = false;
+	conn->handshake_done = false;
 	conn->sock = -1;
 	strncpy(conn->host, host, sizeof(conn->host) - 1);
 	strncpy(conn->charport, charport, sizeof(conn->charport) - 1);
@@ -1325,20 +1325,7 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 		conn->netname = netdefs[0].name;
 	}
 
-	if (!p2p_connect_socket(conn))
-		success = false;
-
-	if (success && !do_handshake(conn, port))
-		success = false;
-
-	if (!success) {
-		LOGWARNING("ckp2p Failed to connect to bitcoin node %d - %s:%s, deferring",
-			   source, host, charport);
-		if (conn->sock >= 0)
-			close(conn->sock);
-		conn->sock = -1;
-	} else
-		LOGWARNING("ckp2p connected to bitcoin node %d - %s:%s", source, host, charport);
+	LOGWARNING("ckp2p set up config peer %d - %s:%s", source, host, charport);
 
 	create_pthread(&thread, p2p_reader, conn);
 
