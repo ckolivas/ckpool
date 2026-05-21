@@ -11,6 +11,7 @@
 #include "sha2.h"
 #include "ckpool.h"
 #include <sys/epoll.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -62,7 +63,7 @@ static uint32_t current_bits = GENESIS_BITS;
 
 static ckmsgq_t* p2p_readers;
 static int reader_epfd;
-struct epoll_event reader_events;
+static struct pollfd fdpoll;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -939,6 +940,8 @@ static void *add_peer(void *arg)
 	conn->peer = old;
 	ckp->p2purls = old + 1;
 	total_conns++;
+	active_conns++;
+	conn->active = true;
 	ck_wunlock(&peerlock);
 
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
@@ -1119,6 +1122,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 	uchar *payload = NULL;
 	uint32_t plen;
 	char cmd[13];
+	int ret;
 
 	if (unlikely(conn->evicted))
 		goto out;
@@ -1139,15 +1143,20 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 			goto out;
 	}
 
+	if (!conn->active) {
+		conn->active = true;
+		active_conns++;
+	}
+
+	fdpoll.fd = conn->sock;
+	ret = poll(&fdpoll, 1, 0);
+	if (!ret) /* Nothing ready to read */
+		goto rearm;
+
 	if (!p2p_recv(conn, cmd, &payload, &plen)) {
 		LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
 		disconnect_conn(conn);
 		goto out;
-	}
-
-	if (!conn->active) {
-		conn->active = true;
-		active_conns++;
 	}
 
 	// Log all received messages with descriptive type, even if ignoring
@@ -1588,6 +1597,8 @@ static void *p2p_acceptor(void *arg)
 		conn->peer = old;
 		ckp->p2purls = old + 1;
 		total_conns++;
+		active_conns++;
+		conn->active = true;
 		ck_wunlock(&peerlock);
 
 		add_conn_epoll(conn);
