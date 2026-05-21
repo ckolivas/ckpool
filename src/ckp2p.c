@@ -63,7 +63,6 @@ static uint32_t current_bits = GENESIS_BITS;
 
 static ckmsgq_t* p2p_readers;
 static int reader_epfd;
-static struct pollfd fdpoll;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -1120,6 +1119,7 @@ static void add_conn_epoll(p2p_conn_t *conn)
 static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 {
 	uchar *payload = NULL;
+	struct pollfd fdpoll = {};
 	uint32_t plen;
 	char cmd[13];
 	int ret;
@@ -1149,6 +1149,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 	}
 
 	fdpoll.fd = conn->sock;
+	fdpoll.events = POLLIN;
 	ret = poll(&fdpoll, 1, 0);
 	if (!ret) /* Nothing ready to read */
 		goto rearm;
