@@ -757,12 +757,12 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	return true;
 }
 
-static bool dup_peer(ckpool_t *ckp, const char *host, int port)
+/* called while holding peerlock */
+static bool _dup_peer(ckpool_t *ckp, const char *host, int port)
 {
 	bool ret = false;
 	int i;
 
-	ck_rlock(&peerlock);
 	for (i = 0; i < ckp->p2purls; i++) {
 		p2p_conn_t *conn = ckp->p2pconn[i];
 
@@ -775,6 +775,16 @@ static bool dup_peer(ckpool_t *ckp, const char *host, int port)
 			break;
 		}
 	}
+
+	return ret;
+}
+
+static bool dup_peer(ckpool_t *ckp, const char *host, int port)
+{
+	bool ret;
+
+	ck_rlock(&peerlock);
+	ret = _dup_peer(ckp, host, port);
 	ck_runlock(&peerlock);
 
 	return ret;
@@ -880,7 +890,7 @@ static void *add_peer(void *arg)
 
 	ck_wlock(&peerlock);
 	/* Do another check for duplicates under lock */
-	if (unlikely(dup_peer(ckp, conn->host, conn->port))) {
+	if (unlikely(_dup_peer(ckp, conn->host, conn->port))) {
 		LOGINFO("Skipping duplicate peer %s:%d", conn->host, conn->port);
 		disconnect_conn(conn);
 		dealloc(conn);
