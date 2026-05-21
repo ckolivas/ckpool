@@ -870,8 +870,6 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 }
 
 static void *p2p_reader(void *arg);
-static void *p2p_keepalive(void *arg);
-
 static void *add_peer(void *arg)
 {
 	p2p_conn_t *conn = arg;
@@ -934,7 +932,6 @@ static void *add_peer(void *arg)
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
 
 	create_pthread(&pthread, p2p_reader, conn);
-	create_pthread(&pthread, p2p_keepalive, conn);
 
 out:
 	return NULL;
@@ -1056,6 +1053,7 @@ static void *p2p_reader(void *arg)
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pr");
+	total_conns++;
 
 	conn->reconnect = 5;
 
@@ -1183,6 +1181,9 @@ static void *p2p_reader(void *arg)
 
 	if (active)
 		active_conns--;
+
+	total_conns--;
+
 	return NULL;
 }
 
@@ -1226,45 +1227,52 @@ static void dump_peers(ckpool_t *ckp)
 
 static void *p2p_keepalive(void *arg)
 {
-	p2p_conn_t *conn = arg;
-	ckpool_t *ckp = conn->ckp;
-	tv_t now;
+	ckpool_t *ckp = arg;
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pk");
-	total_conns++;
 
 	while (42) {
 		uint64_t nonce, nonce_le;
+		int p2purls, i;
+		tv_t now;
+
+		ck_rlock(&peerlock);
+		p2purls = ckp->p2purls;
+		ck_runlock(&peerlock);
 #ifdef CKP2P
-		printf("Peers:%d, Connections:%d, Active:%d            \r", ckp->p2purls,
+		printf("Peers:%d, Connections:%d, Active:%d            \r", p2purls,
 		       total_conns, active_conns);
 		fflush(NULL);
 #endif
 		sleep(KEEPALIVE_INTERVAL);
-		if (!conn->peer && finished_init)
-			dump_peers(ckp);
 		tv_time(&now);
-		if (conn->peer && (!conn->handshake_done || conn->sock < 0)) {
-			if (conn->incoming_only) {
-				conn->evicted = true;
-				break;
-			}
-			if (tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
-				LOGWARNING("Dropping peer %d unresponsive for %d seconds",
-					   conn->peer, EVICT_TIMEOUT);
-				conn->evicted = true;
-				break;
-			}
-			continue;
-		}
 
-		nonce = ((uint64_t)rand() << 32) | rand();
-		nonce_le = htole64(nonce);
-		p2p_send(conn, "ping", (uchar *)&nonce_le, 8);
+		for (i = 0; i < p2purls ; i++) {
+			p2p_conn_t *conn = ckp->p2pconn[i];
+
+			if (!conn->peer && finished_init)
+				dump_peers(ckp);
+			if (conn->peer && (!conn->handshake_done || conn->sock < 0)) {
+				if (conn->incoming_only) {
+					conn->evicted = true;
+					continue;
+				}
+				if (tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
+					LOGWARNING("Dropping peer %d unresponsive for %d seconds",
+						   conn->peer, EVICT_TIMEOUT);
+					conn->evicted = true;
+					continue;
+				}
+				continue;
+			}
+
+			nonce = ((uint64_t)rand() << 32) | rand();
+			nonce_le = htole64(nonce);
+			p2p_send(conn, "ping", (uchar *)&nonce_le, 8);
+		}
 	}
 
-	total_conns--;
 	return NULL;
 }
 
@@ -1412,8 +1420,6 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 
 	create_pthread(&thread, p2p_reader, conn);
 
-	create_pthread(&thread, p2p_keepalive, conn);
-
 	return conn;
 }
 
@@ -1553,7 +1559,6 @@ static void *p2p_acceptor(void *arg)
 
 		/* Spawn exactly the same reader + keepalive threads as outgoing peers */
 		create_pthread(&pthread, p2p_reader, conn);
-		create_pthread(&pthread, p2p_keepalive, conn);
 	}
 
 	close(listen_sock);
@@ -1564,7 +1569,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 {
 	connsock_t *cs;
 	int i;
-	pthread_t accept_thread;
+	pthread_t pthread;
 
 	cklock_init(&curblock.lock);
 	cklock_init(&peerlock);
@@ -1613,8 +1618,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
 	/* Start listener thread for incoming ckp2p connections on port 8335 */
-	create_pthread(&accept_thread, p2p_acceptor, ckp);
+	create_pthread(&pthread, p2p_acceptor, ckp);
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
+
+	create_pthread(&pthread, p2p_keepalive, ckp);
 
 	finished_init = true;
 
