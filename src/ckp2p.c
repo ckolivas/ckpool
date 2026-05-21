@@ -10,6 +10,7 @@
 #include "libckpool.h"
 #include "sha2.h"
 #include "ckpool.h"
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -58,6 +59,10 @@ static bool finished_init = false;
 static cklock_t peerlock;
 #define GENESIS_BITS 0x1d00ffff
 static uint32_t current_bits = GENESIS_BITS;
+
+static ckmsgq_t* p2p_readers;
+static int reader_epfd;
+struct epoll_event reader_events;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -869,12 +874,10 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 	return true;
 }
 
-static void *p2p_reader(void *arg);
 static void *add_peer(void *arg)
 {
 	p2p_conn_t *conn = arg;
 	ckpool_t *ckp = conn->ckp;
-	pthread_t pthread;
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pap");
@@ -930,8 +933,6 @@ static void *add_peer(void *arg)
 	ck_wunlock(&peerlock);
 
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
-
-	create_pthread(&pthread, p2p_reader, conn);
 
 out:
 	return NULL;
@@ -1042,149 +1043,178 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 	dealloc(data);
 }
 
-static void *p2p_reader(void *arg)
+static void *p2p_receiver(void *arg)
 {
-	p2p_conn_t *conn = arg;
-	ckpool_t *ckp = conn->ckp;
-	bool active = false;
-	char cmd[13];
-	uchar *payload;
-	uint32_t plen;
+	ckpool_t *ckp = arg;
+	struct epoll_event event = {};
 
+	rename_proc("p2preceiver");
 	pthread_detach(pthread_self());
-	rename_proc("ckp2pr");
-	total_conns++;
-
-	conn->reconnect = 5;
 
 	while (42) {
-		if (unlikely(conn->evicted))
-			break;
+		int ret;
 
-		if (conn->sock < 0) {
-			if (conn->incoming_only) {
-				conn->evicted = true;
-				break;
-			}
+		ret = epoll_wait(reader_epfd, &event, 1, 1000);
 
-			if (p2p_connect_socket(conn)) {
-				if (!do_handshake(conn, conn->port)) {
-					close(conn->sock);
-					conn->sock = -1;
-				}
-			}
-			if (conn->sock < 0) {
-				if (active) {
-					active = false;
-					active_conns--;
-				}
-
-				if (conn->reconnect < 300)
-					conn->reconnect *= 2;
-				sleep(conn->reconnect);
-				continue;
-			}
-		}
-
-		if (!p2p_recv(conn, cmd, &payload, &plen)) {
-			LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
-			disconnect_conn(conn);
-
-			if (active) {
-				active = false;
-				active_conns--;
-			}
-			if (conn->reconnect < 300)
-				conn->reconnect *= 2;
-			sleep(conn->reconnect);
+		if (unlikely(ret < 0)) {
+			if (errno != EINTR)
+				LOGERR("epoll_wait failed: %s", strerror(errno));
 			continue;
 		}
-		if (!active) {
-			active = true;
-			active_conns++;
+		if (ret == 0)   /* timeout */
+			continue;
+
+		uint64_t idx = event.data.u64;
+		int fd = event.data.fd;
+
+		ck_rlock(&peerlock);
+		int p2purls = ckp->p2purls;
+		ck_runlock(&peerlock);
+
+		epoll_ctl(reader_epfd, EPOLL_CTL_DEL, fd, NULL);
+		if (unlikely(idx >= (uint64_t)p2purls)) {
+			LOGERR("invalid peer index %"PRId64, idx);
+			continue;
 		}
 
-		conn->reconnect = 5;
+		p2p_conn_t *conn = ckp->p2pconn[idx];
+		if (unlikely(!conn || conn->evicted))
+			continue;
 
-		// Log all received messages with descriptive type, even if ignoring
-		if (!strcmp(cmd, "version")) {
-			LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
-		} else if (!strcmp(cmd, "verack")) {
-			LOGINFO("Received VERACK (%u bytes) - handling for handshake", plen);
-		} else if (!strcmp(cmd, "ping")) {
-			LOGINFO("Received PING (%u bytes) - replying with PONG", plen);
-			handle_ping(conn, payload, plen);
-			continue; // Skip dealloc since handler does it
-		} else if (!strcmp(cmd, "pong")) {
-			LOGDEBUG("Received PONG (%u bytes) - ignoring (keep-alive response)", plen);
-		} else if (!strcmp(cmd, "sendcmpct")) {
-			LOGINFO("Received SENDCMPCT (%u bytes) - handling compact block negotiation", plen);
-			handle_sendcmpct(conn, payload, plen);
-			continue; // Skip dealloc since handler does it
-		} else if (!strcmp(cmd, "getdata")) {
-			LOGINFO("Received GETDATA (%u bytes) - handling (request for compact block or tx)", plen);
-			handle_getdata(conn, payload, plen);
-			continue; // Skip dealloc since handler does it
-		} else if (!strcmp(cmd, "getblocktxn")) {
-			LOGINFO("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
-			handle_getblocktxn(conn, payload, plen);
-			continue; // Skip dealloc since handler does it
-		} else if (!strcmp(cmd, "inv")) {
-			handle_inv(conn, payload, plen);
-			continue;
-		} else if (!strcmp(cmd, "headers")) {
-#if 0
-			LOGINFO("Received HEADERS (%u bytes) - parsing tip if necessary", plen);
-			handle_headers(conn->peer, payload, plen);
-			continue;   /* handler already deallocates */
-#else
-			LOGINFO("Received HEADERS (%u bytes) - ignoring", plen);
-#endif
-		} else if (!strcmp(cmd, "cmpctblock")) {
-			LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
-			handle_cmpctblock(ckp, payload, plen, conn->peer);
-			continue;
-		} else if (!strcmp(cmd, "tx")) {
-			LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
-		} else if (!strcmp(cmd, "block")) {
-			LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
-		} else if (!strcmp(cmd, "blocktxn")) {
-			LOGDEBUG("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
-		} else if (!strcmp(cmd, "getheaders")) {
-			LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
-		} else if (!strcmp(cmd, "getblocks")) {
-			LOGDEBUG("Received GETBLOCKS (%u bytes) - ignoring (blocks request)", plen);
-		} else if (!strcmp(cmd, "getaddr")) {
-			LOGDEBUG("Received GETADDR (%u bytes) - ignoring (peer discovery request)", plen);
-		} else if (!strcmp(cmd, "addr")) {
-			LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
-		} else if (!strcmp(cmd, "addrv2")) {
-			LOGINFO("Received ADDRV2 (%u bytes)", plen);
-			parse_addrv2(ckp, payload, plen);
-			continue; // Handler deallocates
-		} else if (!strcmp(cmd, "feefilter")) {
-			LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
-		} else if (!strcmp(cmd, "reject")) {
-			LOGDEBUG("Received REJECT (%u bytes) - ignoring (rejection message)", plen);
-		} else if (!strcmp(cmd, "notfound")) {
-			LOGDEBUG("Received NOTFOUND (%u bytes) - ignoring (item not found)", plen);
-		} else if (!strcmp(cmd, "wtxidrelay")) {
-			LOGDEBUG("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
-		} else if (!strcmp(cmd, "sendaddrv2")) {
-			LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
-		} else {
-			LOGINFO("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
+		ckmsgq_add(p2p_readers, conn);
+	}
+	return NULL;
+}
+
+static void add_conn_epoll(p2p_conn_t *conn)
+{
+	if (conn->sock < 0 || conn->evicted)
+		return;
+
+	struct epoll_event event = {
+		//.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLONESHOT,
+		.events = EPOLLIN | EPOLLRDHUP | EPOLLERR,
+		.data.u64 = (uint64_t)conn->peer,
+		.data.fd = conn->sock
+	};
+
+	if (epoll_ctl(reader_epfd, EPOLL_CTL_ADD, conn->sock, &event) < 0) {
+		if (errno != EEXIST)    /* EEXIST is harmless if we raced */
+			LOGDEBUG("epoll_ctl ADD failed for peer %d (fd %d): %s",
+				 conn->peer, conn->sock, strerror(errno));
+	}
+}
+
+static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
+{
+	uchar *payload = NULL;
+	uint32_t plen;
+	char cmd[13];
+
+	if (unlikely(conn->evicted))
+		goto out;
+
+	if (conn->sock < 0) {
+		if (conn->incoming_only) {
+			conn->evicted = true;
+			goto out;
 		}
 
-		if (payload) dealloc(payload);
+		if (p2p_connect_socket(conn)) {
+			if (!do_handshake(conn, conn->port)) {
+				close(conn->sock);
+				conn->sock = -1;
+			}
+		}
+		if (conn->sock < 0)
+			goto out;
 	}
 
-	if (active)
+	if (!p2p_recv(conn, cmd, &payload, &plen)) {
+		LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
+		disconnect_conn(conn);
+		goto out;
+	}
+
+	if (!conn->active) {
+		conn->active = true;
+		active_conns++;
+	}
+
+	// Log all received messages with descriptive type, even if ignoring
+	if (!strcmp(cmd, "version")) {
+		LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
+	} else if (!strcmp(cmd, "verack")) {
+		LOGINFO("Received VERACK (%u bytes) - handling for handshake", plen);
+	} else if (!strcmp(cmd, "ping")) {
+		LOGINFO("Received PING (%u bytes) - replying with PONG", plen);
+		handle_ping(conn, payload, plen);
+		goto rearm; // Skip dealloc since handler does it
+	} else if (!strcmp(cmd, "pong")) {
+		LOGDEBUG("Received PONG (%u bytes) - ignoring (keep-alive response)", plen);
+	} else if (!strcmp(cmd, "sendcmpct")) {
+		LOGINFO("Received SENDCMPCT (%u bytes) - handling compact block negotiation", plen);
+		handle_sendcmpct(conn, payload, plen);
+		goto rearm; // Skip dealloc since handler does it
+	} else if (!strcmp(cmd, "getdata")) {
+		LOGINFO("Received GETDATA (%u bytes) - handling (request for compact block or tx)", plen);
+		handle_getdata(conn, payload, plen);
+		goto rearm; // Skip dealloc since handler does it
+	} else if (!strcmp(cmd, "getblocktxn")) {
+		LOGINFO("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
+		handle_getblocktxn(conn, payload, plen);
+		goto rearm; // Skip dealloc since handler does it
+	} else if (!strcmp(cmd, "inv")) {
+		handle_inv(conn, payload, plen);
+		goto rearm;
+	} else if (!strcmp(cmd, "headers")) {
+		LOGINFO("Received HEADERS (%u bytes) - ignoring", plen);
+	} else if (!strcmp(cmd, "cmpctblock")) {
+		LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
+		handle_cmpctblock(ckp, payload, plen, conn->peer);
+		goto rearm;
+	} else if (!strcmp(cmd, "tx")) {
+		LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
+	} else if (!strcmp(cmd, "block")) {
+		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
+	} else if (!strcmp(cmd, "blocktxn")) {
+		LOGDEBUG("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
+	} else if (!strcmp(cmd, "getheaders")) {
+		LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
+	} else if (!strcmp(cmd, "getblocks")) {
+		LOGDEBUG("Received GETBLOCKS (%u bytes) - ignoring (blocks request)", plen);
+	} else if (!strcmp(cmd, "getaddr")) {
+		LOGDEBUG("Received GETADDR (%u bytes) - ignoring (peer discovery request)", plen);
+	} else if (!strcmp(cmd, "addr")) {
+		LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
+	} else if (!strcmp(cmd, "addrv2")) {
+		LOGINFO("Received ADDRV2 (%u bytes)", plen);
+		parse_addrv2(ckp, payload, plen);
+		goto rearm; // Handler deallocates
+	} else if (!strcmp(cmd, "feefilter")) {
+		LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
+	} else if (!strcmp(cmd, "reject")) {
+		LOGDEBUG("Received REJECT (%u bytes) - ignoring (rejection message)", plen);
+	} else if (!strcmp(cmd, "notfound")) {
+		LOGDEBUG("Received NOTFOUND (%u bytes) - ignoring (item not found)", plen);
+	} else if (!strcmp(cmd, "wtxidrelay")) {
+		LOGDEBUG("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
+	} else if (!strcmp(cmd, "sendaddrv2")) {
+		LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
+	} else {
+		LOGINFO("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
+	}
+
+	if (payload)
+		dealloc(payload);
+rearm:
+	add_conn_epoll(conn);
+	return;
+out:
+	if (conn->active) {
+		conn->active = false;
 		active_conns--;
-
-	total_conns--;
-
-	return NULL;
+	}
 }
 
 /* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
@@ -1264,6 +1294,8 @@ static void *p2p_keepalive(void *arg)
 					conn->evicted = true;
 					continue;
 				}
+				/* Tell p2p_reader to try reconnecting */
+				ckmsgq_add(p2p_readers, conn);
 				continue;
 			}
 
@@ -1383,7 +1415,6 @@ void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_pa
 static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *charport, int source)
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
-	pthread_t thread;
 	int port, i;
 
 	conn->ckp = ckp;
@@ -1417,8 +1448,6 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	}
 
 	LOGWARNING("ckp2p set up config peer %d - %s:%s", source, host, charport);
-
-	create_pthread(&thread, p2p_reader, conn);
 
 	return conn;
 }
@@ -1465,7 +1494,6 @@ static int create_p2p_listener(void)
 static void *p2p_acceptor(void *arg)
 {
 	ckpool_t *ckp = arg;
-	pthread_t pthread;
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pa");
@@ -1509,7 +1537,6 @@ static void *p2p_acceptor(void *arg)
 		conn->cmpct_payload = NULL;
 		conn->has_block = false;
 		tv_time(&conn->last_alive);
-		conn->reconnect = 5;
 		conn->handshake_done = false;
 		conn->evicted = false;
 		conn->peer = -1;
@@ -1555,10 +1582,8 @@ static void *p2p_acceptor(void *arg)
 		ckp->p2purls = old + 1;
 		ck_wunlock(&peerlock);
 
+		add_conn_epoll(conn);
 		LOGWARNING("Added incoming peer %d (%s:%d)", old, host, port_num);
-
-		/* Spawn exactly the same reader + keepalive threads as outgoing peers */
-		create_pthread(&pthread, p2p_reader, conn);
 	}
 
 	close(listen_sock);
@@ -1568,7 +1593,7 @@ static void *p2p_acceptor(void *arg)
 int prepare_ckp2p(ckpool_t *ckp)
 {
 	connsock_t *cs;
-	int i;
+	int i, p2purls;
 	pthread_t pthread;
 
 	cklock_init(&curblock.lock);
@@ -1600,6 +1625,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 		LOGWARNING("Limiting peers to %d", ckp->p2purls);
 		ckp->p2purls = ckp->maxclients;
 	}
+	p2purls = ckp->p2purls;
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
 	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
 	for (i = 0 ; i < ckp->p2purls ; i++) {
@@ -1611,17 +1637,29 @@ int prepare_ckp2p(ckpool_t *ckp)
 		}
 	}
 
-	for (i = 0 ; i < ckp->p2purls ; i++) {
+	for (i = 0 ; i < p2purls ; i++) {
 		cs = ckp->p2pcs[i];
 		ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
+
+	int threads = sysconf(_SC_NPROCESSORS_ONLN);
+	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, threads);
+
+	reader_epfd = epoll_create1(EPOLL_CLOEXEC);
+	if (reader_epfd < 0)
+		quit(1, "FATAL: Failed to create epoll in prepare_ckp2p");
+
+	create_pthread(&pthread, p2p_receiver, ckp);
 
 	/* Start listener thread for incoming ckp2p connections on port 8335 */
 	create_pthread(&pthread, p2p_acceptor, ckp);
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
 
 	create_pthread(&pthread, p2p_keepalive, ckp);
+
+	for (i = 0; i < p2purls; i++)
+		ckmsgq_add(p2p_readers, ckp->p2pconn[i]);
 
 	finished_init = true;
 

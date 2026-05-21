@@ -24,11 +24,11 @@ typedef struct {
 	char host[256];
 	char charport[32];
 	int port;
-	int reconnect;
 	int peer;
 	tv_t last_alive;
 	bool evicted;
 	bool incoming_only;
+	bool active;
 } p2p_conn_t;
 
 int prepare_ckp2p(ckpool_t *ckp);
