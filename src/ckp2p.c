@@ -56,7 +56,8 @@ static int total_conns;
 static int active_conns;
 static bool finished_init = false;
 static cklock_t peerlock;
-static uint32_t current_bits = 0x1d00ffff;
+#define GENESIS_BITS 0x1d00ffff
+static uint32_t current_bits = GENESIS_BITS;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -538,31 +539,31 @@ static void display_newblock(uchar *blockhash)
 	LOGWARNING("New block hash detected: %s", showhash);
 }
 
-/* Standard Bitcoin target-from-bits conversion (used by libckpool internally) */
+/* Bitcoin target-from-bits (little-endian target array, index 0 = LSB) */
 static void target_from_bits(uchar *target, uint32_t bits)
 {
+	memset(target, 0, 32);
+
 	int nsize = (bits >> 24) & 0xff;
 	uint32_t mant = bits & 0x007fffff;
 
-	memset(target, 0, 32);
-
 	if (nsize <= 3) {
 		mant >>= 8 * (3 - nsize);
-		target[31 - nsize] = mant & 0xff;
+		target[3 - nsize] = mant & 0xff;
 	} else {
-		target[32 - nsize] = (mant >> 16) & 0xff;
-		target[33 - nsize] = (mant >> 8) & 0xff;
-		target[34 - nsize] = mant & 0xff;
+		target[nsize - 3] = (mant >> 16) & 0xff;
+		target[nsize - 2] = (mant >> 8) & 0xff;
+		target[nsize - 1] = mant & 0xff;
 	}
 }
 
-/* Returns true if block hash meets the target (little-endian comparison) */
+/* Returns true if block hash meets the target (both arrays little-endian) */
 static bool hash_meets_target(const uchar *hash, uint32_t bits)
 {
 	uchar target[32];
 	target_from_bits(target, bits);
 
-	/* Compare hash (little-endian) <= target (little-endian) */
+	/* Compare from MSB (index 31) to LSB (index 0) */
 	for (int i = 31; i >= 0; i--) {
 		if (hash[i] < target[i]) return true;
 		if (hash[i] > target[i]) return false;
@@ -586,10 +587,10 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	memcpy(&block_bits, header + 72, 4);
 	block_bits = le32toh(block_bits);
 
-	/* We only trust source peer 0 to get the current network diff */
-	if (!source) {
-		if (block_bits != current_bits) {
-			LOGWARNING("Current bits set to %u", block_bits);
+	/* Trust peer 0 implicitly; other peers only if we haven't set diff */
+	if (block_bits != current_bits) {
+		if (current_bits == GENESIS_BITS || !source) {
+			LOGWARNING("Current bits set to 0x%08x (from peer %d)", block_bits, source);
 
 			ck_wlock(&curblock.lock);
 			current_bits = block_bits;
@@ -601,11 +602,14 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	sha256(header, 80, h1);
 	sha256(h1, 32, blockhash);
 
-	if (!hash_meets_target(blockhash, block_bits)) {
-		LOGWARNING("Compact block from peer %d does not meet current difficulty target - dropping",
-			   source);
+	if (!hash_meets_target(blockhash, current_bits)) {
+		LOGWARNING("Compact block from peer %d does not meet current difficulty target (0x%08x) - dropping",
+			   source, current_bits);
 		dealloc(payload);
-		evict_peer(ckp, source);
+		if (likely(source))
+			evict_peer(ckp, source);
+		else
+			LOGERR("Peer 0 compact block doesn't meet target!");
 		return;
 	}
 
@@ -626,60 +630,65 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	/* payload is stolen and released by relay_compact_block */
 }
 
+#if 0
 static void handle_headers(int peer, uchar *payload, uint32_t plen)
 {
-	uint32_t pos = 0, header_offset;
-	uchar blank[32] = {};
-	int64_t i, txcount, count;
-	bool first_block = false;
+	uint32_t pos = 0;
+	int64_t count = parse_varint(payload, plen, &pos);
 
-	ck_rlock(&curblock.lock);
-	if (unlikely(!peer && !memcmp(curblock.hash, blank, 32)))
-		first_block = true;
-	ck_runlock(&curblock.lock);
+	LOGINFO("Received HEADERS with %lld headers from peer %d", (long long)count, peer);
 
-	if (likely(!first_block))
+	/* Only update difficulty from peer 0 at startup */
+	if (peer)
 		goto out;
 
-	count = parse_varint(payload, plen, &pos);
-	if (count <= 0 || count > 2000)   /* protocol limit */
+	if (count <= 0 || count > 2000)
 		goto out;
 
-	/* Find the *last* header in the message */
-	header_offset = (uint32_t)pos;
-	for (i = 1; i < count; i++) {   /* skip all but the last */
-		header_offset += 80;                /* header */
-		txcount = parse_varint(payload, plen, &header_offset);
+	/* Always take the LAST header in the message — this is the tip */
+	uint32_t header_offset = pos;
+	uchar last_header[80] = {0};
+	int64_t processed = 0;
+
+	for (int64_t i = 0; i < count; i++) {
+		if (header_offset + 80 > plen)
+			break;
+
+		memcpy(last_header, payload + header_offset, 80);
+		processed++;
+
+		header_offset += 80;
+
+		int64_t txcount = parse_varint(payload, plen, &header_offset);
 		if (txcount < 0)
 			break;
 	}
 
-	if (header_offset + 80 > plen)
+	if (processed == 0)
 		goto out;
 
-	/* Extract the last 80-byte header and compute its hash */
-	uchar header[80];
-	memcpy(header, payload + header_offset, 80);
-	uchar h1[32], blockhash[32];
-	sha256(header, 80, h1);
-	sha256(h1, 32, blockhash);
-
 	uint32_t received_bits;
-	memcpy(&received_bits, header + 72, 4);
+	memcpy(&received_bits, last_header + 72, 4);
 	received_bits = le32toh(received_bits);
 
-	/* Update global current difficulty */
-	ck_wlock(&curblock.lock);
-	current_bits = received_bits;
-	ck_wunlock(&curblock.lock);
+	uchar h1[32], blockhash[32];
+	sha256(last_header, 80, h1);
+	sha256(h1, 32, blockhash);
 
-	LOGWARNING("current_bits set to 0x%08x", received_bits);
+	if (received_bits != current_bits) {
+		ck_wlock(&curblock.lock);
+		current_bits = received_bits;
+		memcpy(curblock.hash, blockhash, 32);
+		LOGWARNING("Current bits set to 0x%08x from headers", received_bits);
+		ck_wunlock(&curblock.lock);
+	}
 
 	display_newblock(blockhash);
 
 out:
 	dealloc(payload);
 }
+#endif
 
 static bool p2p_connect_socket(p2p_conn_t *conn)
 {
@@ -699,7 +708,6 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 	char cmd[13];
 	uchar *payload;
 	uint32_t plen;
-	uint32_t protover, protover_le;
 
 	send_version(conn, port);
 
@@ -745,17 +753,6 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 
 	/* Advertise ourselves to the network */
 	send_self_addrv2(conn);
-
-	// Send getheaders with genesis locator and zero stop to request up to 2000 headers
-	uchar gethdr_payload[69];
-	memset(gethdr_payload, 0, sizeof(gethdr_payload));
-	protover = 70016;
-	protover_le = htole32(protover);
-	memcpy(gethdr_payload, &protover_le, 4);
-	gethdr_payload[4] = 1; // hash_count varint=1
-	memcpy(gethdr_payload + 5, conn->genesis, 32);
-	// hash_stop remains all zeros
-	p2p_send(conn, "getheaders", gethdr_payload, sizeof(gethdr_payload));
 
 	return true;
 }
@@ -858,16 +855,6 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 
 	/* Advertise ourselves to the network */
 	send_self_addrv2(conn);
-
-	/* Also request current tip (same as outgoing) */
-	uchar gethdr_payload[69];
-	memset(gethdr_payload, 0, sizeof(gethdr_payload));
-	uint32_t protover = 70016;
-	uint32_t protover_le = htole32(protover);
-	memcpy(gethdr_payload, &protover_le, 4);
-	gethdr_payload[4] = 1; /* hash_count varint=1 */
-	memcpy(gethdr_payload + 5, conn->genesis, 32);
-	p2p_send(conn, "getheaders", gethdr_payload, sizeof(gethdr_payload));
 
 	return true;
 }
@@ -1129,9 +1116,13 @@ static void *p2p_reader(void *arg)
 			handle_inv(conn, payload, plen);
 			continue;
 		} else if (!strcmp(cmd, "headers")) {
+#if 0
 			LOGINFO("Received HEADERS (%u bytes) - parsing tip if necessary", plen);
 			handle_headers(conn->peer, payload, plen);
 			continue;   /* handler already deallocates */
+#else
+			LOGINFO("Received HEADERS (%u bytes) - ignoring", plen);
+#endif
 		} else if (!strcmp(cmd, "cmpctblock")) {
 			LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
 			handle_cmpctblock(ckp, payload, plen, conn->peer);
