@@ -1932,10 +1932,10 @@ int main(int argc, char **argv)
 	if (!ckp.maxclients)
 		ckp.maxclients = 1024;
 #endif
-	if (ckp.maxclients > ret * 9 / 10) {
+	if (ckp.maxclients > ret * 5 / 10) {
 		LOGWARNING("Cannot set maxclients to %d due to max open file limit of %d, reducing to %d",
-			   ckp.maxclients, ret, ret * 9 / 10);
-		ckp.maxclients = ret * 9 / 10;
+			   ckp.maxclients, ret, ret * 5 / 10);
+		ckp.maxclients = ret * 5 / 10;
 	} else if (!ckp.maxclients) {
 		LOGNOTICE("Setting maxclients to %d due to max open file limit of %d",
 			  ret * 9 / 10, ret);
