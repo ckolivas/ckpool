@@ -1302,6 +1302,8 @@ static void *p2p_keepalive(void *arg)
 
 			if (!conn->peer && finished_init)
 				dump_peers(ckp);
+			if (conn->evicted)
+				continue;
 			if (conn->peer && (!conn->handshake_done || conn->sock < 0)) {
 				if (conn->incoming_only) {
 					evict_peer(conn);
