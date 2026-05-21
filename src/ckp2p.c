@@ -60,8 +60,10 @@ static bool finished_init = false;
 static cklock_t peerlock;
 #define GENESIS_BITS 0x1d00ffff
 static uint32_t current_bits = GENESIS_BITS;
+static int num_threads;
 
 static ckmsgq_t* p2p_readers;
+static ckmsgq_t* p2p_connectors;
 static int reader_epfd;
 
 /* Check if magic is unset (all zeros) */
@@ -481,6 +483,7 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		}
 
 		disconnect_conn(conn);
+		ckmsgq_add(p2p_connectors, conn);
 	}
 	dealloc(payload);
 }
@@ -496,6 +499,7 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 
 	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
 	disconnect_conn(conn);
+	ckmsgq_add(p2p_connectors, conn);
 
 	dealloc(payload);
 }
@@ -1057,7 +1061,7 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 static void *p2p_receiver(void *arg)
 {
 	ckpool_t *ckp = arg;
-	struct epoll_event event = {};
+	struct epoll_event event;
 
 	rename_proc("p2preceiver");
 	pthread_detach(pthread_self());
@@ -1065,8 +1069,7 @@ static void *p2p_receiver(void *arg)
 	while (42) {
 		int ret;
 
-		ret = epoll_wait(reader_epfd, &event, 1, 1000);
-
+		ret = epoll_wait(reader_epfd, &event, 1, 100);
 		if (unlikely(ret < 0)) {
 			if (errno != EINTR)
 				LOGERR("epoll_wait failed: %s", strerror(errno));
@@ -1076,13 +1079,11 @@ static void *p2p_receiver(void *arg)
 			continue;
 
 		uint64_t idx = event.data.u64;
-		int fd = event.data.fd;
 
 		ck_rlock(&peerlock);
 		int p2purls = ckp->p2purls;
 		ck_runlock(&peerlock);
 
-		epoll_ctl(reader_epfd, EPOLL_CTL_DEL, fd, NULL);
 		if (unlikely(idx >= (uint64_t)p2purls)) {
 			LOGINFO("invalid peer index %"PRId64, idx);
 			continue;
@@ -1103,10 +1104,8 @@ static void add_conn_epoll(p2p_conn_t *conn)
 		return;
 
 	struct epoll_event event = {
-		//.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLONESHOT,
-		.events = EPOLLIN | EPOLLRDHUP | EPOLLERR,
+		.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLONESHOT,
 		.data.u64 = (uint64_t)conn->peer,
-		.data.fd = conn->sock
 	};
 
 	if (epoll_ctl(reader_epfd, EPOLL_CTL_ADD, conn->sock, &event) < 0) {
@@ -1116,14 +1115,8 @@ static void add_conn_epoll(p2p_conn_t *conn)
 	}
 }
 
-static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
+static void p2p_connector(ckpool_t *ckp, p2p_conn_t *conn)
 {
-	uchar *payload = NULL;
-	struct pollfd fdpoll = {};
-	uint32_t plen;
-	char cmd[13];
-	int ret;
-
 	if (unlikely(conn->evicted))
 		goto out;
 
@@ -1148,6 +1141,37 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		active_conns++;
 	}
 
+	ckmsgq_add(p2p_readers, conn);
+out:
+	return;
+}
+
+static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
+{
+	uchar *payload = NULL;
+	struct pollfd fdpoll = {};
+	uint32_t plen;
+	char cmd[13];
+	int ret;
+
+	if (unlikely(conn->evicted))
+		goto out;
+
+	if (conn->sock < 0 || !conn->handshake_done) {
+		if (conn->active) {
+			conn->active = false;
+			active_conns--;
+		}
+		ckmsgq_add(p2p_connectors, conn);
+		goto out;
+	}
+
+	if (!conn->active) {
+		conn->active = true;
+		active_conns++;
+	}
+
+	/* Sanity check we haven't been woken up without anything to read */
 	fdpoll.fd = conn->sock;
 	fdpoll.events = POLLIN;
 	ret = poll(&fdpoll, 1, 0);
@@ -1157,6 +1181,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 	if (!p2p_recv(conn, cmd, &payload, &plen)) {
 		LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
 		disconnect_conn(conn);
+		ckmsgq_add(p2p_connectors, conn);
 		goto out;
 	}
 
@@ -1297,6 +1322,9 @@ static void *p2p_keepalive(void *arg)
 		sleep(KEEPALIVE_INTERVAL);
 		tv_time(&now);
 
+		if (finished_init)
+			dump_peers(ckp);
+
 		for (i = 0; i < p2purls ; i++) {
 			p2p_conn_t *conn = ckp->p2pconn[i];
 
@@ -1304,19 +1332,19 @@ static void *p2p_keepalive(void *arg)
 				dump_peers(ckp);
 			if (conn->evicted)
 				continue;
-			if (conn->peer && (!conn->handshake_done || conn->sock < 0)) {
+			if (!conn->handshake_done || conn->sock < 0) {
 				if (conn->incoming_only) {
 					evict_peer(conn);
 					continue;
 				}
-				if (tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
+				if (i && tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
 					LOGWARNING("Dropping peer %d unresponsive for %d seconds",
 						   conn->peer, EVICT_TIMEOUT);
 					evict_peer(conn);
 					continue;
 				}
-				/* Tell p2p_reader to try reconnecting */
-				ckmsgq_add(p2p_readers, conn);
+				/* Tell p2p_connectors to try reconnecting */
+				ckmsgq_add(p2p_connectors, conn);
 				continue;
 			}
 
@@ -1397,6 +1425,7 @@ static void *submission_thread(void *arg)
 		/* Disconnect all remote peers to avoid inducing latency at
 		 * their end in case they ask for more information from ckp2p.*/
 		disconnect_conn(conn);
+		ckmsgq_add(p2p_connectors, conn);
 
 		submitted++;
 	}
@@ -1665,23 +1694,23 @@ int prepare_ckp2p(ckpool_t *ckp)
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
-	int threads = sysconf(_SC_NPROCESSORS_ONLN);
-	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, threads);
+	num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, num_threads);
+	p2p_connectors = create_ckmsgqs(ckp, "p2pconnect", &p2p_connector, num_threads);
 
 	reader_epfd = epoll_create1(EPOLL_CLOEXEC);
 	if (reader_epfd < 0)
 		quit(1, "FATAL: Failed to create epoll in prepare_ckp2p");
 
 	create_pthread(&pthread, p2p_receiver, ckp);
+	create_pthread(&pthread, p2p_keepalive, ckp);
 
 	/* Start listener thread for incoming ckp2p connections on port 8335 */
 	create_pthread(&pthread, p2p_acceptor, ckp);
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
 
-	create_pthread(&pthread, p2p_keepalive, ckp);
-
 	for (i = 0; i < p2purls; i++)
-		ckmsgq_add(p2p_readers, ckp->p2pconn[i]);
+		ckmsgq_add(p2p_connectors, ckp->p2pconn[i]);
 
 	finished_init = true;
 
