@@ -534,7 +534,7 @@ static void display_newblock(uchar *blockhash)
 {
 	char fliphash[32], showhash[68];
 
-	swap_256(fliphash, blockhash);
+	bswap_256(fliphash, blockhash);
 	__bin2hex(showhash, fliphash, 32);
 	LOGWARNING("New block hash detected: %s", showhash);
 }
