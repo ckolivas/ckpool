@@ -28,7 +28,7 @@
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
-#define EVICT_TIMEOUT 3600
+#define EVICT_TIMEOUT 600
 #define P2P_LISTEN_PORT 8333
 #define CKP2P_LISTEN_PORT 8335
 
@@ -431,12 +431,20 @@ static void disconnect_conn(p2p_conn_t *conn)
 	conn->handshake_done = false;
 }
 
-static void evict_peer(ckpool_t *ckp, int peer)
+static void evict_peer(p2p_conn_t *conn)
+{
+	if (conn->evicted)
+		return;
+	conn->evicted = true;
+	disconnect_conn(conn);
+	total_conns--;
+}
+
+static void evict_peerno(ckpool_t *ckp, int peer)
 {
 	p2p_conn_t *conn = ckp->p2pconn[peer];
 
-	conn->evicted = true;
-	disconnect_conn(conn);
+	evict_peer(conn);
 }
 
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
@@ -612,7 +620,7 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 			   source, current_bits);
 		dealloc(payload);
 		if (likely(source))
-			evict_peer(ckp, source);
+			evict_peerno(ckp, source);
 		else
 			LOGERR("Peer 0 compact block doesn't meet target!");
 		return;
@@ -930,6 +938,7 @@ static void *add_peer(void *arg)
 
 	conn->peer = old;
 	ckp->p2purls = old + 1;
+	total_conns++;
 	ck_wunlock(&peerlock);
 
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
@@ -948,7 +957,7 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 		return;
 
 	if (total_conns >= ckp->maxclients) {
-		LOGDEBUG("Half max client limit reached, not adding more p2p clients");
+		LOGDEBUG("Max client limit reached, not adding more p2p clients");
 		return;
 	}
 
@@ -1073,7 +1082,7 @@ static void *p2p_receiver(void *arg)
 
 		epoll_ctl(reader_epfd, EPOLL_CTL_DEL, fd, NULL);
 		if (unlikely(idx >= (uint64_t)p2purls)) {
-			LOGERR("invalid peer index %"PRId64, idx);
+			LOGINFO("invalid peer index %"PRId64, idx);
 			continue;
 		}
 
@@ -1116,7 +1125,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 
 	if (conn->sock < 0) {
 		if (conn->incoming_only) {
-			conn->evicted = true;
+			evict_peer(conn);
 			goto out;
 		}
 
@@ -1285,13 +1294,13 @@ static void *p2p_keepalive(void *arg)
 				dump_peers(ckp);
 			if (conn->peer && (!conn->handshake_done || conn->sock < 0)) {
 				if (conn->incoming_only) {
-					conn->evicted = true;
+					evict_peer(conn);
 					continue;
 				}
 				if (tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
 					LOGWARNING("Dropping peer %d unresponsive for %d seconds",
 						   conn->peer, EVICT_TIMEOUT);
-					conn->evicted = true;
+					evict_peer(conn);
 					continue;
 				}
 				/* Tell p2p_reader to try reconnecting */
@@ -1535,10 +1544,7 @@ static void *p2p_acceptor(void *arg)
 		memcpy(conn->genesis, netdefs[0].genesis, 32);
 		conn->netname = netdefs[0].name;
 		conn->cmpct_payload = NULL;
-		conn->has_block = false;
 		tv_time(&conn->last_alive);
-		conn->handshake_done = false;
-		conn->evicted = false;
 		conn->peer = -1;
 
 		if (!do_incoming_handshake(conn)) {
@@ -1576,10 +1582,12 @@ static void *p2p_acceptor(void *arg)
 		if (old > 0)
 			memcpy(ckp->p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
 		ckp->p2pconn[old] = conn;
-		if (old_p2pconn) dealloc(old_p2pconn);
+		if (old_p2pconn)
+			dealloc(old_p2pconn);
 
 		conn->peer = old;
 		ckp->p2purls = old + 1;
+		total_conns++;
 		ck_wunlock(&peerlock);
 
 		add_conn_epoll(conn);
@@ -1625,7 +1633,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 		LOGWARNING("Limiting peers to %d", ckp->p2purls);
 		ckp->p2purls = ckp->maxclients;
 	}
-	p2purls = ckp->p2purls;
+	p2purls = total_conns = ckp->p2purls;
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
 	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
 	for (i = 0 ; i < ckp->p2purls ; i++) {
