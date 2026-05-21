@@ -1321,7 +1321,7 @@ static void *submission_thread(void *arg)
 		submitted++;
 	}
 
-	swap_256(fliphash, cbt->blockhash);
+	bswap_256(fliphash, cbt->blockhash);
 	__bin2hex(hex, fliphash, 32);
 	if (submitted)
 		LOGNOTICE("Submitted %d compact block%s %s", submitted, submitted > 1 ? "s" : "", hex);
