@@ -587,9 +587,9 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	memcpy(&block_bits, header + 72, 4);
 	block_bits = le32toh(block_bits);
 
-	/* Trust peer 0 implicitly; other peers only if we haven't set diff */
+	/* Trust peer 0 implicitly; other peers only if diff is higher */
 	if (block_bits != current_bits) {
-		if (current_bits == GENESIS_BITS || !source) {
+		if (current_bits > block_bits || !source) {
 			LOGWARNING("Current bits set to 0x%08x (from peer %d)", block_bits, source);
 
 			ck_wlock(&curblock.lock);
