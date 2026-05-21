@@ -45,6 +45,8 @@ struct unix_msg {
 	char *buf;
 };
 
+typedef struct ckmsgq ckmsgq_t;
+
 struct ckmsgq {
 	ckpool_t *ckp;
 	char name[16];
@@ -55,9 +57,8 @@ struct ckmsgq {
 	void (*func)(ckpool_t *, void *);
 	int64_t messages;
 	bool active;
+	ckmsgq_t *primary;
 };
-
-typedef struct ckmsgq ckmsgq_t;
 
 typedef struct proc_instance proc_instance_t;
 

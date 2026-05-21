@@ -149,6 +149,7 @@ out:
 static void *ckmsg_queue(void *arg)
 {
 	ckmsgq_t *ckmsgq = (ckmsgq_t *)arg;
+	ckmsgq_t *primary = ckmsgq->primary;
 	ckpool_t *ckp = ckmsgq->ckp;
 
 	pthread_detach(pthread_self());
@@ -160,16 +161,16 @@ static void *ckmsg_queue(void *arg)
 		tv_t now;
 		ts_t abs;
 
-		mutex_lock(ckmsgq->lock);
+		mutex_lock(primary->lock);
 		tv_time(&now);
 		tv_to_ts(&abs, &now);
 		abs.tv_sec++;
-		if (!ckmsgq->msgs)
-			cond_timedwait(ckmsgq->cond, ckmsgq->lock, &abs);
-		msg = ckmsgq->msgs;
+		if (!primary->msgs)
+			cond_timedwait(primary->cond, primary->lock, &abs);
+		msg = primary->msgs;
 		if (msg)
-			DL_DELETE(ckmsgq->msgs, msg);
-		mutex_unlock(ckmsgq->lock);
+			DL_DELETE(primary->msgs, msg);
+		mutex_unlock(primary->lock);
 
 		if (!msg)
 			continue;
@@ -190,6 +191,7 @@ ckmsgq_t *create_ckmsgq(ckpool_t *ckp, const char *name, const void *func)
 	ckmsgq->cond = ckalloc(sizeof(pthread_cond_t));
 	mutex_init(ckmsgq->lock);
 	cond_init(ckmsgq->cond);
+	ckmsgq->primary = ckmsgq;
 	create_pthread(&ckmsgq->pth, ckmsg_queue, ckmsgq);
 
 	return ckmsgq;
@@ -213,6 +215,7 @@ ckmsgq_t *create_ckmsgqs(ckpool_t *ckp, const char *name, const void *func, cons
 		ckmsgq[i].ckp = ckp;
 		ckmsgq[i].lock = lock;
 		ckmsgq[i].cond = cond;
+		ckmsgq[i].primary = &ckmsgq[0]; /* all workers consume from [0] */
 		create_pthread(&ckmsgq[i].pth, ckmsg_queue, &ckmsgq[i]);
 	}
 
