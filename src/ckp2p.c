@@ -886,6 +886,23 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 	return true;
 }
 
+static void add_conn_epoll(p2p_conn_t *conn)
+{
+	if (conn->sock < 0 || conn->evicted)
+		return;
+
+	struct epoll_event event = {
+		.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLONESHOT,
+		.data.u64 = (uint64_t)conn->peer,
+	};
+
+	if (epoll_ctl(reader_epfd, EPOLL_CTL_ADD, conn->sock, &event) < 0) {
+		if (errno != EEXIST)    /* EEXIST is harmless if we raced */
+			LOGDEBUG("epoll_ctl ADD failed for peer %d (fd %d): %s",
+				 conn->peer, conn->sock, strerror(errno));
+	}
+}
+
 static void *add_peer(void *arg)
 {
 	p2p_conn_t *conn = arg;
@@ -948,7 +965,7 @@ static void *add_peer(void *arg)
 	ck_wunlock(&peerlock);
 
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
-
+	add_conn_epoll(conn);
 out:
 	return NULL;
 }
@@ -1096,23 +1113,6 @@ static void *p2p_receiver(void *arg)
 		ckmsgq_add(p2p_readers, conn);
 	}
 	return NULL;
-}
-
-static void add_conn_epoll(p2p_conn_t *conn)
-{
-	if (conn->sock < 0 || conn->evicted)
-		return;
-
-	struct epoll_event event = {
-		.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLONESHOT,
-		.data.u64 = (uint64_t)conn->peer,
-	};
-
-	if (epoll_ctl(reader_epfd, EPOLL_CTL_ADD, conn->sock, &event) < 0) {
-		if (errno != EEXIST)    /* EEXIST is harmless if we raced */
-			LOGDEBUG("epoll_ctl ADD failed for peer %d (fd %d): %s",
-				 conn->peer, conn->sock, strerror(errno));
-	}
 }
 
 static void p2p_connector(ckpool_t *ckp, p2p_conn_t *conn)
