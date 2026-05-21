@@ -879,6 +879,15 @@ static void *add_peer(void *arg)
 	}
 
 	ck_wlock(&peerlock);
+	/* Do another check for duplicates under lock */
+	if (unlikely(dup_peer(ckp, conn->host, conn->port))) {
+		LOGINFO("Skipping duplicate peer %s:%d", conn->host, conn->port);
+		disconnect_conn(conn);
+		dealloc(conn);
+		ck_wunlock(&peerlock);
+		goto out;
+	}
+
 	/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
 	int old = ckp->p2purls;
 
