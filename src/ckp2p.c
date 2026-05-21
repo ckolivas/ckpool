@@ -1115,7 +1115,7 @@ static void *p2p_receiver(void *arg)
 	return NULL;
 }
 
-static void p2p_connector(ckpool_t *ckp, p2p_conn_t *conn)
+static void p2p_connector(ckpool_t __maybe_unused *ckp, p2p_conn_t *conn)
 {
 	if (unlikely(conn->evicted))
 		goto out;
@@ -1694,8 +1694,8 @@ int prepare_ckp2p(ckpool_t *ckp)
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
-	num_threads = sysconf(_SC_NPROCESSORS_ONLN);
-	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, num_threads);
+	num_threads = sysconf(_SC_NPROCESSORS_ONLN) / 2 ? : 1;
+	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, num_threads * 2);
 	p2p_connectors = create_ckmsgqs(ckp, "p2pconnect", &p2p_connector, num_threads);
 
 	reader_epfd = epoll_create1(EPOLL_CLOEXEC);
