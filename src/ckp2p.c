@@ -938,10 +938,10 @@ static void *add_peer(void *arg)
 		goto out;
 	}
 
-	ck_rlock(&peerlock);
+	ck_wlock(&peerlock);
 	/* Do another check for duplicates under lock */
 	if (unlikely(_dup_peer(ckp, conn->host, conn->port))) {
-		ck_runlock(&peerlock);
+		ck_wunlock(&peerlock);
 		LOGINFO("Skipping duplicate peer %s:%d", conn->host, conn->port);
 		disconnect_conn(conn);
 		dealloc(conn);
