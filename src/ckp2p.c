@@ -435,10 +435,17 @@ static void disconnect_conn(p2p_conn_t *conn)
 
 static void evict_peer(p2p_conn_t *conn)
 {
-	if (conn->evicted)
+	ck_wlock(&peerlock);
+	if (conn->evicted) {
+		ck_wunlock(&peerlock);
 		return;
+	}
 	conn->evicted = true;
+	ck_wunlock(&peerlock);
+
 	disconnect_conn(conn);
+	/* NOTE possible leak if contains ->cmpct_payload here but is very
+	 * unlikely */
 	total_conns--;
 }
 
@@ -974,7 +981,7 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 {
 	uint32_t pos = 0;
-	int i, count = parse_varint(data, dlen, &pos);
+	int i, count;
 
 	if (total_conns >= ckp->maxclients) {
 		LOGDEBUG("Max client limit reached, not adding more p2p clients");
