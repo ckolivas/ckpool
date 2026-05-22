@@ -713,11 +713,12 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	}
 	ck_wunlock(&curblock.lock);
 
-	if (new_block)
+	if (new_block) {
 		display_newblock(blockhash);
-
-	relay_compact_block(ckp, blockhash, payload, plen, shortid_nonce, source);
-	/* payload is stolen and released by relay_compact_block */
+		relay_compact_block(ckp, blockhash, payload, plen, shortid_nonce, source);
+		/* payload is stolen and released by relay_compact_block */
+	} else
+		dealloc(payload);
 }
 
 static bool p2p_connect_socket(p2p_conn_t *conn)
