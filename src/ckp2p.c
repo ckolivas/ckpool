@@ -7,9 +7,6 @@
  * any later version.  See COPYING for more details.
  */
 
-#include "libckpool.h"
-#include "sha2.h"
-#include "ckpool.h"
 #include <sys/epoll.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -23,6 +20,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <endian.h>
+#include <stdio.h>
+
+#include "libckpool.h"
+#include "sha2.h"
+#include "ckpool.h"
+#include "utlist.h"
 
 #define MSG_BLOCK 2
 #define MSG_WITNESS_FLAG (1U << 30)
@@ -65,6 +68,15 @@ static int num_threads;
 static ckmsgq_t* p2p_readers;
 static ckmsgq_t* p2p_connectors;
 static int reader_epfd;
+
+struct blocklist {
+	uchar hash[32];
+	struct blocklist *next, *prev;
+};
+
+typedef struct blocklist blocklist_t;
+
+static blocklist_t *blockhashes;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -622,6 +634,11 @@ static bool hash_meets_target(const uchar *hash, uint32_t bits)
 	return true;   /* exact match is valid */
 }
 
+static int blockcmp(blocklist_t *a, uchar *b)
+{
+	return memcmp(a->hash, b, 32);
+}
+
 /* Function for testing cmpctblock validity by echoing back any received */
 static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int source)
 {
@@ -669,8 +686,30 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 
 	ck_wlock(&curblock.lock);
 	if (memcmp(curblock.hash, blockhash, 32)) {
-		memcpy(curblock.hash, blockhash, 32);
-		new_block = true;
+		blocklist_t *block;
+
+		/* Check this hash hasn't been seen in the last 10 blocks as
+		 * compact blocks are often repeated, to avoid relaying the
+		 * same block again */
+		DL_SEARCH(blockhashes, block, blockhash, blockcmp);
+		if (!block) {
+			int count;
+
+			block = ckalloc(sizeof(blocklist_t));
+
+			memcpy(block->hash, blockhash, 32);
+			DL_APPEND(blockhashes, block);
+			DL_COUNT(blockhashes, block, count);
+			LOGDEBUG("Block count %d", count);
+			if (count > 10) {
+				block = blockhashes;
+				DL_DELETE(blockhashes, block);
+				free(block);
+			}
+			memcpy(curblock.hash, blockhash, 32);
+			new_block = true;
+		} else
+			LOGDEBUG("Block already exists");
 	}
 	ck_wunlock(&curblock.lock);
 
