@@ -687,7 +687,7 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	if (memcmp(curblock.hash, blockhash, 32)) {
 		blocklist_t *block;
 
-		/* Check this hash hasn't been seen in the last 10 blocks as
+		/* Check this hash hasn't been seen in the last 100 blocks as
 		 * compact blocks are often repeated, to avoid relaying the
 		 * same block again */
 		DL_SEARCH(blockhashes, block, blockhash, blockcmp);
@@ -700,7 +700,7 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 			DL_APPEND(blockhashes, block);
 			DL_COUNT(blockhashes, block, count);
 			LOGDEBUG("Block count %d", count);
-			if (count > 10) {
+			if (count > 100) {
 				block = blockhashes;
 				DL_DELETE(blockhashes, block);
 				free(block);
@@ -1023,7 +1023,7 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 	uint32_t pos = 0;
 	int i, count;
 
-	if (total_conns >= ckp->maxclients) {
+	if (active_conns >= ckp->maxclients || total_conns >= ckp->maxclients * 2) {
 		LOGDEBUG("Max client limit reached, not adding more p2p clients");
 		goto out;
 	}
@@ -1564,7 +1564,7 @@ static void *p2p_acceptor(void *arg)
 		socklen_t clen = sizeof(client_addr);
 		int newsock;
 
-		while (total_conns >= ckp->maxclients)
+		while (active_conns >= ckp->maxclients || total_conns >= ckp->maxclients * 2)
 			sleep(KEEPALIVE_INTERVAL);
 		newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
 		if (newsock < 0) {
