@@ -1378,7 +1378,7 @@ static void *p2p_keepalive(void *arg)
 					unresponsive = tvdiff(&now, &conn->last_alive);
 				if (client_watermarks(ckp))
 					timeout = FAST_EVICT;
-				if (unresponsive > timeout) {
+				if (unresponsive >= timeout) {
 					LOGWARNING("Dropping peer %d unresponsive for %d seconds",
 						   conn->peer, unresponsive);
 					evict_peer(conn);
