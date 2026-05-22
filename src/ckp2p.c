@@ -32,6 +32,7 @@
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
+#define FAST_EVICT 600
 #define EVICT_TIMEOUT 3600
 #define P2P_LISTEN_PORT 8333
 #define CKP2P_LISTEN_PORT 8335
@@ -1016,13 +1017,24 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	create_pthread(&pthread, add_peer, conn);
 }
 
-static bool pause_clients(ckpool_t *ckp)
+static inline bool client_watermarks(ckpool_t *ckp)
 {
 	bool ret = true;
 
 	if (total_conns >= ckp->maxclients * 4 / 3)
 		goto out;
 	if (active_conns >= ckp->maxclients)
+		goto out;
+	ret = false;
+out:
+	return ret;
+}
+
+static bool pause_clients(ckpool_t *ckp)
+{
+	bool ret = true;
+
+	if (client_watermarks(ckp))
 		goto out;
 	if (!ckmsgq_empty(p2p_connectors))
 		goto out;
@@ -1355,13 +1367,20 @@ static void *p2p_keepalive(void *arg)
 			if (conn->evicted)
 				continue;
 			if (!conn->handshake_done || conn->sock < 0) {
+				int unresponsive = 0, timeout = EVICT_TIMEOUT;
+
 				if (conn->incoming_only) {
 					evict_peer(conn);
 					continue;
 				}
-				if (i && tvdiff(&now, &conn->last_alive) > EVICT_TIMEOUT) {
+				/* Never evict peer 0 */
+				if (i)
+					unresponsive = tvdiff(&now, &conn->last_alive);
+				if (client_watermarks(ckp))
+					timeout = FAST_EVICT;
+				if (unresponsive > timeout) {
 					LOGWARNING("Dropping peer %d unresponsive for %d seconds",
-						   conn->peer, EVICT_TIMEOUT);
+						   conn->peer, unresponsive);
 					evict_peer(conn);
 					continue;
 				}
