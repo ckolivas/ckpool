@@ -1010,11 +1010,6 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	if (!finished_init)
 		return;
 
-	if (total_conns >= ckp->maxclients) {
-		LOGDEBUG("Max client limit reached, not adding more p2p clients");
-		return;
-	}
-
 	conn = ckzalloc(sizeof(*conn));
 	conn->ckp = ckp;
 	cklock_init(&conn->block_lock);
@@ -1041,14 +1036,20 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 	uint32_t pos = 0;
 	int i, count = parse_varint(data, dlen, &pos);
 
+	if (total_conns >= ckp->maxclients) {
+		LOGDEBUG("Max client limit reached, not adding more p2p clients");
+		goto out;
+	}
+
+	count = parse_varint(data, dlen, &pos);
 	if (count < 0 || count > 1000) {   /* sanity limit */
 		LOGINFO("Invalid or oversized addrv2 count (%d)", count);
-		return;
+		goto out;
 	}
 
 	if (count == 0) {
 		LOGDEBUG("Received empty addrv2");
-		return;
+		goto out;
 	}
 
 	LOGINFO("Received addrv2 with %d address(es)", count);
@@ -1102,7 +1103,7 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 	next:
 		continue;
 	}
-
+out:
 	dealloc(data);
 }
 
