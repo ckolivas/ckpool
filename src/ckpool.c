@@ -1628,7 +1628,11 @@ int main(int argc, char **argv)
 	memset(&ckp, 0, sizeof(ckp));
 	ckp.starttime = time(NULL);
 	ckp.startpid = getpid();
+#ifdef CKP2P
+	ckp.loglevel = LOG_WARNING;
+#else
 	ckp.loglevel = LOG_NOTICE;
+#endif
 	ckp.initial_args = ckalloc(sizeof(char *) * (argc + 2)); /* Leave room for extra -H */
 	for (ckp.args = 0; ckp.args < argc; ckp.args++)
 		ckp.initial_args[ckp.args] = strdup(argv[ckp.args]);
