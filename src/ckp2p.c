@@ -903,6 +903,32 @@ static void add_conn_epoll(p2p_conn_t *conn)
 	}
 }
 
+/* Perform under wlock peerlock */
+static inline void _activate_conn(p2p_conn_t *conn)
+{
+	if (!conn->active) {
+		conn->active = true;
+		active_conns++;
+	}
+}
+
+static void activate_conn(p2p_conn_t *conn)
+{
+	ck_wlock(&peerlock);
+	_activate_conn(conn);
+	ck_wunlock(&peerlock);
+}
+
+static void deactivate_conn(p2p_conn_t *conn)
+{
+	ck_wlock(&peerlock);
+	if (conn->active) {
+		conn->active = false;
+		active_conns--;
+	}
+	ck_wunlock(&peerlock);
+}
+
 static void *add_peer(void *arg)
 {
 	p2p_conn_t *conn = arg;
@@ -960,8 +986,7 @@ static void *add_peer(void *arg)
 	conn->peer = old;
 	ckp->p2purls = old + 1;
 	total_conns++;
-	active_conns++;
-	conn->active = true;
+	_activate_conn(conn);
 	ck_wunlock(&peerlock);
 
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
@@ -1136,10 +1161,7 @@ static void p2p_connector(ckpool_t __maybe_unused *ckp, p2p_conn_t *conn)
 			goto out;
 	}
 
-	if (!conn->active) {
-		conn->active = true;
-		active_conns++;
-	}
+	activate_conn(conn);
 
 	ckmsgq_add(p2p_readers, conn);
 out:
@@ -1158,18 +1180,12 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		goto out;
 
 	if (conn->sock < 0 || !conn->handshake_done) {
-		if (conn->active) {
-			conn->active = false;
-			active_conns--;
-		}
+		deactivate_conn(conn);
 		ckmsgq_add(p2p_connectors, conn);
 		goto out;
 	}
 
-	if (!conn->active) {
-		conn->active = true;
-		active_conns++;
-	}
+	activate_conn(conn);
 
 	/* Sanity check we haven't been woken up without anything to read */
 	fdpoll.fd = conn->sock;
@@ -1255,10 +1271,7 @@ rearm:
 	add_conn_epoll(conn);
 	return;
 out:
-	if (conn->active) {
-		conn->active = false;
-		active_conns--;
-	}
+	deactivate_conn(conn);
 }
 
 /* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
@@ -1629,8 +1642,7 @@ static void *p2p_acceptor(void *arg)
 		conn->peer = old;
 		ckp->p2purls = old + 1;
 		total_conns++;
-		active_conns++;
-		conn->active = true;
+		_activate_conn(conn);
 		ck_wunlock(&peerlock);
 
 		add_conn_epoll(conn);
