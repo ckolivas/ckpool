@@ -1020,7 +1020,7 @@ static bool pause_clients(ckpool_t *ckp)
 {
 	bool ret = true;
 
-	if (total_conns >= ckp->maxclients * 2)
+	if (total_conns >= ckp->maxclients * 4 / 3)
 		goto out;
 	if (active_conns >= ckp->maxclients)
 		goto out;
@@ -1694,9 +1694,9 @@ int prepare_ckp2p(ckpool_t *ckp)
 	} else
 		externalport = CKP2P_LISTEN_PORT;
 
-	if (ckp->p2purls > ckp->maxclients) {
+	if (ckp->p2purls > ckp->maxclients * 4 / 3) {
+		ckp->p2purls = ckp->maxclients * 4 / 3;
 		LOGWARNING("Limiting peers to %d", ckp->p2purls);
-		ckp->p2purls = ckp->maxclients;
 	}
 	p2purls = total_conns = ckp->p2purls;
 	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
