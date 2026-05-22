@@ -647,66 +647,6 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	/* payload is stolen and released by relay_compact_block */
 }
 
-#if 0
-static void handle_headers(int peer, uchar *payload, uint32_t plen)
-{
-	uint32_t pos = 0;
-	int64_t count = parse_varint(payload, plen, &pos);
-
-	LOGINFO("Received HEADERS with %lld headers from peer %d", (long long)count, peer);
-
-	/* Only update difficulty from peer 0 at startup */
-	if (peer)
-		goto out;
-
-	if (count <= 0 || count > 2000)
-		goto out;
-
-	/* Always take the LAST header in the message — this is the tip */
-	uint32_t header_offset = pos;
-	uchar last_header[80] = {0};
-	int64_t processed = 0;
-
-	for (int64_t i = 0; i < count; i++) {
-		if (header_offset + 80 > plen)
-			break;
-
-		memcpy(last_header, payload + header_offset, 80);
-		processed++;
-
-		header_offset += 80;
-
-		int64_t txcount = parse_varint(payload, plen, &header_offset);
-		if (txcount < 0)
-			break;
-	}
-
-	if (processed == 0)
-		goto out;
-
-	uint32_t received_bits;
-	memcpy(&received_bits, last_header + 72, 4);
-	received_bits = le32toh(received_bits);
-
-	uchar h1[32], blockhash[32];
-	sha256(last_header, 80, h1);
-	sha256(h1, 32, blockhash);
-
-	if (received_bits != current_bits) {
-		ck_wlock(&curblock.lock);
-		current_bits = received_bits;
-		memcpy(curblock.hash, blockhash, 32);
-		LOGWARNING("Current bits set to 0x%08x from headers", received_bits);
-		ck_wunlock(&curblock.lock);
-	}
-
-	display_newblock(blockhash);
-
-out:
-	dealloc(payload);
-}
-#endif
-
 static bool p2p_connect_socket(p2p_conn_t *conn)
 {
 	conn->sock = connect_socket(conn->host, conn->charport);
