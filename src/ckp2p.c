@@ -1016,6 +1016,21 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	create_pthread(&pthread, add_peer, conn);
 }
 
+static bool pause_clients(ckpool_t *ckp)
+{
+	bool ret = true;
+
+	if (total_conns >= ckp->maxclients * 2)
+		goto out;
+	if (active_conns >= ckp->maxclients)
+		goto out;
+	if (!ckmsgq_empty(p2p_connectors))
+		goto out;
+	ret = false;
+out:
+	return ret;
+}
+
 /* Parse an ADDRV2 message and extract/log all host:port pairs.
  * Supports IPv4 (netid=1) and IPv6 (netid=2). */
 static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
@@ -1023,7 +1038,7 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 	uint32_t pos = 0;
 	int i, count;
 
-	if (active_conns >= ckp->maxclients || total_conns >= ckp->maxclients * 2) {
+	if (pause_clients(ckp)) {
 		LOGDEBUG("Max client limit reached, not adding more p2p clients");
 		goto out;
 	}
@@ -1564,7 +1579,7 @@ static void *p2p_acceptor(void *arg)
 		socklen_t clen = sizeof(client_addr);
 		int newsock;
 
-		while (active_conns >= ckp->maxclients || total_conns >= ckp->maxclients * 2)
+		while (pause_clients(ckp))
 			sleep(KEEPALIVE_INTERVAL);
 		newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
 		if (newsock < 0) {
