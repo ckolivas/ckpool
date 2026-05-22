@@ -423,6 +423,32 @@ static void handle_sendcmpct(p2p_conn_t *conn, uchar *payload, uint32_t len)
 		dealloc(payload);
 }
 
+/* Perform under wlock peerlock */
+static inline void _activate_conn(p2p_conn_t *conn)
+{
+	if (!conn->active) {
+		conn->active = true;
+		active_conns++;
+	}
+}
+
+static void activate_conn(p2p_conn_t *conn)
+{
+	ck_wlock(&peerlock);
+	_activate_conn(conn);
+	ck_wunlock(&peerlock);
+}
+
+static void deactivate_conn(p2p_conn_t *conn)
+{
+	ck_wlock(&peerlock);
+	if (conn->active) {
+		conn->active = false;
+		active_conns--;
+	}
+	ck_wunlock(&peerlock);
+}
+
 /* Disconnect after sending any block response to prevent being
  * asked for more info we don't have */
 static void disconnect_conn(p2p_conn_t *conn)
@@ -431,6 +457,7 @@ static void disconnect_conn(p2p_conn_t *conn)
 	close(conn->sock);
 	conn->sock = -1;
 	conn->handshake_done = false;
+	deactivate_conn(conn);
 }
 
 static void evict_peer(p2p_conn_t *conn)
@@ -854,32 +881,6 @@ static void add_conn_epoll(p2p_conn_t *conn)
 				 conn->peer, conn->sock, strerror(errno));
 		}
 	}
-}
-
-/* Perform under wlock peerlock */
-static inline void _activate_conn(p2p_conn_t *conn)
-{
-	if (!conn->active) {
-		conn->active = true;
-		active_conns++;
-	}
-}
-
-static void activate_conn(p2p_conn_t *conn)
-{
-	ck_wlock(&peerlock);
-	_activate_conn(conn);
-	ck_wunlock(&peerlock);
-}
-
-static void deactivate_conn(p2p_conn_t *conn)
-{
-	ck_wlock(&peerlock);
-	if (conn->active) {
-		conn->active = false;
-		active_conns--;
-	}
-	ck_wunlock(&peerlock);
 }
 
 static void *add_peer(void *arg)
