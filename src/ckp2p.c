@@ -32,7 +32,7 @@
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
 #define KEEPALIVE_INTERVAL 60
-#define EVICT_TIMEOUT 600
+#define EVICT_TIMEOUT 3600
 #define P2P_LISTEN_PORT 8333
 #define CKP2P_LISTEN_PORT 8335
 
@@ -63,7 +63,6 @@ static bool finished_init = false;
 static cklock_t peerlock;
 #define GENESIS_BITS 0x1d00ffff
 static uint32_t current_bits = GENESIS_BITS;
-static int num_threads;
 
 static ckmsgq_t* p2p_readers;
 static ckmsgq_t* p2p_connectors;
@@ -1650,9 +1649,10 @@ static void *p2p_acceptor(void *arg)
 
 int prepare_ckp2p(ckpool_t *ckp)
 {
+	pthread_t pthread;
+	int num_threads;
 	connsock_t *cs;
 	int i, p2purls;
-	pthread_t pthread;
 
 	cklock_init(&curblock.lock);
 	cklock_init(&peerlock);
@@ -1701,8 +1701,8 @@ int prepare_ckp2p(ckpool_t *ckp)
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
-	num_threads = sysconf(_SC_NPROCESSORS_ONLN) / 2 ? : 1;
-	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, num_threads * 2);
+	num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, num_threads);
 	p2p_connectors = create_ckmsgqs(ckp, "p2pconnect", &p2p_connector, num_threads);
 
 	reader_epfd = epoll_create1(EPOLL_CLOEXEC);
