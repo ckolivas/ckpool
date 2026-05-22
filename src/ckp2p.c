@@ -896,10 +896,16 @@ static void add_conn_epoll(p2p_conn_t *conn)
 		.data.u64 = (uint64_t)conn->peer,
 	};
 
-	if (epoll_ctl(reader_epfd, EPOLL_CTL_ADD, conn->sock, &event) < 0) {
-		if (errno != EEXIST)    /* EEXIST is harmless if we raced */
-			LOGDEBUG("epoll_ctl ADD failed for peer %d (fd %d): %s",
+	if (epoll_ctl(reader_epfd, EPOLL_CTL_MOD, conn->sock, &event) < 0) {
+		if (errno == ENOENT) {
+			/* New fd not yet registered (fresh connect) - use ADD */
+			if (epoll_ctl(reader_epfd, EPOLL_CTL_ADD, conn->sock, &event) < 0)
+				LOGDEBUG("epoll_ctl ADD failed for peer %d (fd %d): %s",
+					 conn->peer, conn->sock, strerror(errno));
+		} else {
+			LOGDEBUG("epoll_ctl MOD failed for peer %d (fd %d): %s",
 				 conn->peer, conn->sock, strerror(errno));
+		}
 	}
 }
 
