@@ -26,6 +26,7 @@
 #include "sha2.h"
 #include "ckpool.h"
 #include "utlist.h"
+#include "uthash.h"
 
 #define MSG_BLOCK 2
 #define MSG_WITNESS_FLAG (1U << 30)
@@ -69,14 +70,19 @@ static ckmsgq_t* p2p_readers;
 static ckmsgq_t* p2p_connectors;
 static int reader_epfd;
 
-struct blocklist {
+typedef struct blocklist {
 	uchar hash[32];
 	struct blocklist *next, *prev;
-};
-
-typedef struct blocklist blocklist_t;
+} blocklist_t;
 
 static blocklist_t *blockhashes;
+
+typedef struct wakelist {
+	UT_hash_handle hh;
+	int peer;
+} wakelist_t;
+
+static wakelist_t *reader_wakes, *connector_wakes;
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -495,6 +501,93 @@ static void evict_peerno(ckpool_t *ckp, int peer)
 	evict_peer(conn);
 }
 
+/* Done under wlock peerlock for multiples */
+static void _add_connector(p2p_conn_t *conn)
+{
+	wakelist_t *waker = NULL;
+
+	HASH_FIND_INT(connector_wakes, &conn->peer, waker);
+	if (!waker) {
+		waker = ckalloc(sizeof(wakelist_t));
+		waker->peer = conn->peer;
+		HASH_ADD_INT(connector_wakes, peer, waker);
+	}
+
+	if (waker)
+		ckmsgq_add(p2p_connectors, conn);
+}
+
+static void add_connector(p2p_conn_t *conn)
+{
+	wakelist_t *waker = NULL;
+
+	ck_wlock(&peerlock);
+	HASH_FIND_INT(connector_wakes, &conn->peer, waker);
+	if (!waker) {
+		waker = ckalloc(sizeof(wakelist_t));
+		waker->peer = conn->peer;
+		HASH_ADD_INT(connector_wakes, peer, waker);
+	}
+	ck_wunlock(&peerlock);
+
+	if (waker)
+		ckmsgq_add(p2p_connectors, conn);
+}
+
+static void add_reader(p2p_conn_t *conn)
+{
+	wakelist_t *waker = NULL;
+
+	ck_wlock(&peerlock);
+	HASH_FIND_INT(reader_wakes, &conn->peer, waker);
+	if (!waker) {
+		waker = ckalloc(sizeof(wakelist_t));
+		waker->peer = conn->peer;
+		HASH_ADD_INT(reader_wakes, peer, waker);
+	}
+	ck_wunlock(&peerlock);
+
+	if (waker)
+		ckmsgq_add(p2p_readers, conn);
+}
+
+static void del_connector(p2p_conn_t *conn)
+{
+	wakelist_t *waker = NULL;
+
+	ck_wlock(&peerlock);
+	HASH_FIND_INT(connector_wakes, &conn->peer, waker);
+	if (waker)
+		HASH_DEL(connector_wakes, waker);
+	ck_wunlock(&peerlock);
+
+	dealloc(waker);
+}
+
+static void del_reader(p2p_conn_t *conn)
+{
+	wakelist_t *waker = NULL;
+
+	ck_wlock(&peerlock);
+	HASH_FIND_INT(reader_wakes, &conn->peer, waker);
+	if (waker)
+		HASH_DEL(reader_wakes, waker);
+	ck_wunlock(&peerlock);
+
+	dealloc(waker);
+}
+
+static int connectors_woken(void)
+{
+	int ret;
+
+	ck_rlock(&peerlock);
+	ret = HASH_COUNT(connector_wakes);
+	ck_runlock(&peerlock);
+
+	return ret;
+}
+
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -529,7 +622,7 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		}
 
 		disconnect_conn(conn);
-		ckmsgq_add(p2p_connectors, conn);
+		add_connector(conn);
 	}
 	dealloc(payload);
 }
@@ -545,7 +638,7 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 
 	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
 	disconnect_conn(conn);
-	ckmsgq_add(p2p_connectors, conn);
+	add_connector(conn);
 
 	dealloc(payload);
 }
@@ -1036,7 +1129,7 @@ static bool pause_clients(ckpool_t *ckp)
 
 	if (client_watermarks(ckp))
 		goto out;
-	if (!ckmsgq_empty(p2p_connectors))
+	if (connectors_woken())
 		goto out;
 	ret = false;
 out:
@@ -1156,7 +1249,7 @@ static void *p2p_receiver(void *arg)
 		if (unlikely(!conn || conn->evicted))
 			continue;
 
-		ckmsgq_add(p2p_readers, conn);
+		add_reader(conn);
 	}
 	return NULL;
 }
@@ -1184,8 +1277,9 @@ static void p2p_connector(ckpool_t __maybe_unused *ckp, p2p_conn_t *conn)
 
 	activate_conn(conn);
 
-	ckmsgq_add(p2p_readers, conn);
+	add_reader(conn);
 out:
+	del_connector(conn);
 	return;
 }
 
@@ -1202,7 +1296,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 
 	if (conn->sock < 0 || !conn->handshake_done) {
 		deactivate_conn(conn);
-		ckmsgq_add(p2p_connectors, conn);
+		add_connector(conn);
 		goto out;
 	}
 
@@ -1218,7 +1312,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 	if (!p2p_recv(conn, cmd, &payload, &plen)) {
 		LOGINFO("P2P recv failed for peer %d - disconnecting", conn->peer);
 		disconnect_conn(conn);
-		ckmsgq_add(p2p_connectors, conn);
+		add_connector(conn);
 		goto out;
 	}
 
@@ -1290,9 +1384,11 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		dealloc(payload);
 rearm:
 	add_conn_epoll(conn);
+	del_reader(conn);
 	return;
 out:
 	deactivate_conn(conn);
+	del_reader(conn);
 }
 
 /* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
@@ -1385,7 +1481,7 @@ static void *p2p_keepalive(void *arg)
 					continue;
 				}
 				/* Tell p2p_connectors to try reconnecting */
-				ckmsgq_add(p2p_connectors, conn);
+				add_connector(conn);
 				continue;
 			}
 
@@ -1466,7 +1562,7 @@ static void *submission_thread(void *arg)
 		/* Disconnect all remote peers to avoid inducing latency at
 		 * their end in case they ask for more information from ckp2p.*/
 		disconnect_conn(conn);
-		ckmsgq_add(p2p_connectors, conn);
+		add_connector(conn);
 
 		submitted++;
 	}
@@ -1750,8 +1846,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 	create_pthread(&pthread, p2p_acceptor, ckp);
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
 
+	ck_wlock(&peerlock);
 	for (i = 0; i < p2purls; i++)
-		ckmsgq_add(p2p_connectors, ckp->p2pconn[i]);
+		_add_connector(ckp->p2pconn[i]);
+	ck_wunlock(&peerlock);
 
 	finished_init = true;
 
