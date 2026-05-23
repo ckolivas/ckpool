@@ -1249,7 +1249,10 @@ static void *p2p_receiver(void *arg)
 		if (unlikely(!conn || conn->evicted))
 			continue;
 
-		add_reader(conn);
+		if (event.events & EPOLLIN)
+			add_reader(conn);
+		else
+			add_connector(conn);
 	}
 	return NULL;
 }
