@@ -248,6 +248,19 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 	}
 }
 
+/* Safe way to read a peer pointer while the array may be resized */
+static p2p_conn_t *get_peer(ckpool_t *ckp, int peer)
+{
+	p2p_conn_t *conn = NULL;
+
+	ck_rlock(&peerlock);
+	if (likely(peer < ckp->p2purls))
+		conn = ckp->p2pconn[peer];
+	ck_runlock(&peerlock);
+
+	return conn;
+}
+
 static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *plen)
 {
 	uchar hdr[24];
@@ -1232,7 +1245,9 @@ static void *p2p_receiver(void *arg)
 	pthread_detach(pthread_self());
 
 	while (42) {
-		int ret;
+		p2p_conn_t *conn;
+		int p2purls, ret;
+		uint64_t idx;
 
 		ret = epoll_wait(reader_epfd, &event, 1, 100);
 		if (unlikely(ret < 0)) {
@@ -1243,10 +1258,10 @@ static void *p2p_receiver(void *arg)
 		if (ret == 0)   /* timeout */
 			continue;
 
-		uint64_t idx = event.data.u64;
+		idx = event.data.u64;
 
 		ck_rlock(&peerlock);
-		int p2purls = ckp->p2purls;
+		p2purls = ckp->p2purls;
 		ck_runlock(&peerlock);
 
 		if (unlikely(idx >= (uint64_t)p2purls)) {
@@ -1254,7 +1269,7 @@ static void *p2p_receiver(void *arg)
 			continue;
 		}
 
-		p2p_conn_t *conn = ckp->p2pconn[idx];
+		conn = get_peer(ckp, idx);
 		if (unlikely(!conn || conn->evicted))
 			continue;
 
@@ -1468,10 +1483,10 @@ static void *p2p_keepalive(void *arg)
 			dump_peers(ckp);
 
 		for (i = 0; i < p2purls ; i++) {
-			p2p_conn_t *conn = ckp->p2pconn[i];
+			p2p_conn_t *conn = get_peer(ckp, i);
 
-			if (!conn->peer && finished_init)
-				dump_peers(ckp);
+			if (unlikely(!conn))
+				continue;
 			if (conn->evicted)
 				continue;
 			if (!conn->handshake_done || conn->sock < 0) {
@@ -1521,14 +1536,15 @@ typedef struct compact_block compact_block_t;
 static void *submission_thread(void *arg)
 {
 	compact_block_t *cbt = arg;
-	int i, submitted = 0;
 	char fliphash[32], hex[68];
+	ckpool_t *ckp = cbt->ckp;
+	int i, submitted = 0;
 	int p2purls;
 
 	pthread_detach(pthread_self());
 
 	ck_rlock(&peerlock);
-	p2purls = cbt->ckp->p2purls;
+	p2purls = ckp->p2purls;
 	ck_runlock(&peerlock);
 
 	for (i = 0; i < p2purls; i++) {
@@ -1539,7 +1555,7 @@ static void *submission_thread(void *arg)
 			continue;
 		}
 
-		conn = cbt->ckp->p2pconn[i];
+		conn = get_peer(ckp, i);
 		if (unlikely(!conn)) {
 			LOGDEBUG("Skipping relaying compact block to uninitialised node %d", i);
 			continue;
