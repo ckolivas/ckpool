@@ -69,6 +69,7 @@ static uint32_t current_bits = GENESIS_BITS;
 static ckmsgq_t* p2p_readers;
 static ckmsgq_t* p2p_connectors;
 static int reader_epfd;
+static int num_threads;
 
 typedef struct blocklist {
 	uchar hash[32];
@@ -1135,7 +1136,7 @@ static bool pause_clients(ckpool_t *ckp)
 
 	if (client_watermarks(ckp))
 		goto out;
-	if (connectors_woken())
+	if (connectors_woken() >= num_threads)
 		goto out;
 	ret = false;
 out:
@@ -1789,7 +1790,6 @@ static void *p2p_acceptor(void *arg)
 int prepare_ckp2p(ckpool_t *ckp)
 {
 	pthread_t pthread;
-	int num_threads;
 	connsock_t *cs;
 	int i, p2purls;
 
