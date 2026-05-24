@@ -6,6 +6,13 @@
  * Software Foundation; either version 3 of the License, or (at your option)
  * any later version.  See COPYING for more details.
  */
+#include "uthash.h"
+
+typedef struct peerlist {
+	UT_hash_handle hh;
+	char url[288];
+} peerlist_t;
+
 
 typedef struct {
 	ckpool_t *ckp;
@@ -29,6 +36,7 @@ typedef struct {
 	bool evicted;
 	bool incoming_only;
 	bool active;
+	peerlist_t *p2ppeer;
 } p2p_conn_t;
 
 int prepare_ckp2p(ckpool_t *ckp);

@@ -85,6 +85,8 @@ typedef struct wakelist {
 
 static wakelist_t *reader_wakes, *connector_wakes;
 
+static peerlist_t *p2ppeers;
+
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
 {
@@ -499,6 +501,8 @@ static void evict_peer(p2p_conn_t *conn)
 		ck_wunlock(&peerlock);
 		return;
 	}
+	HASH_DEL(p2ppeers, conn->p2ppeer);
+	dealloc(conn->p2ppeer);
 	conn->evicted = true;
 	ck_wunlock(&peerlock);
 
@@ -905,22 +909,14 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 /* called while holding peerlock */
 static bool _dup_peer(ckpool_t *ckp, const char *host, int port)
 {
+	peerlist_t *p2ppeer = NULL;
 	bool ret = false;
-	int i;
+	char url[288];
 
-	for (i = 0; i < ckp->p2purls; i++) {
-		p2p_conn_t *conn = ckp->p2pconn[i];
-
-		if (!conn)
-			continue;
-		if (conn->evicted)
-			continue;
-		if (!strcmp(conn->host, host) && (conn->port == port)) {
-			ret = true;
-			break;
-		}
-	}
-
+	sprintf(url, "%s:%d", host, port);
+	HASH_FIND_STR(p2ppeers, url, p2ppeer);
+	if (p2ppeer)
+		ret = true;
 	return ret;
 }
 
@@ -1095,6 +1091,10 @@ static void *add_peer(void *arg)
 	ckp->p2purls = old + 1;
 	total_conns++;
 	_activate_conn(conn);
+
+	peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+	sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
+	HASH_ADD_STR(p2ppeers, url, conn->p2ppeer);
 	ck_wunlock(&peerlock);
 
 	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
@@ -1794,6 +1794,10 @@ static void *p2p_acceptor(void *arg)
 		ckp->p2purls = old + 1;
 		total_conns++;
 		_activate_conn(conn);
+
+		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+		sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
+		HASH_ADD_STR(p2ppeers, url, p2ppeer);
 		ck_wunlock(&peerlock);
 
 		add_conn_epoll(conn);
@@ -1853,7 +1857,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 
 	for (i = 0 ; i < p2purls ; i++) {
 		cs = ckp->p2pcs[i];
-		ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
+		p2p_conn_t *conn = ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
+		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+		sprintf(p2ppeer->url, "%s", ckp->p2purl[i]);
+		HASH_ADD_STR(p2ppeers, url, p2ppeer);
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
