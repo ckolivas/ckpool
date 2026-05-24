@@ -168,6 +168,8 @@ struct ckpool_instance {
 	bool handover;
 	/* How many clients maximum to accept before rejecting further */
 	int maxclients;
+	/* How many are priority peers for ckp2p to never evict */
+	int prioclients;
 	/* Drop clients that have been idle for this many seconds, 0 to disable */
 	int dropidle;
 

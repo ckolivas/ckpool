@@ -618,6 +618,7 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
 	int64_t count = parse_varint(payload, plen, &pos);
+	bool responded = false;
 
 	if (count < 0 || count > 500) { // basic sanity
 		dealloc(payload);
@@ -637,9 +638,10 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 
 		if (type == MSG_CMPCT_BLOCK) {
 			ck_rlock(&conn->block_lock);
-			if (conn->has_block && !memcmp(conn->blockhash, hash, 32))
+			if (conn->has_block && !memcmp(conn->blockhash, hash, 32)) {
 				p2p_send(conn, "cmpctblock", conn->cmpct_payload, conn->cmpct_len);
-			else
+				responded = true;
+			} else
 				LOGINFO("Peer %d requested cmpctblock we don't have", conn->peer);
 			ck_runlock(&conn->block_lock);
 		} else {
@@ -647,8 +649,10 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 				conn->peer);
 		}
 
-		disconnect_conn(conn);
-		add_connector(conn);
+		if (!responded) {
+			disconnect_conn(conn);
+			add_connector(conn);
+		}
 	}
 	dealloc(payload);
 }
@@ -1500,8 +1504,8 @@ static void *p2p_keepalive(void *arg)
 					evict_peer(conn);
 					continue;
 				}
-				/* Never evict peer 0 */
-				if (i)
+				/* Never evict priority clients */
+				if (i < ckp->prioclients)
 					unresponsive = tvdiff(&now, &conn->last_alive);
 				if (client_watermarks(ckp))
 					timeout = FAST_EVICT;
@@ -1593,10 +1597,12 @@ static void *submission_thread(void *arg)
 		ck_wunlock(&conn->block_lock);
 
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
-		/* Disconnect all remote peers to avoid inducing latency at
+		/* Disconnect all priority peers to avoid inducing latency at
 		 * their end in case they ask for more information from ckp2p.*/
-		disconnect_conn(conn);
-		add_connector(conn);
+		if (i < ckp->prioclients) {
+			disconnect_conn(conn);
+			add_connector(conn);
+		}
 
 		submitted++;
 	}

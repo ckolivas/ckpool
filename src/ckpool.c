@@ -1511,6 +1511,7 @@ static void parse_config(ckpool_t *ckp)
 	json_get_int64(&ckp->maxdiff, json_conf, "maxdiff");
 	json_get_string(&ckp->logdir, json_conf, "logdir");
 	json_get_int(&ckp->maxclients, json_conf, "maxclients");
+	json_get_int(&ckp->prioclients, json_conf, "prioclients");
 	json_get_double(&ckp->donation, json_conf, "donation");
 	/* Avoid dust-sized donations */
 	if (ckp->donation < 0.1)
@@ -1938,6 +1939,8 @@ int main(int argc, char **argv)
 #if CKP2P
 	if (!ckp.maxclients)
 		ckp.maxclients = 1024;
+	if (!ckp.prioclients)
+		ckp.prioclients = 1;
 #endif
 	if (ckp.maxclients > ret * 5 / 10) {
 		LOGWARNING("Cannot set maxclients to %d due to max open file limit of %d, reducing to %d",
