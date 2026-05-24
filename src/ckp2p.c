@@ -1392,8 +1392,8 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 	if (payload)
 		dealloc(payload);
 rearm:
-	add_conn_epoll(conn);
 	del_reader(conn);
+	add_conn_epoll(conn);
 	return;
 out:
 	deactivate_conn(conn);
