@@ -6,8 +6,19 @@
  * Software Foundation; either version 3 of the License, or (at your option)
  * any later version.  See COPYING for more details.
  */
+#include "uthash.h"
 
-typedef struct {
+struct p2p_conn;
+
+struct peerlist {
+	UT_hash_handle hh;
+	char url[288];
+	struct p2p_conn *conn;
+};
+
+typedef struct peerlist peerlist_t;
+
+struct p2p_conn {
 	ckpool_t *ckp;
 	int sock;
 	uchar magic[4];
@@ -29,7 +40,10 @@ typedef struct {
 	bool evicted;
 	bool incoming_only;
 	bool active;
-} p2p_conn_t;
+	peerlist_t *p2ppeer;
+};
+
+typedef struct p2p_conn p2p_conn_t;
 
 int prepare_ckp2p(ckpool_t *ckp);
 void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
