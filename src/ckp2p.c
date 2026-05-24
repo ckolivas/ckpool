@@ -646,28 +646,7 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 			LOGINFO("Peer %d requested full block (getdata) - cannot serve",
 				conn->peer);
 		}
-#if 0
-		disconnect_conn(conn);
-		add_connector(conn);
-#endif
 	}
-	dealloc(payload);
-}
-
-static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
-{
-	if (plen < 32) {
-		dealloc(payload);
-		return;
-	}
-
-	LOGINFO("Peer %d requested getblocktxn - cannot serve", conn->peer);
-#if 0
-	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
-	disconnect_conn(conn);
-	add_connector(conn);
-#endif
-
 	dealloc(payload);
 }
 
@@ -710,9 +689,6 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		LOGDEBUG("Received INV (%u bytes) - ignoring transaction announcements", plen);
 	dealloc(payload);
 }
-
-static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
-				uint32_t cmpct_len, uint64_t shortid_nonce, int source);
 
 static void display_newblock(uchar *blockhash)
 {
@@ -763,7 +739,6 @@ static int blockcmp(blocklist_t *a, uchar *b)
 /* Function for testing cmpctblock validity by echoing back any received */
 static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int source)
 {
-	uint64_t shortid_nonce_le, shortid_nonce;
 	bool new_block = false;
 	uint32_t block_bits;
 
@@ -802,9 +777,6 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 		return;
 	}
 
-	memcpy(&shortid_nonce_le, payload + 80, 8);
-	shortid_nonce = le64toh(shortid_nonce_le);
-
 	ck_wlock(&curblock.lock);
 	if (memcmp(curblock.hash, blockhash, 32)) {
 		blocklist_t *block;
@@ -834,12 +806,9 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 	}
 	ck_wunlock(&curblock.lock);
 
-	if (new_block) {
+	if (new_block)
 		display_newblock(blockhash);
-		relay_compact_block(ckp, blockhash, payload, plen, shortid_nonce, source);
-		/* payload is stolen and released by relay_compact_block */
-	} else
-		dealloc(payload);
+	dealloc(payload);
 }
 
 static bool p2p_connect_socket(p2p_conn_t *conn)
@@ -1168,7 +1137,7 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 	uint32_t pos = 0;
 	int i, count;
 
-	if (pause_clients(ckp)) {
+	if (client_watermarks(ckp)) {
 		LOGDEBUG("Max client limit reached, not adding more p2p clients");
 		goto out;
 	}
@@ -1366,9 +1335,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		handle_getdata(conn, payload, plen);
 		goto rearm; // Skip dealloc since handler does it
 	} else if (!strcmp(cmd, "getblocktxn")) {
-		LOGINFO("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
-		handle_getblocktxn(conn, payload, plen);
-		goto rearm; // Skip dealloc since handler does it
+		LOGINFO("Received GETBLOCKTXN (%u bytes) - ignoring", plen);
 	} else if (!strcmp(cmd, "inv")) {
 		handle_inv(conn, payload, plen);
 		goto rearm;
@@ -1540,100 +1507,6 @@ struct compact_block {
 };
 
 typedef struct compact_block compact_block_t;
-
-static void *submission_thread(void *arg)
-{
-	compact_block_t *cbt = arg;
-	char fliphash[32], hex[68];
-	ckpool_t *ckp = cbt->ckp;
-	int i, submitted = 0;
-	int p2purls;
-
-	pthread_detach(pthread_self());
-
-	ck_rlock(&peerlock);
-	p2purls = ckp->p2purls;
-	ck_runlock(&peerlock);
-
-	for (i = 0; i < p2purls; i++) {
-		p2p_conn_t *conn;
-
-		if (i == cbt->source) {
-			LOGDEBUG("Skipping relaying compact block to source node %d", i);
-			continue;
-		}
-
-		conn = get_peer(ckp, i);
-		if (unlikely(!conn)) {
-			LOGDEBUG("Skipping relaying compact block to uninitialised node %d", i);
-			continue;
-		}
-		if (conn->evicted) {
-			LOGDEBUG("Skipping relaying compact block to evicted node %d", i);
-			continue;
-		}
-
-		if (!memcmp(conn->blockhash, cbt->blockhash, 32)) {
-			LOGINFO("Source node %d already has compact block", i);
-			continue;
-		}
-
-		if (conn->sock < 0 || !conn->handshake_done) {
-			LOGINFO("Connection %d not active - skipping submission", i);
-			continue;
-		}
-
-		ck_wlock(&conn->block_lock);
-		if (conn->cmpct_payload)
-			dealloc(conn->cmpct_payload);
-		memcpy(conn->blockhash, cbt->blockhash, 32);
-		conn->cmpct_payload = ckalloc(cbt->cmpct_len);
-		memcpy(conn->cmpct_payload, cbt->cmpct_payload, cbt->cmpct_len);
-		conn->cmpct_len = cbt->cmpct_len;
-		conn->shortid_nonce = cbt->shortid_nonce;
-		conn->has_block = true;
-		ck_wunlock(&conn->block_lock);
-
-		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
-		/* Disconnect all remote peers to avoid inducing latency at
-		 * their end in case they ask for more information from ckp2p.*/
-		disconnect_conn(conn);
-		add_connector(conn);
-
-		submitted++;
-	}
-
-	bswap_256(fliphash, cbt->blockhash);
-	__bin2hex(hex, fliphash, 32);
-	if (submitted)
-		LOGNOTICE("Submitted %d compact block%s %s", submitted, submitted > 1 ? "s" : "", hex);
-	free(cbt->cmpct_payload);
-	free(cbt);
-
-	return NULL;
-}
-
-static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
-				uint32_t cmpct_len, uint64_t shortid_nonce, int source)
-{
-	compact_block_t *cbt = ckalloc(sizeof(compact_block_t));
-
-	cbt->ckp = ckp;
-	memcpy(cbt->blockhash, blockhash, 32);
-	/* Steal payload memory here */
-	cbt->cmpct_payload = cmpct_payload;
-	cbt->cmpct_len = cmpct_len;
-	cbt->shortid_nonce = shortid_nonce;
-	cbt->source = source;
-
-	create_pthread(&cbt->pth, submission_thread, cbt);
-}
-
-void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
-			  uint32_t cmpct_len, uint64_t shortid_nonce)
-{
-	relay_compact_block(ckp, blockhash, cmpct_payload, cmpct_len, shortid_nonce, -1);
-}
 
 static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *charport, int source)
 {
