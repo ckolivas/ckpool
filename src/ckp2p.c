@@ -627,9 +627,10 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 			LOGINFO("Peer %d requested full block (getdata) - cannot serve",
 				conn->peer);
 		}
-
+#if 0
 		disconnect_conn(conn);
 		add_connector(conn);
+#endif
 	}
 	dealloc(payload);
 }
@@ -642,10 +643,11 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	}
 
 	LOGINFO("Peer %d requested getblocktxn - cannot serve", conn->peer);
-
+#if 0
 	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
 	disconnect_conn(conn);
 	add_connector(conn);
+#endif
 
 	dealloc(payload);
 }
