@@ -32,7 +32,8 @@
 #define MSG_WITNESS_FLAG (1U << 30)
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
-#define KEEPALIVE_INTERVAL 60
+#define KEEPALIVE_INTERVAL 5
+#define PING_INTERVAL 120
 #define FAST_EVICT 600
 #define EVICT_TIMEOUT 3600
 #define P2P_LISTEN_PORT 8333
@@ -1455,13 +1456,16 @@ static void dump_peers(ckpool_t *ckp)
 
 static void *p2p_keepalive(void *arg)
 {
+	static tv_t last_ping;
 	ckpool_t *ckp = arg;
 
+	tv_time(&last_ping);
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pk");
 
 	while (42) {
 		uint64_t nonce, nonce_le;
+		bool ping = false;
 		int p2purls, i;
 		tv_t now;
 
@@ -1476,8 +1480,11 @@ static void *p2p_keepalive(void *arg)
 		sleep(KEEPALIVE_INTERVAL);
 		tv_time(&now);
 
-		if (finished_init)
+		if (tvdiff(&now, &last_ping) > PING_INTERVAL) {
+			copy_tv(&last_ping, &now);
+			ping = true;
 			dump_peers(ckp);
+		}
 
 		for (i = 0; i < p2purls ; i++) {
 			p2p_conn_t *conn = get_peer(ckp, i);
@@ -1509,6 +1516,8 @@ static void *p2p_keepalive(void *arg)
 				continue;
 			}
 
+			if (!ping)
+				continue;
 			nonce = ((uint64_t)rand() << 32) | rand();
 			nonce_le = htole64(nonce);
 			p2p_send(conn, "ping", (uchar *)&nonce_le, 8);
