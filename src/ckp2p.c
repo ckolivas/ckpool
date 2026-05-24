@@ -510,9 +510,10 @@ static void evict_peer(p2p_conn_t *conn)
 
 static void evict_peerno(ckpool_t *ckp, int peer)
 {
-	p2p_conn_t *conn = ckp->p2pconn[peer];
+	p2p_conn_t *conn = get_peer(ckp, peer);
 
-	evict_peer(conn);
+	if (likely(conn))
+		evict_peer(conn);
 }
 
 /* Done under wlock peerlock for multiples */
