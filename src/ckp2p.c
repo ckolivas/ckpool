@@ -1814,7 +1814,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 	cklock_init(&peerlock);
 
 	if (ckp->externalip) {
-		connsock_t cslocal;
+		connsock_t cslocal = {};
 		int ip;
 
 		if (!extract_sockaddr(ckp->externalip, &cslocal.url, &cslocal.port)) {
