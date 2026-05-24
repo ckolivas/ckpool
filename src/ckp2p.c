@@ -505,21 +505,24 @@ static void evict_peerno(ckpool_t *ckp, int peer)
 static void _add_connector(p2p_conn_t *conn)
 {
 	wakelist_t *waker = NULL;
+	bool new = false;
 
 	HASH_FIND_INT(connector_wakes, &conn->peer, waker);
 	if (!waker) {
 		waker = ckalloc(sizeof(wakelist_t));
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
+		new = true;
 	}
 
-	if (waker)
+	if (new)
 		ckmsgq_add(p2p_connectors, conn);
 }
 
 static void add_connector(p2p_conn_t *conn)
 {
 	wakelist_t *waker = NULL;
+	bool new = false;
 
 	ck_wlock(&peerlock);
 	HASH_FIND_INT(connector_wakes, &conn->peer, waker);
@@ -527,16 +530,18 @@ static void add_connector(p2p_conn_t *conn)
 		waker = ckalloc(sizeof(wakelist_t));
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
+		new = true;
 	}
 	ck_wunlock(&peerlock);
 
-	if (waker)
+	if (new)
 		ckmsgq_add(p2p_connectors, conn);
 }
 
 static void add_reader(p2p_conn_t *conn)
 {
 	wakelist_t *waker = NULL;
+	bool new = false;
 
 	ck_wlock(&peerlock);
 	HASH_FIND_INT(reader_wakes, &conn->peer, waker);
@@ -544,10 +549,11 @@ static void add_reader(p2p_conn_t *conn)
 		waker = ckalloc(sizeof(wakelist_t));
 		waker->peer = conn->peer;
 		HASH_ADD_INT(reader_wakes, peer, waker);
+		new = true;
 	}
 	ck_wunlock(&peerlock);
 
-	if (waker)
+	if (new)
 		ckmsgq_add(p2p_readers, conn);
 }
 
