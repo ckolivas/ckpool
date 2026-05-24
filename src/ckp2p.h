@@ -8,13 +8,17 @@
  */
 #include "uthash.h"
 
-typedef struct peerlist {
+struct p2p_conn;
+
+struct peerlist {
 	UT_hash_handle hh;
 	char url[288];
-} peerlist_t;
+	struct p2p_conn *conn;
+};
 
+typedef struct peerlist peerlist_t;
 
-typedef struct {
+struct p2p_conn {
 	ckpool_t *ckp;
 	int sock;
 	uchar magic[4];
@@ -37,7 +41,9 @@ typedef struct {
 	bool incoming_only;
 	bool active;
 	peerlist_t *p2ppeer;
-} p2p_conn_t;
+};
+
+typedef struct p2p_conn p2p_conn_t;
 
 int prepare_ckp2p(ckpool_t *ckp);
 void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,

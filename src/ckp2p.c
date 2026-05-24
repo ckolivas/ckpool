@@ -1093,6 +1093,7 @@ static void *add_peer(void *arg)
 	_activate_conn(conn);
 
 	peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+	p2ppeer->conn = conn;
 	sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
 	HASH_ADD_STR(p2ppeers, url, conn->p2ppeer);
 	ck_wunlock(&peerlock);
@@ -1420,7 +1421,8 @@ out:
 /* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
 static void dump_peers(ckpool_t *ckp)
 {
-	int count = 0, i;
+	peerlist_t *p2ppeer;
+	int count = 0;
 	FILE *fp;
 
 	fp = fopen("peers.conf", "we");
@@ -1431,14 +1433,10 @@ static void dump_peers(ckpool_t *ckp)
 	fprintf(fp, "{\n\"p2purl\" : [");
 
 	ck_rlock(&peerlock);
-	for (i = 0; i < ckp->p2purls; i++) {
-		p2p_conn_t *conn = ckp->p2pconn[i];
+	for (p2ppeer = p2ppeers; p2ppeer!= NULL; p2ppeer = p2ppeer->hh.next) {
+		p2p_conn_t *conn = p2ppeer->conn;
 		struct in6_addr addr;
 
-		if (!conn)
-			continue;
-		if (conn->evicted)
-			continue;
 		if (conn->incoming_only)
 			continue;
 
@@ -1796,6 +1794,7 @@ static void *p2p_acceptor(void *arg)
 		_activate_conn(conn);
 
 		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+		p2ppeer->conn = conn;
 		sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
 		HASH_ADD_STR(p2ppeers, url, p2ppeer);
 		ck_wunlock(&peerlock);
@@ -1859,6 +1858,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 		cs = ckp->p2pcs[i];
 		p2p_conn_t *conn = ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
 		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+		p2ppeer->conn = conn;
 		sprintf(p2ppeer->url, "%s", ckp->p2purl[i]);
 		HASH_ADD_STR(p2ppeers, url, p2ppeer);
 	}
