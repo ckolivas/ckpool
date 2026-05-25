@@ -37,6 +37,7 @@ struct p2p_conn {
 	int port;
 	int peer;
 	tv_t last_alive;
+	tv_t last_attempt;
 	int reconnect;
 	bool evicted;
 	bool incoming_only;

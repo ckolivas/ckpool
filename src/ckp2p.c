@@ -222,6 +222,18 @@ static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
 	return false;
 }
 
+static void reset_reconnect(p2p_conn_t *conn)
+{
+	if (conn->peer < 0 || conn->peer > conn->ckp->prioclients)
+		conn->reconnect = KEEPALIVE_INTERVAL;
+}
+
+static void peer_alive(p2p_conn_t *conn)
+{
+	tv_time(&conn->last_alive);
+	reset_reconnect(conn);
+}
+
 static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, uint32_t plen)
 {
 	uchar hdr[24];
@@ -246,8 +258,7 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 		(plen && write_exact(conn->sock, payload, plen) != (ssize_t)plen)) {
 		LOGNOTICE("p2p_send(%s) failed to peer %d", cmd, conn->peer);
 	} else {
-		tv_time(&conn->last_alive);
-		conn->reconnect = KEEPALIVE_INTERVAL;
+		peer_alive(conn);
 		LOGINFO("Sent %s (%u bytes) to peer %d", cmd, plen, conn->peer);
 	}
 }
@@ -317,8 +328,7 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 		return false;
 	}
 
-	tv_time(&conn->last_alive);
-	conn->reconnect = KEEPALIVE_INTERVAL;
+	peer_alive(conn);
 	return true;
 }
 
@@ -553,6 +563,8 @@ static void add_connector(p2p_conn_t *conn)
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
 		new = true;
+		if (conn->peer > conn->ckp->prioclients)
+			tv_time(&conn->last_attempt);
 	}
 	ck_wunlock(&peerlock);
 
@@ -1131,9 +1143,7 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	memcpy(conn->genesis, netdefs[0].genesis, 32);
 	conn->netname = netdefs[0].name;
 	conn->peer = -1;
-	conn->reconnect = KEEPALIVE_INTERVAL;
-
-	tv_time(&conn->last_alive);
+	peer_alive(conn);
 
 	create_pthread(&pthread, add_peer, conn);
 }
@@ -1508,25 +1518,33 @@ static void *p2p_keepalive(void *arg)
 			if (conn->evicted)
 				continue;
 			if (!conn->handshake_done || conn->sock < 0) {
-				int unresponsive = 0, timeout = EVICT_TIMEOUT;
+				int attempted, timeout = EVICT_TIMEOUT;
+				bool prio;
 
 				if (conn->incoming_only) {
 					evict_peer(conn);
 					continue;
 				}
+
+				prio = (i < ckp->prioclients);
 				/* Never evict priority clients */
-				if (i >= ckp->prioclients)
-					unresponsive = tvdiff(&now, &conn->last_alive);
-				if (client_watermarks(ckp))
-					timeout = FAST_EVICT;
-				if (unresponsive >= timeout) {
-					LOGWARNING("Dropping peer %d unresponsive for %d seconds",
-						   conn->peer, unresponsive);
-					evict_peer(conn);
-					continue;
+				if (!prio) {
+					int unresponsive = tvdiff(&now, &conn->last_alive);
+
+					if (client_watermarks(ckp))
+						timeout = FAST_EVICT;
+					if (unresponsive >= timeout) {
+						LOGWARNING("Dropping peer %d unresponsive for %d seconds",
+							   conn->peer, unresponsive);
+						evict_peer(conn);
+						continue;
+					}
 				}
-				/* Double reconnect timeout each time */
-				if (unresponsive >= conn->reconnect) {
+
+				attempted = tvdiff(&now, &conn->last_attempt);
+				/* Double reconnect timeout each time. Priority
+				 * clients have a reconnect of 0 */
+				if (attempted >= conn->reconnect) {
 					if (conn->reconnect < 300)
 						conn->reconnect *= 2;
 					add_connector(conn);
@@ -1666,10 +1684,9 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	strncpy(conn->charport, charport, sizeof(conn->charport) - 1);
 	sscanf(charport, "%d", &port);
 	conn->port = port;
-	conn->reconnect = KEEPALIVE_INTERVAL;
 
 	/* Set initial attempted connection time */
-	tv_time(&conn->last_alive);
+	peer_alive(conn);
 
 	for (i = 0; netdefs[i].name; i++) {
 		if (netdefs[i].port == port) {
@@ -1771,9 +1788,8 @@ static void *p2p_acceptor(void *arg)
 		conn->port = port_num;
 		memcpy(conn->genesis, netdefs[0].genesis, 32);
 		conn->netname = netdefs[0].name;
-		conn->reconnect = KEEPALIVE_INTERVAL;
-		tv_time(&conn->last_alive);
 		conn->peer = -1;
+		peer_alive(conn);
 
 		if (!do_incoming_handshake(conn)) {
 			LOGINFO("Incoming handshake failed from %s:%d", host, port_num);
