@@ -1505,7 +1505,7 @@ static void *p2p_keepalive(void *arg)
 					continue;
 				}
 				/* Never evict priority clients */
-				if (i < ckp->prioclients)
+				if (i >= ckp->prioclients)
 					unresponsive = tvdiff(&now, &conn->last_alive);
 				if (client_watermarks(ckp))
 					timeout = FAST_EVICT;
