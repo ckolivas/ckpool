@@ -1842,23 +1842,24 @@ int prepare_ckp2p(ckpool_t *ckp)
 
 	if (ckp->externalip) {
 		connsock_t cslocal = {};
-		int ip;
+		struct in_addr addr;
 
 		if (!extract_sockaddr(ckp->externalip, &cslocal.url, &cslocal.port)) {
 			LOGEMERG("Failed to extract address from externalip %s", ckp->externalip);
 			return -1;
 		}
-		ip = inet_addr(cslocal.url);
+		if (inet_aton(cslocal.url, &addr) == 0) {
+			LOGEMERG("Failed to parse IP from externalip %s", ckp->externalip);
+			free(cslocal.url);
+			free(cslocal.port);
+			return -1;
+		}
 		sscanf(cslocal.port, "%d", &externalport);
 		if (!externalport)
 			externalport = CKP2P_LISTEN_PORT;
 		free(cslocal.url);
 		free(cslocal.port);
-		if (ip < 0) {
-			LOGEMERG("Failed to extract inet_addr from externalip %s", ckp->externalip);
-			return - 1;
-		}
-		externalip = ip;
+		externalip = addr.s_addr;
 	} else {
 		externalport = CKP2P_LISTEN_PORT;
 		ASPRINTF(&ckp->externalip, "127.0.0.1:%d", externalport);
