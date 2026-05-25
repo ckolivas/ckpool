@@ -1435,7 +1435,10 @@ static void dump_peers(ckpool_t *ckp)
 		LOGERR("Unable to fopen peers.conf in dump_peers");
 		return;
 	}
-	fprintf(fp, "{\n\"p2purl\" : [");
+	fprintf(fp, "{\n\"maxclients\" : %d,\n", ckp->maxclients);
+	fprintf(fp, "\"prioclients\" : %d,\n", ckp->prioclients);
+	fprintf(fp, "\"externalip\" : \"%s\",\n", ckp->externalip);
+	fprintf(fp, "\"p2purl\" : [");
 
 	ck_rlock(&peerlock);
 	for (p2ppeer = p2ppeers; p2ppeer!= NULL; p2ppeer = p2ppeer->hh.next) {
@@ -1850,8 +1853,10 @@ int prepare_ckp2p(ckpool_t *ckp)
 			return - 1;
 		}
 		externalip = ip;
-	} else
+	} else {
 		externalport = CKP2P_LISTEN_PORT;
+		ASPRINTF(&ckp->externalip, "127.0.0.1:%d", externalport);
+	}
 
 	if (ckp->p2purls > ckp->maxclients * 4 / 3) {
 		ckp->p2purls = ckp->maxclients * 4 / 3;
