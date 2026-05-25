@@ -247,6 +247,7 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 		LOGNOTICE("p2p_send(%s) failed to peer %d", cmd, conn->peer);
 	} else {
 		tv_time(&conn->last_alive);
+		conn->reconnect = KEEPALIVE_INTERVAL;
 		LOGINFO("Sent %s (%u bytes) to peer %d", cmd, plen, conn->peer);
 	}
 }
@@ -317,6 +318,7 @@ static bool p2p_recv(p2p_conn_t *conn, char cmd[13], uchar **payload, uint32_t *
 	}
 
 	tv_time(&conn->last_alive);
+	conn->reconnect = KEEPALIVE_INTERVAL;
 	return true;
 }
 
@@ -912,7 +914,7 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 }
 
 /* called while holding peerlock */
-static bool _dup_peer(ckpool_t *ckp, const char *host, int port)
+static bool _dup_peer(const char *host, int port)
 {
 	peerlist_t *p2ppeer = NULL;
 	bool ret = false;
@@ -925,12 +927,12 @@ static bool _dup_peer(ckpool_t *ckp, const char *host, int port)
 	return ret;
 }
 
-static bool dup_peer(ckpool_t *ckp, const char *host, int port)
+static bool dup_peer(const char *host, int port)
 {
 	bool ret;
 
 	ck_rlock(&peerlock);
-	ret = _dup_peer(ckp, host, port);
+	ret = _dup_peer(host, port);
 	ck_runlock(&peerlock);
 
 	return ret;
@@ -965,7 +967,7 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 				adv_port = P2P_LISTEN_PORT; /* Set to default if we don't get it */
 			conn->port = adv_port;
 			snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
-			if (dup_peer(conn->ckp, conn->host, conn->port)) {
+			if (dup_peer(conn->host, conn->port)) {
 				LOGNOTICE("Duplicate incoming peer %s:%s, will not reconnect if dropped", conn->host, conn->charport);
 				conn->incoming_only = true;
 			}
@@ -1055,7 +1057,7 @@ static void *add_peer(void *arg)
 
 	ck_wlock(&peerlock);
 	/* Do another check for duplicates under lock */
-	if (unlikely(_dup_peer(ckp, conn->host, conn->port))) {
+	if (unlikely(_dup_peer(conn->host, conn->port))) {
 		ck_wunlock(&peerlock);
 		LOGINFO("Skipping duplicate peer %s:%d", conn->host, conn->port);
 		disconnect_conn(conn);
@@ -1121,8 +1123,6 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	conn = ckzalloc(sizeof(*conn));
 	conn->ckp = ckp;
 	cklock_init(&conn->block_lock);
-	conn->cmpct_payload = NULL;
-	conn->has_block = false;
 	conn->sock = -1;
 	strncpy(conn->host, host, sizeof(conn->host) - 1);
 	snprintf(conn->charport, sizeof(conn->charport), "%d", port);
@@ -1131,6 +1131,7 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	memcpy(conn->genesis, netdefs[0].genesis, 32);
 	conn->netname = netdefs[0].name;
 	conn->peer = -1;
+	conn->reconnect = KEEPALIVE_INTERVAL;
 
 	tv_time(&conn->last_alive);
 
@@ -1229,7 +1230,7 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 		if (port == 0)
 			port = 8333;   /* default Bitcoin port if not specified */
 
-		if (!dup_peer(ckp, host, port))
+		if (!dup_peer(host, port))
 			add_peer_async(ckp, host, port);
 		else
 			LOGINFO("Dup addrv2: %s:%d", host, port);
@@ -1524,8 +1525,12 @@ static void *p2p_keepalive(void *arg)
 					evict_peer(conn);
 					continue;
 				}
-				/* Tell p2p_connectors to try reconnecting */
-				add_connector(conn);
+				/* Double reconnect timeout each time */
+				if (unresponsive >= conn->reconnect) {
+					if (conn->reconnect < 300)
+						conn->reconnect *= 2;
+					add_connector(conn);
+				}
 				continue;
 			}
 
@@ -1656,15 +1661,12 @@ static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *ch
 	conn->ckp = ckp;
 	cklock_init(&conn->block_lock);
 	conn->peer = source;
-	conn->cmpct_payload = NULL;
-	conn->has_block = false;
-	conn->handshake_done = false;
 	conn->sock = -1;
 	strncpy(conn->host, host, sizeof(conn->host) - 1);
 	strncpy(conn->charport, charport, sizeof(conn->charport) - 1);
 	sscanf(charport, "%d", &port);
 	conn->port = port;
-	memset(conn->magic, 0, 4); // unset
+	conn->reconnect = KEEPALIVE_INTERVAL;
 
 	/* Set initial attempted connection time */
 	tv_time(&conn->last_alive);
@@ -1767,10 +1769,9 @@ static void *p2p_acceptor(void *arg)
 		strncpy(conn->host, host, sizeof(conn->host) - 1);
 		strncpy(conn->charport, serv, sizeof(conn->charport) - 1);
 		conn->port = port_num;
-		memset(conn->magic, 0, 4); /* auto-detect */
 		memcpy(conn->genesis, netdefs[0].genesis, 32);
 		conn->netname = netdefs[0].name;
-		conn->cmpct_payload = NULL;
+		conn->reconnect = KEEPALIVE_INTERVAL;
 		tv_time(&conn->last_alive);
 		conn->peer = -1;
 
