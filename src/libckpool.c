@@ -1988,6 +1988,14 @@ void ts_realtime(ts_t *ts)
 	clock_gettime(CLOCK_REALTIME, ts);
 }
 
+void tv_monotonic(tv_t *tv)
+{
+	ts_t now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	ts_to_tv(tv, &now);
+}
+
 void cksleep_prepare_r(ts_t *ts)
 {
 	clock_gettime(CLOCK_MONOTONIC, ts);
