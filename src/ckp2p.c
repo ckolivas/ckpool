@@ -230,7 +230,7 @@ static void reset_reconnect(p2p_conn_t *conn)
 
 static void peer_alive(p2p_conn_t *conn)
 {
-	tv_time(&conn->last_alive);
+	tv_monotonic(&conn->last_alive);
 	reset_reconnect(conn);
 }
 
@@ -564,7 +564,7 @@ static void add_connector(p2p_conn_t *conn)
 		HASH_ADD_INT(connector_wakes, peer, waker);
 		new = true;
 		if (conn->peer > conn->ckp->prioclients)
-			tv_time(&conn->last_attempt);
+			tv_monotonic(&conn->last_attempt);
 	}
 	ck_wunlock(&peerlock);
 
@@ -1474,11 +1474,11 @@ static void dump_peers(ckpool_t *ckp)
 
 static void *p2p_keepalive(void *arg)
 {
-	tv_t last_ping;
 	ckpool_t *ckp = arg;
 	ts_t last_update;
+	tv_t last_ping;
 
-	tv_time(&last_ping);
+	tv_monotonic(&last_ping);
 	cksleep_prepare_r(&last_update);
 
 	pthread_detach(pthread_self());
