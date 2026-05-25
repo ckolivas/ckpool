@@ -1463,10 +1463,13 @@ static void dump_peers(ckpool_t *ckp)
 
 static void *p2p_keepalive(void *arg)
 {
-	static tv_t last_ping;
+	tv_t last_ping;
 	ckpool_t *ckp = arg;
+	ts_t last_update;
 
 	tv_time(&last_ping);
+	cksleep_prepare_r(&last_update);
+
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pk");
 
@@ -1484,8 +1487,11 @@ static void *p2p_keepalive(void *arg)
 		       total_conns, active_conns);
 		fflush(NULL);
 #endif
-		sleep(KEEPALIVE_INTERVAL);
-		tv_time(&now);
+		/* Use re-entrant function since it can take a while to get
+		 * back here with many peers */
+		cksleep_ms_r(&last_update, KEEPALIVE_INTERVAL * 1000);
+		cksleep_prepare_r(&last_update);
+		ts_to_tv(&now, &last_update);
 
 		if (tvdiff(&now, &last_ping) > PING_INTERVAL) {
 			copy_tv(&last_ping, &now);
