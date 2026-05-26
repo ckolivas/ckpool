@@ -32,6 +32,8 @@
 #define MSG_WITNESS_FLAG (1U << 30)
 #define MSG_WITNESS_BLOCK (MSG_BLOCK | MSG_WITNESS_FLAG)
 #define MSG_CMPCT_BLOCK 4
+#define MSG_TX 1
+#define MSG_WITNESS_TX (MSG_TX | MSG_WITNESS_FLAG)
 #define KEEPALIVE_INTERVAL 5
 #define PING_INTERVAL 120
 #define FAST_EVICT 600
@@ -691,6 +693,7 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
 	bool has_block = false;
+	bool has_tx = false;
 	int64_t i, count = parse_varint(payload, plen, &pos);
 
 	if (count < 0 || count > 500) {
@@ -718,12 +721,22 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 			memcpy(getdata_payload + 1, &req_type_le, 4);
 			memcpy(getdata_payload + 5, hash, 32);
 			p2p_send(conn, "getdata", getdata_payload, 37);
+		} else if (type == MSG_TX || type == MSG_WITNESS_TX) {
+			has_tx = true;
+			uchar getdata_payload[37];
+			getdata_payload[0] = 1;
+			uint32_t req_type_le = htole32(type);
+			memcpy(getdata_payload + 1, &req_type_le, 4);
+			memcpy(getdata_payload + 5, hash, 32);
+			p2p_send(conn, "getdata", getdata_payload, 37);
 		}
 	}
 	if (has_block)
 		LOGINFO("Received INV (%u bytes) - requesting cmpctblock for blocks", plen);
-	else
-		LOGDEBUG("Received INV (%u bytes) - ignoring transaction announcements", plen);
+	if (has_tx)
+		LOGINFO("Received INV (%u bytes) - requesting tx data", plen);
+	if (!has_block && !has_tx)
+		LOGDEBUG("Received INV (%u bytes) - ignoring other announcements", plen);
 	dealloc(payload);
 }
 
@@ -774,6 +787,27 @@ static bool hash_meets_target(const uchar *hash, uint32_t bits)
 static int blockcmp(blocklist_t *a, uchar *b)
 {
 	return memcmp(a->hash, b, 32);
+}
+
+static void handle_tx(uchar *payload, uint32_t plen)
+{
+	uchar h1[32], txhash[32];
+	char fliphash[32], hexhash[68];
+
+	if (plen < 60) {
+		dealloc(payload);
+		return;
+	}
+
+	sha256(payload, plen, h1);
+	sha256(h1, 32, txhash);
+
+	bswap_256(fliphash, txhash);
+	__bin2hex(hexhash, fliphash, 32);
+
+	LOGINFO("Received TX (%u bytes) hash %s", plen, hexhash);
+
+	dealloc(payload);
 }
 
 /* Function for testing cmpctblock validity by echoing back any received */
@@ -1392,7 +1426,9 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		handle_cmpctblock(ckp, payload, plen, conn->peer);
 		goto rearm;
 	} else if (!strcmp(cmd, "tx")) {
-		LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
+		LOGDEBUG("Received TX (%u bytes) - parsing transaction data.", plen);
+		handle_tx(payload, plen);
+		goto rearm;
 	} else if (!strcmp(cmd, "block")) {
 		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
 	} else if (!strcmp(cmd, "blocktxn")) {
