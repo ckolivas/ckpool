@@ -90,6 +90,15 @@ static wakelist_t *reader_wakes, *connector_wakes;
 
 static peerlist_t *p2ppeers;
 
+typedef struct txhashlist {
+	UT_hash_handle hh;
+	char hash[68];
+} txhashlist_t;
+
+static txhashlist_t *txhashes;
+static cklock_t txlock;
+static uint64_t tx_count;
+
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
 {
@@ -789,10 +798,11 @@ static int blockcmp(blocklist_t *a, uchar *b)
 	return memcmp(a->hash, b, 32);
 }
 
-static void handle_tx(uchar *payload, uint32_t plen)
+static void handle_tx(ckpool_t *ckp, uchar *payload, uint32_t plen)
 {
 	uchar h1[32], txhash[32];
 	char fliphash[32], hexhash[68];
+	char txhex[68];
 
 	if (plen < 60) {
 		dealloc(payload);
@@ -804,8 +814,50 @@ static void handle_tx(uchar *payload, uint32_t plen)
 
 	bswap_256(fliphash, txhash);
 	__bin2hex(hexhash, fliphash, 32);
+	__bin2hex(txhex, txhash, 32);
 
 	LOGINFO("Received TX (%u bytes) hash %s", plen, hexhash);
+
+	ck_wlock(&txlock);
+	txhashlist_t *existing = NULL;
+	HASH_FIND_STR(txhashes, txhex, existing);
+	if (existing) {
+		ck_wunlock(&txlock);
+		dealloc(payload);
+		return;
+	}
+
+	/* New transaction */
+	txhashlist_t *new_entry = ckalloc(sizeof(txhashlist_t));
+	memcpy(new_entry->hash, txhex, 67);
+	new_entry->hash[64] = '\0';
+	HASH_ADD_STR(txhashes, hash, new_entry);
+	tx_count++;
+
+	bool need_prune = (tx_count >= 100000);
+	ck_wunlock(&txlock);
+
+	/* Relay new tx to priority peers */
+	for (int i = 0; i < ckp->prioclients; i++) {
+		p2p_conn_t *conn = get_peer(ckp, i);
+		if (conn && conn->sock >= 0 && conn->handshake_done)
+			p2p_send(conn, "tx", payload, plen);
+	}
+
+	if (need_prune) {
+		ck_wlock(&txlock);
+		txhashlist_t *entry = txhashes;
+		int pruned = 0;
+		while (pruned < 1000 && entry) {
+			txhashlist_t *next = (txhashlist_t *)entry->hh.next;
+			HASH_DEL(txhashes, entry);
+			dealloc(entry);
+			entry = next;
+			pruned++;
+			tx_count--;
+		}
+		ck_wunlock(&txlock);
+	}
 
 	dealloc(payload);
 }
@@ -1427,7 +1479,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		goto rearm;
 	} else if (!strcmp(cmd, "tx")) {
 		LOGDEBUG("Received TX (%u bytes) - parsing transaction data.", plen);
-		handle_tx(payload, plen);
+		handle_tx(ckp, payload, plen);
 		goto rearm;
 	} else if (!strcmp(cmd, "block")) {
 		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
@@ -1892,6 +1944,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 
 	cklock_init(&curblock.lock);
 	cklock_init(&peerlock);
+	cklock_init(&txlock);
 
 	if (ckp->externalip) {
 		connsock_t cslocal = {};
