@@ -391,7 +391,7 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 	memcpy(version_payload + off, &height_le, sizeof(height_le));
 	off += sizeof(height_le);
 
-	version_payload[off++] = 0; /* relay = 0 */
+	version_payload[off++] = 1; /* relay txns = 1 */
 
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 }
