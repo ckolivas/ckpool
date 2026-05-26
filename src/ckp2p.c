@@ -96,7 +96,7 @@ typedef struct txhashlist {
 } txhashlist_t;
 
 static txhashlist_t *txhashes;
-static cklock_t txlock;
+static mutex_t txlock;
 static uint64_t tx_count;
 
 /* Check if magic is unset (all zeros) */
@@ -818,13 +818,12 @@ static void handle_tx(ckpool_t *ckp, uchar *payload, uint32_t plen)
 
 	LOGINFO("Received TX (%u bytes) hash %s", plen, hexhash);
 
-	ck_wlock(&txlock);
+	mutex_lock(&txlock);
 	txhashlist_t *existing = NULL;
 	HASH_FIND_STR(txhashes, txhex, existing);
 	if (existing) {
-		ck_wunlock(&txlock);
-		dealloc(payload);
-		return;
+		mutex_unlock(&txlock);
+		goto out;
 	}
 
 	/* New transaction */
@@ -835,7 +834,7 @@ static void handle_tx(ckpool_t *ckp, uchar *payload, uint32_t plen)
 	tx_count++;
 
 	bool need_prune = (tx_count >= 100000);
-	ck_wunlock(&txlock);
+	mutex_unlock(&txlock);
 
 	/* Relay new tx to priority peers */
 	for (int i = 0; i < ckp->prioclients; i++) {
@@ -845,7 +844,7 @@ static void handle_tx(ckpool_t *ckp, uchar *payload, uint32_t plen)
 	}
 
 	if (need_prune) {
-		ck_wlock(&txlock);
+		mutex_lock(&txlock);
 		txhashlist_t *entry = txhashes;
 		int pruned = 0;
 		while (pruned < 1000 && entry) {
@@ -856,9 +855,9 @@ static void handle_tx(ckpool_t *ckp, uchar *payload, uint32_t plen)
 			pruned++;
 			tx_count--;
 		}
-		ck_wunlock(&txlock);
+		mutex_unlock(&txlock);
 	}
-
+out:
 	dealloc(payload);
 }
 
@@ -1944,7 +1943,7 @@ int prepare_ckp2p(ckpool_t *ckp)
 
 	cklock_init(&curblock.lock);
 	cklock_init(&peerlock);
-	cklock_init(&txlock);
+	mutex_init(&txlock);
 
 	if (ckp->externalip) {
 		connsock_t cslocal = {};
