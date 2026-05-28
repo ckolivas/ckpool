@@ -1590,7 +1590,7 @@ static void *submission_thread(void *arg)
 	p2purls = ckp->p2purls;
 	ck_runlock(&peerlock);
 
-	priosource = (cbt->source < ckp->prioclients);
+	priosource = cbt->source < ckp->prioclients ? true : false;
 
 	for (i = 0; i < p2purls; i++) {
 		p2p_conn_t *conn;
