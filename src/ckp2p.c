@@ -1770,7 +1770,7 @@ static void *p2p_acceptor(void *arg)
 		socklen_t clen = sizeof(client_addr);
 		int newsock;
 
-		while (pause_clients(ckp))
+		while (client_watermarks(ckp))
 			sleep(KEEPALIVE_INTERVAL);
 		newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
 		if (newsock < 0) {
