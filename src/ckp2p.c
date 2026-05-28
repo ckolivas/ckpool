@@ -1581,6 +1581,7 @@ static void *submission_thread(void *arg)
 	char fliphash[32], hex[68];
 	ckpool_t *ckp = cbt->ckp;
 	int i, submitted = 0;
+	bool priosource;
 	int p2purls;
 
 	pthread_detach(pthread_self());
@@ -1589,8 +1590,15 @@ static void *submission_thread(void *arg)
 	p2purls = ckp->p2purls;
 	ck_runlock(&peerlock);
 
+	priosource = (cbt->source < ckp->prioclients);
+
 	for (i = 0; i < p2purls; i++) {
 		p2p_conn_t *conn;
+
+		/* Only relay to prioclients unless the compact block has come
+		 * from a priority source */
+		if (!priosource && i >= ckp->prioclients)
+			break;
 
 		if (i == cbt->source) {
 			LOGDEBUG("Skipping relaying compact block to source node %d", i);
