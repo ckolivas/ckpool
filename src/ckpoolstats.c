@@ -526,8 +526,10 @@ workers_only:
 
 			ASPRINTF(&s, "%s/users/%s", sdir, username);
 			fp = fopen(s, "re");
-			if (!fp)
-				fail("Failed to open user %s", username);
+			if (!fp) {
+				log("Failed to open user %s", username);
+				continue;
+			}
 			val = json_load_file(s, 0, NULL);
 			if (!val) /* Invalid or not user file */
 				continue;
