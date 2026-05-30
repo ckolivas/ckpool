@@ -12,7 +12,6 @@
 #include <stdio.h>
 
 #include "libckpool.h"
-#include "ckpool.h"
 
 #define log(fmt, ...) do { \
 	printf(fmt, ##__VA_ARGS__); \
@@ -67,10 +66,10 @@ pstats_t allpstats;
 dsps_t alldsps;
 sps_t allsps;
 
-bool json_get_int64(int64_t *store, const json_t *val, const char *res)
+int64_t json_get_int64(int64_t *store, const json_t *val, const char *res)
 {
 	json_t *entry = json_object_get(val, res);
-	bool ret = false;
+	*store = 0;
 
 	if (!entry) {
 		LOGDEBUG("Json did not find entry %s", res);
@@ -82,15 +81,14 @@ bool json_get_int64(int64_t *store, const json_t *val, const char *res)
 	}
 	*store = json_integer_value(entry);
 	LOGDEBUG("Json found entry %s: %"PRId64, res, *store);
-	ret = true;
 out:
-	return ret;
+	return *store;
 }
 
-bool json_get_double(double *store, const json_t *val, const char *res)
+double json_get_double(double *store, const json_t *val, const char *res)
 {
 	json_t *entry = json_object_get(val, res);
-	bool ret = false;
+	*store = 0;
 
 	if (!entry) {
 		LOGDEBUG("Json did not find entry %s", res);
@@ -102,8 +100,63 @@ bool json_get_double(double *store, const json_t *val, const char *res)
 	}
 	*store = json_real_value(entry);
 	LOGDEBUG("Json found entry %s: %f", res, *store);
+out:
+	return *store;
+}
+
+const double nonces = 4294967296;
+
+bool json_get_string(char **store, const json_t *entry, const char *res)
+{
+	bool ret = false;
+	const char *buf;
+
+	*store = NULL;
+	if (!entry || json_is_null(entry)) {
+		LOGDEBUG("Json did not find entry %s", res);
+		goto out;
+	}
+	if (!json_is_string(entry)) {
+		LOGWARNING("Json entry %s is not a string", res);
+		goto out;
+	}
+	buf = json_string_value(entry);
+	LOGDEBUG("Json found entry %s: %s", res, buf);
+	*store = strdup(buf);
 	ret = true;
 out:
+	return ret;
+}
+
+/* Fallthrough intentional */
+double dsps_from_key(json_t *val, const char *key)
+{
+	char *string, *endptr;
+	double ret = 0;
+
+	json_get_string(&string, val, key);
+	if (!string)
+		return ret;
+	ret = strtod(string, &endptr) / nonces;
+	if (endptr) {
+		switch (endptr[0]) {
+			case 'E':
+				ret *= (double)1000;
+			case 'P':
+				ret *= (double)1000;
+			case 'T':
+				ret *= (double)1000;
+			case 'G':
+				ret *= (double)1000;
+			case 'M':
+				ret *= (double)1000;
+			case 'K':
+				ret *= (double)1000;
+			default:
+				break;
+		}
+	}
+	free(string);
 	return ret;
 }
 
@@ -132,10 +185,10 @@ void read_poolstats(FILE *fp)
 		fail("Failed to json decode pstats line from pool logfile: %s", pstats);
 	json_get_int64(&poolpstats.runtime, val, "runtime");
 	json_get_int64(&poolpstats.lastupdate, val, "lastupdate");
-	json_get_int64(&poolpstats.users, val, "Users");
-	json_get_int64(&poolpstats.workers, val, "Workers");
-	json_get_int64(&poolpstats.idle, val, "Idle");
-	json_get_int64(&poolpstats.disconnected, val, "Disconnected");
+	allpstats.users += json_get_int64(&poolpstats.users, val, "Users");
+	allpstats.workers += json_get_int64(&poolpstats.workers, val, "Workers");
+	allpstats.idle += json_get_int64(&poolpstats.idle, val, "Idle");
+	allpstats.disconnected += json_get_int64(&poolpstats.disconnected, val, "Disconnected");
 	json_decref(val);
 
 	/* Pessimise these two values from worst stats */
@@ -143,14 +196,17 @@ void read_poolstats(FILE *fp)
 		allpstats.runtime = poolpstats.runtime;
 	if (!allpstats.lastupdate || allpstats.lastupdate > poolpstats.lastupdate)
 		allpstats.lastupdate = poolpstats.lastupdate;
-	allpstats.users += poolpstats.users;
-	allpstats.workers += poolpstats.workers;
-	allpstats.idle += poolpstats.idle;
-	allpstats.disconnected += poolpstats.disconnected;
 
 	val = json_loads(dsps, 0, NULL);
 	if (!val)
 		fail("Failed to json decode dsps line from pool logfile: %s", sps);
+	alldsps.hashrate1m += pooldsps.hashrate1m = dsps_from_key(val, "hashrate1m");
+	alldsps.hashrate5m += pooldsps.hashrate5m = dsps_from_key(val, "hashrate5m");
+	alldsps.hashrate15m += pooldsps.hashrate15m = dsps_from_key(val, "hashrate15m");
+	alldsps.hashrate1hr += pooldsps.hashrate1hr = dsps_from_key(val, "hashrate1hr");
+	alldsps.hashrate6hr += pooldsps.hashrate6hr = dsps_from_key(val, "hashrate6hr");
+	alldsps.hashrate1d += pooldsps.hashrate1d = dsps_from_key(val, "hashrate1d");
+	alldsps.hashrate7d += pooldsps.hashrate7d = dsps_from_key(val, "hashrate7d");
 	json_decref(val);
 
 	val = json_loads(sps, 0, NULL);
