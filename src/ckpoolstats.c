@@ -414,6 +414,8 @@ int main(int argc, char __maybe_unused **argv)
 	if (parse_workers)
 		goto workers_only;
 
+	umask(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+
 	/* Read pool stats from each entry and create allstats */
 	json_array_foreach(dirs, index, val) {
 		const char *dir = json_string_value(val);
