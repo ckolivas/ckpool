@@ -164,7 +164,6 @@ void read_poolstats(FILE *fp)
 {
 	char *s = alloca(4096), *pstats, *dsps, *sps;
 	pstats_t poolpstats = {};
-	dsps_t pooldsps = {};
 	sps_t poolsps = {};
 	json_t *val;
 	int ret;
@@ -200,18 +199,27 @@ void read_poolstats(FILE *fp)
 	val = json_loads(dsps, 0, NULL);
 	if (!val)
 		fail("Failed to json decode dsps line from pool logfile: %s", sps);
-	alldsps.hashrate1m += pooldsps.hashrate1m = dsps_from_key(val, "hashrate1m");
-	alldsps.hashrate5m += pooldsps.hashrate5m = dsps_from_key(val, "hashrate5m");
-	alldsps.hashrate15m += pooldsps.hashrate15m = dsps_from_key(val, "hashrate15m");
-	alldsps.hashrate1hr += pooldsps.hashrate1hr = dsps_from_key(val, "hashrate1hr");
-	alldsps.hashrate6hr += pooldsps.hashrate6hr = dsps_from_key(val, "hashrate6hr");
-	alldsps.hashrate1d += pooldsps.hashrate1d = dsps_from_key(val, "hashrate1d");
-	alldsps.hashrate7d += pooldsps.hashrate7d = dsps_from_key(val, "hashrate7d");
+	alldsps.hashrate1m += dsps_from_key(val, "hashrate1m");
+	alldsps.hashrate5m += dsps_from_key(val, "hashrate5m");
+	alldsps.hashrate15m += dsps_from_key(val, "hashrate15m");
+	alldsps.hashrate1hr += dsps_from_key(val, "hashrate1hr");
+	alldsps.hashrate6hr += dsps_from_key(val, "hashrate6hr");
+	alldsps.hashrate1d += dsps_from_key(val, "hashrate1d");
+	alldsps.hashrate7d += dsps_from_key(val, "hashrate7d");
 	json_decref(val);
 
 	val = json_loads(sps, 0, NULL);
 	if (!val)
 		fail("Failed to json decode sps line from pool logfile: %s", dsps);
+	allsps.diff += json_get_double(&poolsps.diff, val , "diff");
+	allsps.sps1m += json_get_double(&poolsps.sps1m, val, "sps1m");
+	allsps.sps5m += json_get_double(&poolsps.sps5m, val, "sps5m");
+	allsps.sps15m += json_get_double(&poolsps.sps15m, val, "sps15m");
+	allsps.accepted += json_get_int64(&poolsps.accepted, val, "accepted");
+	allsps.rejected += json_get_int64(&poolsps.rejected, val, "rejected");
+	json_get_int64(&poolsps.bestshare, val, "bestshare");
+	if (poolsps.bestshare > allsps.bestshare)
+		allsps.bestshare = poolsps.bestshare;
 	json_decref(val);
 }
 
