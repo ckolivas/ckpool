@@ -56,6 +56,7 @@ typedef struct {
 	double sps1m;
 	double sps5m;
 	double sps15m;
+	double sps1h;
 	int64_t accepted;
 	int64_t rejected;
 	int64_t bestshare;
@@ -217,6 +218,7 @@ void read_poolstats(FILE *fp)
 	allsps.sps1m += json_get_double(&poolsps.sps1m, val, "SPS1m");
 	allsps.sps5m += json_get_double(&poolsps.sps5m, val, "SPS5m");
 	allsps.sps15m += json_get_double(&poolsps.sps15m, val, "SPS15m");
+	allsps.sps1h += json_get_double(&poolsps.sps1h, val, "SPS1h");
 	allsps.accepted += json_get_int64(&poolsps.accepted, val, "accepted");
 	allsps.rejected += json_get_int64(&poolsps.rejected, val, "rejected");
 	json_get_int64(&poolsps.bestshare, val, "bestshare");
@@ -305,6 +307,19 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	free(s);
 	json_decref(val);
 
+	JSON_CPACK(val,"{sf,sI,sI,sI,sf,sf,sf,sf}",
+		   "diff", allsps.diff,
+	    "accepted", allsps.accepted,
+	    "rejected", allsps.rejected,
+	    "bestshare", allsps.bestshare,
+	    "SPS1m", allsps.sps1m,
+	    "SPS5m", allsps.sps5m,
+	    "SPS15m", allsps.sps15m,
+	    "SPS1h", allsps.sps1h);
+	s = json_dumps(val, JSON_PRESERVE_ORDER);
+	log("Allstats sps %s", s);
+	free(s);
+	json_decref(val);
 
 	json_decref(conf);
 
