@@ -6,6 +6,7 @@
  * Software Foundation; either version 3 of the License, or (at your option)
  * any later version.  See COPYING for more details.
  */
+#define _GNU_SOURCE
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -31,10 +32,45 @@
 	exit(1); \
 } while(0)
 
+void read_poolstats(FILE *fp)
+{
+	char *s = alloca(4096), *pstats, *dsps, *sps;
+	json_t *val;
+	int ret;
+
+	memset(s, 0, 4096);
+	ret = fread(s, 1, 4095, fp);
+	if (ret < 1 || !strlen(s))
+		fail("No string to read in pool logfile");
+
+	/* Strip out end of line terminators */
+	pstats = strsep(&s, "\n");
+	dsps = strsep(&s, "\n");
+	sps = strsep(&s, "\n");
+	if (!s)
+		fail("Failed to find EOL in pool logfile");
+	val = json_loads(pstats, 0, NULL);
+	if (!val)
+		fail("Failed to json decode pstats line from pool logfile: %s", pstats);
+	json_decref(val);
+
+	val = json_loads(dsps, 0, NULL);
+	if (!val)
+		fail("Failed to json decode dsps line from pool logfile: %s", sps);
+	json_decref(val);
+
+	val = json_loads(sps, 0, NULL);
+	if (!val)
+		fail("Failed to json decode sps line from pool logfile: %s", dsps);
+	json_decref(val);
+}
+
 int main(int __maybe_unused argc, char __maybe_unused **argv)
 {
 	json_t *conf, *dirs, *val;
 	size_t index;
+	FILE *fp;
+	char *s;
 
 	conf = json_load_file("ckpoolstats.conf", 0, NULL);
 	if (!conf)
@@ -45,7 +81,17 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 
 	json_array_foreach(dirs, index, val) {
 		const char *dir = json_string_value(val);
-		log("Found dir %s", dir);
+
+		log("Found dir entry %s", dir);
+		ASPRINTF(&s, "%s/pool/pool.status", dir);
+		fp = fopen(s, "re");
+		if (fp)
+			log("Opened %s", s);
+		else
+			fail("Failed to open %s", s);
+		read_poolstats(fp);
+		fclose(fp);
+		free(s);
 	}
 
 	json_decref(conf);
