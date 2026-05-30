@@ -1938,7 +1938,7 @@ int main(int argc, char **argv)
 	ret = sysconf(_SC_OPEN_MAX);
 #if CKP2P
 	if (!ckp.maxclients)
-		ckp.maxclients = 1024;
+		ckp.maxclients = 4000;
 	if (!ckp.prioclients)
 		ckp.prioclients = 1;
 #endif
