@@ -11,8 +11,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "libckpool.h"
+#include "uthash.h"
 
 #define log(fmt, ...) do { \
 	printf(fmt, ##__VA_ARGS__); \
@@ -67,6 +69,15 @@ typedef struct {
 pstats_t allpstats;
 dsps_t alldsps;
 sps_t allsps;
+
+typedef struct {
+	UT_hash_handle hh;
+
+	char username[128];
+	json_t *json;
+} user_t;
+
+user_t *users;
 
 int64_t json_get_int64(int64_t *store, const json_t *val, const char *res)
 {
@@ -228,6 +239,40 @@ void read_poolstats(FILE *fp)
 	json_decref(val);
 }
 
+user_t *get_user(const char *username, bool *new)
+{
+	user_t *user = NULL;
+
+	HASH_FIND_STR(users, username, user);
+	if (!user) {
+		user = ckzalloc(sizeof(user_t));
+		strcpy(user->username, username);
+		HASH_ADD_STR(users, username, user);
+		*new = true;
+	}
+	return user;
+}
+
+/* FIXME, user stats need appending */
+void append_workers(user_t *user, json_t *val)
+{
+	json_t *newworkers = json_object_get(val, "worker");
+	json_t *workers = json_object_get(user->json, "worker");
+	json_t *worker;
+	size_t index;
+
+	if (!workers) {
+		log("No workers for %s", user->username);
+		/* Shouldn't happen */
+		json_object_set(user->json, "worker", json_array());
+		workers = json_object_get(user->json, "worker");
+	}
+	if (!newworkers || !json_is_array(newworkers))
+		return;
+	json_array_foreach(newworkers, index, worker)
+		json_array_append(workers, worker);
+}
+
 int main(int __maybe_unused argc, char __maybe_unused **argv)
 {
 	double ghs1, ghs5, ghs15, ghs60, ghs360, ghs1440, ghs10080;
@@ -245,6 +290,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	if (!dirs || !json_is_array(dirs))
 		fail("dirs array not found");
 
+	/* Read pool stats from each entry and create allstats */
 	json_array_foreach(dirs, index, val) {
 		const char *dir = json_string_value(val);
 
@@ -260,6 +306,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 		free(s);
 	}
 
+	/* Write pool.status for allstats */
 	if (mkdir("pool", 0750) && errno != EEXIST)
 		fail("Failed to create pool directory");
 	fp = fopen("pool/pool.status", "we");
@@ -330,6 +377,62 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	log("Allstats sps %s", s);
 	free(s);
 	json_decref(val);
+
+	json_array_foreach(dirs, index, val) {
+		struct dirent *dir;
+		struct stat fdbuf;
+		char *username;
+		DIR *d;
+		const char *sdir = json_string_value(val);
+
+		ASPRINTF(&s, "%s/users", sdir);
+		d = opendir(s);
+		if (!d)
+			fail("Failed to open users directory %s", s);
+		free(s);
+
+		while ((dir = readdir(d)) != NULL) {
+			user_t *user = NULL;
+			bool new = false;
+
+			username = basename(dir->d_name);
+			if (!strcmp(username, "/") || !strcmp(username, ".") || !strcmp(username, ".."))
+				continue;
+
+			ASPRINTF(&s, "%s/users/%s", sdir, username);
+			fp = fopen(s, "re");
+			if (!fp)
+				fail("Failed to open user %s", username);
+			val = json_load_file(s, 0, NULL);
+			if (!val) /* Invalid or not user file */
+				continue;
+			free(s);
+			user = get_user(username, &new);
+			if (new)
+				user->json = val;
+			else {
+				append_workers(user, val);
+				json_decref(val);
+			}
+			fclose(fp);
+		}
+		closedir(d);
+	}
+
+	user_t *user;
+
+	if (mkdir("users", 0750) && errno != EEXIST)
+		fail("Failed to create users directory");
+
+	for (user = users; user != NULL; user = user->hh.next) {
+		ASPRINTF(&s, "users/%s", user->username);
+		fp = fopen(s, "we");
+		free(s);
+		if (!fp)
+			fail("Failed to write user %s", user->username);
+		json_dumpf(user->json, fp, 0);
+		fclose(fp);
+	}
 
 	json_decref(conf);
 
