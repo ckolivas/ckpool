@@ -10,6 +10,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include "libckpool.h"
 
@@ -259,6 +260,11 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 		free(s);
 	}
 
+	if (mkdir("pool", 0750) && errno != EEXIST)
+		fail("Failed to create pool directory");
+	fp = fopen("pool/pool.status", "we");
+	if (!fp)
+		fail("Failed to open updated pool.status file");
 	JSON_CPACK(val, "{si,si,si,si,si,si}",
 		   "runtime", allpstats.runtime,
 	    "lastupdate", allpstats.lastupdate,
@@ -268,6 +274,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	    "Disconnected", allpstats.disconnected);
 
 	s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER);
+	fprintf(fp, "%s\n", s);
 	log("Allstats pstats %s", s);
 	free(s);
 	json_decref(val);
@@ -303,6 +310,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 			"hashrate7d", suffix10080);
 
 	s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER);
+	fprintf(fp, "%s\n", s);
 	log("Allstats dsps %s", s);
 	free(s);
 	json_decref(val);
@@ -317,6 +325,8 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	    "SPS15m", allsps.sps15m,
 	    "SPS1h", allsps.sps1h);
 	s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_REAL_PRECISION(6));
+	fprintf(fp, "%s\n", s);
+	fclose(fp);
 	log("Allstats sps %s", s);
 	free(s);
 	json_decref(val);
