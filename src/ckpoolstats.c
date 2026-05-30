@@ -267,7 +267,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	    "Idle", allpstats.idle,
 	    "Disconnected", allpstats.disconnected);
 
-	s = json_dumps(val, JSON_PRESERVE_ORDER);
+	s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER);
 	log("Allstats pstats %s", s);
 	free(s);
 	json_decref(val);
@@ -302,7 +302,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 			"hashrate1d", suffix1440,
 			"hashrate7d", suffix10080);
 
-	s = json_dumps(val, JSON_PRESERVE_ORDER);
+	s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER);
 	log("Allstats dsps %s", s);
 	free(s);
 	json_decref(val);
@@ -316,7 +316,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	    "SPS5m", allsps.sps5m,
 	    "SPS15m", allsps.sps15m,
 	    "SPS1h", allsps.sps1h);
-	s = json_dumps(val, JSON_PRESERVE_ORDER);
+	s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_REAL_PRECISION(6));
 	log("Allstats sps %s", s);
 	free(s);
 	json_decref(val);
