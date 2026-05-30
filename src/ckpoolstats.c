@@ -12,6 +12,7 @@
 #include <stdio.h>
 
 #include "libckpool.h"
+#include "ckpool.h"
 
 #define log(fmt, ...) do { \
 	printf(fmt, ##__VA_ARGS__); \
@@ -61,9 +62,57 @@ typedef struct {
 	int64_t bestshare;
 } sps_t;
 
+/* Global combined stats */
+pstats_t allpstats;
+dsps_t alldsps;
+sps_t allsps;
+
+bool json_get_int64(int64_t *store, const json_t *val, const char *res)
+{
+	json_t *entry = json_object_get(val, res);
+	bool ret = false;
+
+	if (!entry) {
+		LOGDEBUG("Json did not find entry %s", res);
+		goto out;
+	}
+	if (!json_is_integer(entry)) {
+		LOGINFO("Json entry %s is not an integer", res);
+		goto out;
+	}
+	*store = json_integer_value(entry);
+	LOGDEBUG("Json found entry %s: %"PRId64, res, *store);
+	ret = true;
+out:
+	return ret;
+}
+
+bool json_get_double(double *store, const json_t *val, const char *res)
+{
+	json_t *entry = json_object_get(val, res);
+	bool ret = false;
+
+	if (!entry) {
+		LOGDEBUG("Json did not find entry %s", res);
+		goto out;
+	}
+	if (!json_is_real(entry)) {
+		LOGWARNING("Json entry %s is not a double", res);
+		goto out;
+	}
+	*store = json_real_value(entry);
+	LOGDEBUG("Json found entry %s: %f", res, *store);
+	ret = true;
+out:
+	return ret;
+}
+
 void read_poolstats(FILE *fp)
 {
 	char *s = alloca(4096), *pstats, *dsps, *sps;
+	pstats_t poolpstats = {};
+	dsps_t pooldsps = {};
+	sps_t poolsps = {};
 	json_t *val;
 	int ret;
 
@@ -81,7 +130,23 @@ void read_poolstats(FILE *fp)
 	val = json_loads(pstats, 0, NULL);
 	if (!val)
 		fail("Failed to json decode pstats line from pool logfile: %s", pstats);
+	json_get_int64(&poolpstats.runtime, val, "runtime");
+	json_get_int64(&poolpstats.lastupdate, val, "lastupdate");
+	json_get_int64(&poolpstats.users, val, "Users");
+	json_get_int64(&poolpstats.workers, val, "Workers");
+	json_get_int64(&poolpstats.idle, val, "Idle");
+	json_get_int64(&poolpstats.disconnected, val, "Disconnected");
 	json_decref(val);
+
+	/* Pessimise these two values from worst stats */
+	if (!allpstats.runtime || allpstats.runtime > poolpstats.runtime)
+		allpstats.runtime = poolpstats.runtime;
+	if (!allpstats.lastupdate || allpstats.lastupdate > poolpstats.lastupdate)
+		allpstats.lastupdate = poolpstats.lastupdate;
+	allpstats.users += poolpstats.users;
+	allpstats.workers += poolpstats.workers;
+	allpstats.idle += poolpstats.idle;
+	allpstats.disconnected += poolpstats.disconnected;
 
 	val = json_loads(dsps, 0, NULL);
 	if (!val)
