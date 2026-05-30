@@ -28,8 +28,11 @@ noinst_LIBRARIES = libckpool.a
 libckpool_a_SOURCES = libckpool.c sha2.c sha256_arm_shani.c sha256_code_release
 libckpool_a_LIBADD = $(native_objs)
 
-bin_PROGRAMS = ckp2p
-EXTRA_PROGRAMS = notifier ckpool ckpmsg
+bin_PROGRAMS = ckpoolstats
+EXTRA_PROGRAMS = notifier ckpool ckpmsg ckp2p
+
+ckpoolstats_SOURCES = ckpoolstats.c
+ckpoolstats_LDADD = libckpool.a jansson-2.14/src/.libs/libjansson.a @LIBS@
 
 ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
                  yyjson.c yyjson_util.c ckp2p.c
