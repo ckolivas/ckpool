@@ -32,6 +32,35 @@
 	exit(1); \
 } while(0)
 
+typedef struct {
+	int64_t runtime;
+	int64_t lastupdate;
+	int64_t users;
+	int64_t workers;
+	int64_t idle;
+	int64_t disconnected;
+} pstats_t;
+
+typedef struct {
+	int hashrate1m;
+	int hashrate5m;
+	int hashrate15m;
+	int hashrate1hr;
+	int hashrate6hr;
+	int hashrate1d;
+	int hashrate7d;
+} dsps_t;
+
+typedef struct {
+	double diff;
+	double sps1m;
+	double sps5m;
+	double sps15m;
+	int64_t accepted;
+	int64_t rejected;
+	int64_t bestshare;
+} sps_t;
+
 void read_poolstats(FILE *fp)
 {
 	char *s = alloca(4096), *pstats, *dsps, *sps;
