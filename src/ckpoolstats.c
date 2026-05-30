@@ -73,8 +73,16 @@ sps_t allsps;
 typedef struct {
 	UT_hash_handle hh;
 
+	char workername[128];
+	json_t *json;
+} worker_t;
+
+typedef struct {
+	UT_hash_handle hh;
+
 	char username[128];
 	json_t *json;
+	worker_t *workers;
 } user_t;
 
 user_t *users;
@@ -247,7 +255,7 @@ static void add_hashrates(json_t *sval, json_t *val, const char *key)
 	dval += dsps_from_key(val, key);
 	ghs = dval * nonces;
 	suffix_string(ghs, suffix, 16, 0);
-	json_object_set(sval, key, json_string(suffix));
+	json_object_set_new(sval, key, json_string(suffix));
 }
 
 static void set_maxint(json_t *sval, json_t *val, const char *key)
@@ -276,7 +284,6 @@ static void add_int(json_t *sval, json_t *val, const char *key)
 
 	json_get_int64(&val64, sval, key);
 	val64 += json_get_int64(&newval64, val, key);
-	json_object_del(val, key);
 	json_object_set_new(sval, key, json_integer(val64));
 }
 
@@ -290,10 +297,8 @@ static void set_maxdouble(json_t *sval, json_t *val, const char *key)
 		json_object_set_new(sval, key, json_real(newdval));
 }
 
-static void combine_userstats(user_t *user, json_t *newval)
+static void combine_stats(json_t *val, json_t *newval)
 {
-	json_t *val = user->json;
-
 	add_hashrates(val, newval, "hashrate1m");
 	add_hashrates(val, newval, "hashrate5m");
 	add_hashrates(val, newval, "hashrate1hr");
@@ -321,24 +326,60 @@ user_t *get_user(const char *username, bool *new)
 	return user;
 }
 
-/* FIXME, user stats need appending */
-void append_workers(user_t *user, json_t *val)
+static void init_worker_hash(user_t *user)
 {
-	json_t *newworkers = json_object_get(val, "worker");
-	json_t *workers = json_object_get(user->json, "worker");
-	json_t *worker;
+	json_t *warray = json_object_get(user->json, "worker");
+	json_t *w;
+	size_t index;
+	worker_t *worker = NULL;
+
+	if (!warray || !json_is_array(warray))
+		return;
+
+	json_array_foreach(warray, index, w) {
+		json_t *wn_val = json_object_get(w, "workername");
+		const char *workername = json_string_value(wn_val);
+		if (!workername)
+			continue;
+
+		HASH_FIND_STR(user->workers, workername, worker);
+		if (!worker) {
+			worker = ckzalloc(sizeof(worker_t));
+			strcpy(worker->workername, workername);
+			HASH_ADD_STR(user->workers, workername, worker);
+			worker->json = w;   /* points to existing object inside the array */
+		}
+	}
+}
+
+void append_workers(user_t *user, json_t *sval)
+{
+	json_t *newvals = json_object_get(sval, "worker");
+	json_t *vals = json_object_get(user->json, "worker");
+	worker_t *worker = NULL;
+	json_t *val;
 	size_t index;
 
-	if (!workers) {
-		log("No workers for %s", user->username);
-		/* Shouldn't happen */
+	if (!vals) {
 		json_object_set(user->json, "worker", json_array());
-		workers = json_object_get(user->json, "worker");
+		vals = json_object_get(user->json, "worker");
 	}
-	if (!newworkers || !json_is_array(newworkers))
+	if (!newvals || !json_is_array(newvals))
 		return;
-	json_array_foreach(newworkers, index, worker)
-		json_array_append(workers, worker);
+	json_array_foreach(newvals, index, val) {
+		json_t *workername_val = json_object_get(val, "workername");
+		const char *workername = json_string_value(workername_val);
+
+		HASH_FIND_STR(user->workers, workername, worker);
+		if (!worker) {
+			worker = ckzalloc(sizeof(worker_t));
+			strcpy(worker->workername, workername);
+			HASH_ADD_STR(user->workers, workername, worker);
+			worker->json = val;
+			json_array_append(vals, val);
+		} else
+			combine_stats(worker->json, val);
+	}
 }
 
 int main(int __maybe_unused argc, char __maybe_unused **argv)
@@ -475,11 +516,12 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 				continue;
 			free(s);
 			user = get_user(username, &new);
-			if (new)
+			if (new) {
 				user->json = val;
-			else {
+				init_worker_hash(user);
+			} else {
+				combine_stats(user->json, val);
 				append_workers(user, val);
-				combine_userstats(user, val);
 				json_decref(val);
 			}
 			fclose(fp);
