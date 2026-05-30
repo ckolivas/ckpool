@@ -129,11 +129,13 @@ out:
 }
 
 /* Fallthrough intentional */
-double dsps_from_key(json_t *val, const char *key)
+double dsps_from_key(json_t *sval, const char *key)
 {
 	char *string, *endptr;
 	double ret = 0;
+	json_t *val;
 
+	val = json_object_get(sval, key);
 	json_get_string(&string, val, key);
 	if (!string)
 		return ret;
@@ -212,9 +214,9 @@ void read_poolstats(FILE *fp)
 	if (!val)
 		fail("Failed to json decode sps line from pool logfile: %s", dsps);
 	allsps.diff += json_get_double(&poolsps.diff, val , "diff");
-	allsps.sps1m += json_get_double(&poolsps.sps1m, val, "sps1m");
-	allsps.sps5m += json_get_double(&poolsps.sps5m, val, "sps5m");
-	allsps.sps15m += json_get_double(&poolsps.sps15m, val, "sps15m");
+	allsps.sps1m += json_get_double(&poolsps.sps1m, val, "SPS1m");
+	allsps.sps5m += json_get_double(&poolsps.sps5m, val, "SPS5m");
+	allsps.sps15m += json_get_double(&poolsps.sps15m, val, "SPS15m");
 	allsps.accepted += json_get_int64(&poolsps.accepted, val, "accepted");
 	allsps.rejected += json_get_int64(&poolsps.rejected, val, "rejected");
 	json_get_int64(&poolsps.bestshare, val, "bestshare");
@@ -225,6 +227,9 @@ void read_poolstats(FILE *fp)
 
 int main(int __maybe_unused argc, char __maybe_unused **argv)
 {
+	double ghs1, ghs5, ghs15, ghs60, ghs360, ghs1440, ghs10080;
+	char suffix1[16], suffix5[16], suffix15[16], suffix60[16];
+	char suffix360[16], suffix1440[16], suffix10080[16];
 	json_t *conf, *dirs, *val;
 	size_t index;
 	FILE *fp;
@@ -251,6 +256,55 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 		fclose(fp);
 		free(s);
 	}
+
+	JSON_CPACK(val, "{si,si,si,si,si,si}",
+		   "runtime", allpstats.runtime,
+	    "lastupdate", allpstats.lastupdate,
+	    "Users", allpstats.users,
+	    "Workers", allpstats.workers,
+	    "Idle", allpstats.idle,
+	    "Disconnected", allpstats.disconnected);
+
+	s = json_dumps(val, JSON_PRESERVE_ORDER);
+	log("Allstats pstats %s", s);
+	free(s);
+	json_decref(val);
+
+	ghs1 = alldsps.hashrate1m * nonces;
+	suffix_string(ghs1, suffix1, 16, 0);
+
+	ghs5 = alldsps.hashrate5m * nonces;
+	suffix_string(ghs5, suffix5, 16, 0);
+
+	ghs15 = alldsps.hashrate15m * nonces;
+	suffix_string(ghs15, suffix15, 16, 0);
+
+	ghs60 = alldsps.hashrate1hr * nonces;
+	suffix_string(ghs60, suffix60, 16, 0);
+
+	ghs360 = alldsps.hashrate6hr * nonces;
+	suffix_string(ghs360, suffix360, 16, 0);
+
+	ghs1440 = alldsps.hashrate1d * nonces;
+	suffix_string(ghs1440, suffix1440, 16, 0);
+
+	ghs10080 = alldsps.hashrate7d * nonces;
+	suffix_string(ghs10080, suffix10080, 16, 0);
+
+	JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,ss}",
+			"hashrate1m", suffix1,
+			"hashrate5m", suffix5,
+			"hashrate15m", suffix15,
+			"hashrate1hr", suffix60,
+			"hashrate6hr", suffix360,
+			"hashrate1d", suffix1440,
+			"hashrate7d", suffix10080);
+
+	s = json_dumps(val, JSON_PRESERVE_ORDER);
+	log("Allstats dsps %s", s);
+	free(s);
+	json_decref(val);
+
 
 	json_decref(conf);
 
