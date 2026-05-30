@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 
 #include "libckpool.h"
 #include "uthash.h"
@@ -382,7 +383,9 @@ void append_workers(user_t *user, json_t *sval)
 	}
 }
 
-int main(int __maybe_unused argc, char __maybe_unused **argv)
+bool parse_workers = false;
+
+int main(int argc, char __maybe_unused **argv)
 {
 	double ghs1, ghs5, ghs15, ghs60, ghs360, ghs1440, ghs10080;
 	char suffix1[16], suffix5[16], suffix15[16], suffix60[16];
@@ -391,13 +394,25 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	size_t index;
 	FILE *fp;
 	char *s;
+	int opt;
 
+	while ((opt = getopt(argc, argv, "w")) != -1) {
+		switch (opt) {
+			case 'w':
+				parse_workers = true;
+			default:
+				break;
+		}
+	}
 	conf = json_load_file("ckpoolstats.conf", 0, NULL);
 	if (!conf)
 		fail("Failed to load ckpoolstats.conf");
 	dirs = json_object_get(conf, "dirs");
 	if (!dirs || !json_is_array(dirs))
 		fail("dirs array not found");
+
+	if (parse_workers)
+		goto workers_only;
 
 	/* Read pool stats from each entry and create allstats */
 	json_array_foreach(dirs, index, val) {
@@ -486,7 +501,9 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 	log("Allstats sps %s", s);
 	free(s);
 	json_decref(val);
+	goto out;
 
+workers_only:
 	json_array_foreach(dirs, index, val) {
 		struct dirent *dir;
 		char *username;
@@ -543,7 +560,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 		json_dumpf(user->json, fp, JSON_INDENT(2));
 		fclose(fp);
 	}
-
+out:
 	json_decref(conf);
 
 	return 0;
