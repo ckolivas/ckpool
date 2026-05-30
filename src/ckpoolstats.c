@@ -319,7 +319,7 @@ user_t *get_user(const char *username, bool *new)
 	HASH_FIND_STR(users, username, user);
 	if (!user) {
 		user = ckzalloc(sizeof(user_t));
-		strcpy(user->username, username);
+		strncpy(user->username, username, 127);
 		HASH_ADD_STR(users, username, user);
 		*new = true;
 	}
@@ -345,7 +345,7 @@ static void init_worker_hash(user_t *user)
 		HASH_FIND_STR(user->workers, workername, worker);
 		if (!worker) {
 			worker = ckzalloc(sizeof(worker_t));
-			strcpy(worker->workername, workername);
+			strncpy(worker->workername, workername, 127);
 			HASH_ADD_STR(user->workers, workername, worker);
 			worker->json = w;   /* points to existing object inside the array */
 		}
@@ -373,7 +373,7 @@ void append_workers(user_t *user, json_t *sval)
 		HASH_FIND_STR(user->workers, workername, worker);
 		if (!worker) {
 			worker = ckzalloc(sizeof(worker_t));
-			strcpy(worker->workername, workername);
+			strncpy(worker->workername, workername, 127);
 			HASH_ADD_STR(user->workers, workername, worker);
 			worker->json = val;
 			json_array_append(vals, val);
