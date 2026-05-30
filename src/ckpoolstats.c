@@ -239,6 +239,74 @@ void read_poolstats(FILE *fp)
 	json_decref(val);
 }
 
+static void add_hashrates(json_t *sval, json_t *val, const char *key)
+{
+	double ghs, dval = dsps_from_key(sval, key);
+	char suffix[16];
+
+	dval += dsps_from_key(val, key);
+	ghs = dval * nonces;
+	suffix_string(ghs, suffix, 16, 0);
+	json_object_set(sval, key, json_string(suffix));
+}
+
+static void set_maxint(json_t *sval, json_t *val, const char *key)
+{
+	int64_t val64, newval64;
+
+	json_get_int64(&val64, sval, key);
+	json_get_int64(&newval64, val, key);
+	if (newval64 > val64)
+		json_object_set_new(sval, key, json_integer(newval64));
+}
+
+static void set_minint(json_t *sval, json_t *val, const char *key)
+{
+	int64_t val64, newval64;
+
+	json_get_int64(&val64, sval, key);
+	json_get_int64(&newval64, val, key);
+	if (newval64 < val64)
+		json_object_set_new(sval, key, json_integer(newval64));
+}
+
+static void add_int(json_t *sval, json_t *val, const char *key)
+{
+	int64_t val64, newval64;
+
+	json_get_int64(&val64, sval, key);
+	val64 += json_get_int64(&newval64, val, key);
+	json_object_del(val, key);
+	json_object_set_new(sval, key, json_integer(val64));
+}
+
+static void set_maxdouble(json_t *sval, json_t *val, const char *key)
+{
+	double dval, newdval;
+
+	json_get_double(&dval, sval, key);
+	json_get_double(&newdval, val, key);
+	if (newdval > dval)
+		json_object_set_new(sval, key, json_real(newdval));
+}
+
+static void combine_userstats(user_t *user, json_t *newval)
+{
+	json_t *val = user->json;
+
+	add_hashrates(val, newval, "hashrate1m");
+	add_hashrates(val, newval, "hashrate5m");
+	add_hashrates(val, newval, "hashrate1hr");
+	add_hashrates(val, newval, "hashrate1d");
+	add_hashrates(val, newval, "hashrate7d");
+	set_maxint(val, newval, "lastshare");
+	add_int(val, newval, "workers");
+	add_int(val, newval, "shares");
+	set_maxdouble(val, newval, "bestshare");
+	set_maxint(val, newval, "bestever");
+	set_minint(val, newval, "authorised");
+}
+
 user_t *get_user(const char *username, bool *new)
 {
 	user_t *user = NULL;
@@ -380,7 +448,6 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 
 	json_array_foreach(dirs, index, val) {
 		struct dirent *dir;
-		struct stat fdbuf;
 		char *username;
 		DIR *d;
 		const char *sdir = json_string_value(val);
@@ -412,6 +479,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 				user->json = val;
 			else {
 				append_workers(user, val);
+				combine_userstats(user, val);
 				json_decref(val);
 			}
 			fclose(fp);
@@ -430,7 +498,7 @@ int main(int __maybe_unused argc, char __maybe_unused **argv)
 		free(s);
 		if (!fp)
 			fail("Failed to write user %s", user->username);
-		json_dumpf(user->json, fp, 0);
+		json_dumpf(user->json, fp, JSON_INDENT(2));
 		fclose(fp);
 	}
 
