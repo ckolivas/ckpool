@@ -53,6 +53,8 @@ Mandatory config fields:
 -At least one "redirecturl" entry.
 
 ---
+BELOW MODES ARE CURRENTLY UNMAINTAINED AND LIKELY NON-FUNCTIONAL
+---
 Node mode
 
 When run with the -N or --node parameter, ckpool operates as a sub-pool of an upstream master pool or pools specified in the "proxy" fields. The upstream pool must be a ckpool instance running in default mode (solo mode is currently unsupported), with a corresponding "nodeserver" entry. A local bitcoin node is mandatory. All user management is done by the upstream pool. The cknode instance will store a local log only of users connected to it. Cknode will attempt to keep its local bitcoin node informed of the transactions being mined at the master pool. If a block is solved by a user connected to cknode, it will attempt to submit it to its local bitcoin node in addition to the upstream pool to speed up propagation of the block. If the upstream pool solves a block separate from the cknode instance, the cknode instance will also attempt to submit the block locally. If the local bitcoin node is missing transactions in a solved block (unlikely), it will be unable to submit the block locally, but this does not prevent the upstream pool from submitting it. The purpose of cknode mode is to have geographically remote pools of one master pool for faster block submission. It is highly recommended to increase rmem_max and wmem_max in sysctl.conf as large packets will be sent between cknode and an upstream pool. Config is as per default mode. If no name is specified with the -n parameter, the file cknode.conf is read for the configuration.
@@ -66,10 +68,11 @@ Mandatory upstream pool config fields:
 ---
 Trusted mode
 
-When run with the -t or --trusted node parameter, ckpool operates as a sub-pool of an upstream master pool specified in the "proxy" field. The upstream pool must be a ckpool instance with a corresponding "trusted" entry. A local bitcoin node is mandatory. All user management is done by the upstream pool. The trusted instance will store a local log only of users connected to it. All share management is handled by the local trusted ckpool instance, and only a record of accepted/rejected shares is submitted to the upstream pool. As this is done in clear text without verification, the connection between the two must be suitably isolated from outside connections to prevent fake share accounting being accepted by the upstream pool. Only locally solved blocks are submitted by a trusted node. The purpose of trusted mode is to isolate the main accounting pool from outwardly facing ip addresses, or for friendly centrally collating record keeping. Config is as per default mode. If no name is specified with the -n parameter, the file ckpool.conf is read for the configuration.
+When run with the -t or --trusted node parameter, ckpool operates as a sub-pool of an upstream master pool specified in the "upstream" field. The upstream pool must be a ckpool instance with a corresponding "trusted" entry. A local bitcoin node is mandatory. All user management is done by the upstream pool. The trusted instance will store a local log only of users connected to it. All share management is handled by the local trusted ckpool instance, and only a record of accepted/rejected shares is submitted to the upstream pool. As this is done in clear text without verification, the connection between the two must be suitably isolated from outside connections to prevent fake share accounting being accepted by the upstream pool. Only locally solved blocks are submitted by a trusted node. The purpose of trusted mode is to isolate the main accounting pool from outwardly facing ip addresses, or for friendly centrally collating record keeping. Config is as per default mode. If no name is specified with the -n parameter, the file ckpool.conf is read for the configuration.
 
-Mandatory config fields:
+Mandatory config fields for remote (trusted) server:
 -At least one "btcd" entry with "url", "auth", and "pass".
--At least one "proxy" entry with "url" matching the upstream nodeserver, "auth", and "pass".
+-At least one "upstream" entry with "url" matching the upstream server.
 Mandatory upstream pool config fields:
--At least one "nodeserver" entry.
+-At least one "btcd" entry with "url", "auth", and "pass".
+-At least one "trusted" array entry for IP:port to bind to and listen for remote servers.

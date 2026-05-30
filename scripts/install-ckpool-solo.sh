@@ -124,7 +124,7 @@ if [ "$available_space_gb" -lt "$required_space" ]; then
 fi
 
 # Prompt for assumevalid block hash
-read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 000000000000000000012d5e7b4745f92b9cd60241854e38be68d9b182feabcb at block 944306, or 0 to disable): " assumevalid_hash
+read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 00000000000000000000c63fa7d726a1840c777a59ebc73f45a298989f78548a at block 951408, or 0 to disable): " assumevalid_hash
 if [ "$assumevalid_hash" = "0" ]; then
     assumevalid_line=""
     echo "Assumevalid disabled. Full blockchain verification will be performed."
@@ -132,7 +132,7 @@ elif [ -n "$assumevalid_hash" ]; then
     echo "Warning: Using assumevalid skips signature verification up to this block, reducing security. Ensure the hash is from a trusted source."
     assumevalid_line="assumevalid=$assumevalid_hash"
 else
-    assumevalid_line="assumevalid=000000000000000000012d5e7b4745f92b9cd60241854e38be68d9b182feabcb"
+    assumevalid_line="assumevalid=00000000000000000000c63fa7d726a1840c777a59ebc73f45a298989f78548a"
 fi
 
 # Prompt for donation to CKPool author

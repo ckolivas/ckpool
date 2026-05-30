@@ -294,7 +294,7 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 		/* Handle these errors gracefully should we ever share this
 		 * socket */
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
-			LOGERR("Recoverable error on accept in accept_client");
+			LOGNOTICE("Recoverable error on accept in accept_client");
 			return 0;
 		}
 		LOGERR("Failed to accept on socket %d in acceptor", sockd);
@@ -622,6 +622,31 @@ static client_instance_t *ref_client_by_id(cdata_t *cdata, int64_t id)
 	ck_wunlock(&cdata->lock);
 
 	return client;
+}
+
+static void add_remote_client(ckpool_t *ckp, cdata_t *cdata, int64_t id)
+{
+	client_instance_t *client;
+	yyjson_mut_doc *doc;
+	bool found = false;
+	char *buf;
+
+	ck_rlock(&cdata->lock);
+	HASH_FIND_I64(cdata->clients, &id, client);
+	if (likely(client)) {
+		found = true;
+		client->remote = true;
+	}
+	ck_runlock(&cdata->lock);
+
+	if (likely(found))
+		LOGWARNING("Added trusted remote client %ld", id);
+	else
+		LOGWARNING("Unable to find trusted remote client %ld", id);
+	doc = yyjson_mut_pack("{sb}", "result", found);
+	buf = yyjson_mut_write(doc, YYJSON_WRITE_NEWLINE_AT_END, NULL);
+	yyjson_mut_doc_free(doc);
+	send_client(ckp, cdata, id, buf);
 }
 
 static void redirect_client(ckpool_t *ckp, client_instance_t *client);
@@ -1079,10 +1104,17 @@ static void send_client(ckpool_t *ckp, cdata_t *cdata, const int64_t id, char *b
 		redirect_client(ckp, client);
 }
 
-static void send_client_yyjson(ckpool_t *ckp, cdata_t *cdata, int64_t client_id, yyjson_mut_doc *doc)
+static void
+_send_client_yyjson(ckpool_t *ckp, cdata_t *cdata, int64_t client_id, yyjson_mut_doc *doc,
+		    const char *file, const char *func, const int line)
 {
 	client_instance_t *client;
 	char *msg;
+
+	if (unlikely(!doc)) {
+		LOGWARNING("_send_client_yyjson received NULL doc from %s %s:%d", file, func, line);
+		return;
+	}
 
 	if (ckp->node && (client = ref_client_by_id(cdata, client_id))) {
 		yyjson_mut_doc *tmp_doc = yyjson_mut_doc_mut_copy(doc, &ckyyalc);
@@ -1098,6 +1130,9 @@ static void send_client_yyjson(ckpool_t *ckp, cdata_t *cdata, int64_t client_id,
 	send_client(ckp, cdata, client_id, msg);
 	yyjson_mut_doc_free(doc);
 }
+
+#define send_client_yyjson(ckp, cdata, client_id, doc) \
+	_send_client_yyjson(ckp, cdata, client_id, doc, __FILE__, __func__, __LINE__)
 
 /* When testing if a client exists, passthrough clients don't exist when their
  * parent no longer exists. */
@@ -1178,6 +1213,8 @@ static bool connect_upstream(ckpool_t *ckp, connsock_t *cs)
 		   cs->url, cs->port);
 	ret = true;
 out:
+	if (val)
+		json_decref(val);
 	cksem_post(&cs->sem);
 
 	return ret;
@@ -1320,9 +1357,14 @@ static void client_yymessage_processor(ckpool_t *ckp, yyjson_mut_doc *doc)
 {
 	cdata_t *cdata = ckp->cdata;
 	client_instance_t *client;
-	yyjson_mut_val *root = yyjson_mut_doc_get_root(doc);
+	yyjson_mut_val *root;
 	int64_t client_id;
 
+	if (unlikely(!doc)) {
+		LOGWARNING("client_yymessage_processor received NULL doc");
+		return;
+	}
+	root = yyjson_mut_doc_get_root(doc);
 	/* Extract the client id from the json message and remove its entry */
 	client_id = yyjson_mut_get_num(yyjson_mut_obj_get(root, "client_id"));
 	yyjson_mut_obj_remove_key(root, "client_id");
@@ -1355,9 +1397,16 @@ void connector_add_message(ckpool_t *ckp, json_t *val)
 		ckmsgq_add(cdata->cympq, doc);
 }
 
-void connector_add_yymessage(ckpool_t *ckp, yyjson_mut_doc *doc)
+void _connector_add_yymessage(ckpool_t *ckp, yyjson_mut_doc *doc, const char *file,
+			     const char *func, const int line)
 {
 	cdata_t *cdata = ckp->cdata;
+
+	if (unlikely(!doc)) {
+		LOGWARNING("_connector_add_yymessage received NULL doc from %s %s:%d",
+			   file, func, line);
+		return;
+	}
 
 	ckmsgq_add(cdata->cympq, doc);
 }
@@ -1560,6 +1609,11 @@ retry:
 		sscanf(buf, "getxfd%d", &fdno);
 		if (fdno > -1 && fdno < ckp->serverurls)
 			send_fd(cdata->serverfd[fdno], umsg->sockd);
+	} else if (cmdmatch(buf, "remote")) {
+		int64_t client = -1;
+
+		sscanf(buf, "remote=%ld", &client);
+		add_remote_client(ckp, cdata, client);
 	} else
 		LOGWARNING("Unhandled connector message: %s", buf);
 	goto retry;

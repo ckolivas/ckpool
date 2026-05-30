@@ -97,8 +97,6 @@ void parse_upstream_workinfo(ckpool_t *ckp, json_t *val);
 void parse_upstream_block(ckpool_t *ckp, json_t *val);
 void parse_upstream_reqtxns(ckpool_t *ckp, json_t *val);
 char *stratifier_stats(ckpool_t *ckp, void *data);
-void _stratifier_add_recv(ckpool_t *ckp, json_t *val, const char *file, const char *func, const int line);
-#define stratifier_add_recv(ckp, val) _stratifier_add_recv(ckp, val, __FILE__, __func__, __LINE__)
 void _stratifier_add_yyrecv(ckpool_t *ckp, yyjson_mut_doc *doc, const char *file, const char *func, const int line);
 #define stratifier_add_yyrecv(ckp, val) _stratifier_add_yyrecv(ckp, doc, __FILE__, __func__, __LINE__)
 void *stratifier(void *arg);
