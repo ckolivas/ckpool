@@ -235,7 +235,9 @@ void read_poolstats(FILE *fp)
 	val = json_loads(sps, 0, NULL);
 	if (!val)
 		fail("Failed to json decode sps line from pool logfile: %s", dsps);
-	allsps.diff += json_get_double(&poolsps.diff, val , "diff");
+	json_get_double(&poolsps.diff, val , "diff");
+	if (poolsps.diff > allsps.diff)
+		allsps.diff = poolsps.diff;
 	allsps.sps1m += json_get_double(&poolsps.sps1m, val, "SPS1m");
 	allsps.sps5m += json_get_double(&poolsps.sps5m, val, "SPS5m");
 	allsps.sps15m += json_get_double(&poolsps.sps15m, val, "SPS15m");
