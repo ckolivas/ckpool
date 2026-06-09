@@ -504,6 +504,7 @@ static void notice_msg_entries(char_entry_t **entries)
 		DL_DELETE(*entries, entry);
 		LOGNOTICE("%s", entry->buf);
 		free(entry->buf);
+		entry->buf = NULL;
 		free(entry);
 	}
 }
@@ -516,6 +517,7 @@ static void info_msg_entries(char_entry_t **entries)
 		DL_DELETE(*entries, entry);
 		LOGINFO("%s", entry->buf);
 		free(entry->buf);
+		entry->buf = NULL;
 		free(entry);
 	}
 }
@@ -611,6 +613,8 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 		int siglen = strlen(ckp->btcsig);
 
 		LOGDEBUG("Len %d sig %s", siglen, ckp->btcsig);
+		if (siglen > 100)
+			siglen = 100;
 		if (siglen) {
 			wb->coinb2bin[wb->coinb2len++] = siglen;
 			memcpy(wb->coinb2bin + wb->coinb2len, ckp->btcsig, siglen);
@@ -681,6 +685,10 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 		char *coinbase, *cb;
 
 		/* Append the generation address and coinb3 in !solo mode */
+		if (unlikely(sdata->txnlen > 255 || wb->coinb2len + 1 + sdata->txnlen > 511)) {
+			LOGEMERG("txnlen %d would overflow coinb2bin, aborting!", sdata->txnlen);
+			return;
+		}
 		wb->coinb2bin[wb->coinb2len++] = sdata->txnlen;
 		memcpy(wb->coinb2bin + wb->coinb2len, sdata->txnbin, sdata->txnlen);
 		wb->coinb2len += sdata->txnlen;
@@ -994,7 +1002,7 @@ static json_t *generate_workinfo(ckpool_t *ckp, const workbase_t *wb, const char
 	char cdfield[64];
 	json_t *val;
 
-	sprintf(cdfield, "%lu,%lu", wb->gentime.tv_sec, wb->gentime.tv_nsec);
+	snprintf(cdfield, sizeof(cdfield), "%lu,%lu", wb->gentime.tv_sec, wb->gentime.tv_nsec);
 
 	JSON_CPACK(val, "{sI,ss,ss,ss,ss,ss,ss,ss,ss,sI,so,ss,ss,ss,ss}",
 			"workinfoid", wb->id,
@@ -1102,14 +1110,14 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 		sdata->blockchange_id = wb->id;
 	}
 	if (*new_block && ckp->logshares) {
-		sprintf(wb->logdir, "%s%08x/", ckp->logdir, wb->height);
+		snprintf(wb->logdir, len, "%s%08x/", ckp->logdir, wb->height);
 		ret = mkdir(wb->logdir, 0750);
 		if (unlikely(ret && errno != EEXIST))
 			LOGERR("Failed to create log directory %s", wb->logdir);
 	}
-	sprintf(wb->idstring, "%016lx", wb->id);
+	snprintf(wb->idstring, 20, "%016lx", wb->id);
 	if (ckp->logshares)
-		sprintf(wb->logdir, "%s%08x/%s", ckp->logdir, wb->height, wb->idstring);
+		snprintf(wb->logdir, len, "%s%08x/%s", ckp->logdir, wb->height, wb->idstring);
 
 	HASH_ADD_I64(sdata->workbases, id, wb);
 	if (sdata->current_workbase)
@@ -2026,6 +2034,7 @@ static void add_remote_blockdata(ckpool_t *ckp, json_t *val, const int cblen, co
 	buf = bin2hex(coinbase, cblen);
 	json_set_string(val, "coinbasehex", buf);
 	free(buf);
+	buf = NULL;
 	buf = bin2hex(data, 80);
 	json_set_string(val, "swaphex", buf);
 	free(buf);
@@ -2102,6 +2111,7 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 {
 	char *gbt_block, varint[12];
 	int txns = wb->txns + 1;
+	int gbt_ofs;
 	char hexcoinbase[1024];
 
 	flip_32(flip32, hash);
@@ -2110,6 +2120,7 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	/* Message format: "data" */
 	gbt_block = ckzalloc(1024);
 	__bin2hex(gbt_block, data, 80);
+	gbt_ofs = 160; /* 80 bytes * 2 hex chars */
 	if (txns < 0xfd) {
 		uint8_t val8 = txns;
 
@@ -2117,17 +2128,17 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	} else if (txns <= 0xffff) {
 		uint16_t val16 = htole16(txns);
 
-		strcat(gbt_block, "fd");
+		gbt_ofs += snprintf(gbt_block + gbt_ofs, 1024 - gbt_ofs, "fd");
 		__bin2hex(varint, (const unsigned char *)&val16, 2);
 	} else {
 		uint32_t val32 = htole32(txns);
 
-		strcat(gbt_block, "fe");
+		gbt_ofs += snprintf(gbt_block + gbt_ofs, 1024 - gbt_ofs, "fe");
 		__bin2hex(varint, (const unsigned char *)&val32, 4);
 	}
-	strcat(gbt_block, varint);
+	gbt_ofs += snprintf(gbt_block + gbt_ofs, 1024 - gbt_ofs, "%s", varint);
 	__bin2hex(hexcoinbase, coinbase, cblen);
-	strcat(gbt_block, hexcoinbase);
+	snprintf(gbt_block + gbt_ofs, 1024 - gbt_ofs, "%s", hexcoinbase);
 	if (wb->txns)
 		realloc_strcat(&gbt_block, wb->txn_data);
 	return gbt_block;
@@ -2265,7 +2276,7 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 	LOGWARNING("Possible upstream block solve diff %lf !", diff);
 
 	ts_realtime(&ts_now);
-	sprintf(cdfield, "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
+	snprintf(cdfield, sizeof(cdfield), "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
 
 	wb = get_workbase(sdata, id);
 	if (unlikely(!wb)) {
@@ -2409,7 +2420,7 @@ static void __disconnect_session(sdata_t *sdata, const stratum_instance_t *clien
 	session->client_id = client->id;
 	session->userid = client->user_id;
 	session->added = now_t;
-	strcpy(session->address, client->address);
+	snprintf(session->address, sizeof(session->address), "%s", client->address);
 	HASH_ADD_INT(sdata->disconnected_sessions, session_id, session);
 	sdata->stats.disconnected++;
 	sdata->disconnected_generated++;
