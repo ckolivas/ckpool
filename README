@@ -218,8 +218,8 @@ down.
 killing it if need be. Otherwise ckpool will refuse to start if an instance of
 the same name is already running.
 
--L will log per share information in the logs directory divided by block height
-and then workbase.
+-L will log per share information and workbase information in the logs directory
+divided by block height and then workbase.
 
 -l <LOGLEVEL will change the log level to that specified. Default is 5 and
 maximum debug is level 7.

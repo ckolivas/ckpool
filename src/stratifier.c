@@ -1116,6 +1116,18 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 		tv_time(&sdata->current_workbase->retired);
 	sdata->current_workbase = wb;
 
+	if (ckp->logshares) {
+		char *wifname;
+		json_t *wival;
+
+		ASPRINTF(&wifname, "%s.workinfo", wb->logdir);
+		wival = generate_workinfo(ckp, wb, __func__);
+		if (json_dump_file(wival, wifname, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_COMPACT | JSON_EOL) == -1)
+			LOGERR("Failed to write to %s", wifname);
+		json_decref(wival);
+		dealloc(wifname);
+	}
+
 	/* Is this long enough to ensure we don't dereference a workbase
 	 * immediately? Should be unless clock changes 10 minutes so we use
 	 * ts_realtime */
