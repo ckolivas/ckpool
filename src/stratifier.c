@@ -6366,10 +6366,9 @@ out_nowb:
 	if (ckp->logshares) {
 		fp = fopen(fname, "ae");
 		if (likely(fp)) {
-			yyjson_mut_write_file(fname, doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL);
+			if (!yyjson_mut_write_fp(fp, doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL))
+				LOGERR("Failed to write to %s", fname);
 			fclose(fp);
-			if (unlikely(len < 0))
-				LOGERR("Failed to fwrite to %s", fname);
 		} else
 			LOGERR("Failed to fopen %s", fname);
 	}
