@@ -100,6 +100,7 @@ typedef struct txn_relay {
 
 static txn_relay_t *txn_relays;
 static cklock_t txn_relay_lock;
+static bool startup_bits_pending;
 
 #define TXN_RELAY_TIMEOUT 5
 #define BLOCKS_FILE "blocks.txt"
@@ -759,6 +760,45 @@ disconnect:
 	dealloc(payload);
 }
 
+static void hash_to_hexline(char *hex, const uchar *hash);
+
+static void request_cmpctblock(p2p_conn_t *conn, const uchar *blockhash)
+{
+	uint32_t req_type = MSG_CMPCT_BLOCK;
+	uint32_t req_type_le = htole32(req_type);
+	uchar getdata_payload[37];
+
+	getdata_payload[0] = 1;
+	memcpy(getdata_payload + 1, &req_type_le, 4);
+	memcpy(getdata_payload + 5, blockhash, 32);
+	p2p_send(conn, "getdata", getdata_payload, 37);
+}
+
+static void try_startup_bits_request(p2p_conn_t *conn)
+{
+	uchar hash[32];
+	char showhash[68];
+	bool have_block = false;
+
+	if (!startup_bits_pending || conn->peer != 0 || !conn->handshake_done)
+		return;
+
+	ck_rlock(&curblock.lock);
+	if (blockhashes) {
+		memcpy(hash, curblock.hash, 32);
+		have_block = true;
+	}
+	ck_runlock(&curblock.lock);
+
+	if (!have_block)
+		return;
+
+	startup_bits_pending = false;
+	request_cmpctblock(conn, hash);
+	hash_to_hexline(showhash, hash);
+	LOGNOTICE("Requested cmpctblock from peer 0 for %s to set current_bits", showhash);
+}
+
 static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -781,15 +821,8 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		memcpy(hash, payload + pos, 32);
 		pos += 32;
 		if (type == MSG_BLOCK || type == MSG_WITNESS_BLOCK) {
-			uint32_t req_type = MSG_CMPCT_BLOCK;
-			uint32_t req_type_le = htole32(req_type);
-
 			has_block = true;
-			uchar getdata_payload[37];
-			getdata_payload[0] = 1;
-			memcpy(getdata_payload + 1, &req_type_le, 4);
-			memcpy(getdata_payload + 5, hash, 32);
-			p2p_send(conn, "getdata", getdata_payload, 37);
+			request_cmpctblock(conn, hash);
 		}
 	}
 	if (has_block)
@@ -931,8 +964,10 @@ static void load_blocks_txt(void)
 		memcpy(curblock.hash, last->hash, 32);
 	ck_wunlock(&curblock.lock);
 	fclose(fp);
-	if (count)
+	if (count) {
+		startup_bits_pending = true;
 		LOGWARNING("Loaded %d block hashes from %s", count, BLOCKS_FILE);
+	}
 }
 
 static void dec_block_requesters(blocklist_t *block)
@@ -1620,6 +1655,7 @@ static void p2p_connector(p2p_conn_t *conn)
 
 	activate_conn(conn);
 
+	try_startup_bits_request(conn);
 	add_reader(conn);
 out:
 	del_connector(conn);
