@@ -646,7 +646,6 @@ static void add_conn_epoll(p2p_conn_t *conn);
 static void dec_block_requesters(blocklist_t *block);
 static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
 				const uchar *payload, uint32_t plen);
-static bool handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t plen);
 static void expire_txn_relays(tv_t *now);
 
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
@@ -1006,7 +1005,7 @@ static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
 }
 
 /* Relay a blocktxn received from a source peer to the waiting requester. */
-static bool handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t plen)
+static void handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t plen)
 {
 	txn_relay_t *relay;
 	int requester_peer;
@@ -1016,7 +1015,8 @@ static bool handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t p
 	HASH_FIND_INT(txn_relays, &source->peer, relay);
 	if (!relay) {
 		ck_wunlock(&txn_relay_lock);
-		return false;
+		LOGINFO("Got BLOCKTXN from expired txn_relay");
+		goto out;
 	}
 	requester_peer = relay->requester_peer;
 	HASH_DEL(txn_relays, relay);
@@ -1026,15 +1026,15 @@ static bool handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t p
 
 	requester = get_peer(requester_peer);
 	if (!requester || requester->sock < 0) {
-		dealloc(payload);
-		return true;
+		LOGNOTICE("Got BLOCKTXN from non-existent requester socket");
+		goto out;
 	}
 
 	LOGNOTICE("Relaying blocktxn (%u bytes) from peer %d to peer %d",
 		  plen, source->peer, requester_peer);
 	p2p_send(requester, "blocktxn", payload, plen);
+out:
 	dealloc(payload);
-	return true;
 }
 
 static void expire_txn_relays(tv_t *now)
@@ -1697,8 +1697,8 @@ static void p2p_reader(p2p_conn_t *conn)
 		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
 	} else if (!strcmp(cmd, "blocktxn")) {
 		LOGDEBUG("Received BLOCKTXN (%u bytes) - handling (block transactions response)", plen);
-		if (handle_blocktxn_relay(conn, payload, plen))
-			goto rearm;
+		handle_blocktxn_relay(conn, payload, plen);
+		goto rearm;
 	} else if (!strcmp(cmd, "getheaders")) {
 		LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
 	} else if (!strcmp(cmd, "getblocks")) {
