@@ -2002,7 +2002,10 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport, int sou
 		conn->netname = netdefs[0].name;
 	}
 
-	LOGWARNING("ckp2p set up config peer %d - %s:%s", source, host, charport);
+	if (source < ckpool.prioclients)
+		LOGWARNING("ckp2p set up prio peer %d - %s:%s", source, host, charport);
+	else
+		LOGNOTICE("ckp2p set up config peer %d - %s:%s", source, host, charport);
 
 	return conn;
 }
