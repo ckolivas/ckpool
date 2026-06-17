@@ -802,13 +802,13 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 static void relay_compact_block(const uchar *blockhash, uchar *cmpct_payload,
 				uint32_t cmpct_len, uint64_t shortid_nonce, int source);
 
-static void display_newblock(uchar *blockhash)
+static void display_newblock(uchar *blockhash, int source)
 {
 	char fliphash[32], showhash[68];
 
 	bswap_256(fliphash, blockhash);
 	__bin2hex(showhash, fliphash, 32);
-	LOGWARNING("New block hash detected: %s", showhash);
+	LOGWARNING("New block hash from peer %d detected: %s", source, showhash);
 }
 
 /* Bitcoin target-from-bits (little-endian target array, index 0 = LSB) */
@@ -1062,7 +1062,7 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 	ck_wunlock(&curblock.lock);
 
 	if (new_block) {
-		display_newblock(blockhash);
+		display_newblock(blockhash, source);
 		relay_compact_block(blockhash, payload, plen, shortid_nonce, source);
 		/* payload is stolen and released by relay_compact_block */
 	} else
@@ -1604,9 +1604,9 @@ static void p2p_reader(p2p_conn_t *conn)
 	} else if (!strcmp(cmd, "block")) {
 		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
 	} else if (!strcmp(cmd, "blocktxn")) {
+		LOGDEBUG("Received BLOCKTXN (%u bytes) - handling (block transactions response)", plen);
 		if (handle_blocktxn_relay(conn, payload, plen))
 			goto rearm;
-		LOGDEBUG("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
 	} else if (!strcmp(cmd, "getheaders")) {
 		LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
 	} else if (!strcmp(cmd, "getblocks")) {
