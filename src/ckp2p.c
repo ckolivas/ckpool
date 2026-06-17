@@ -102,6 +102,7 @@ static txn_relay_t *txn_relays;
 static cklock_t txn_relay_lock;
 
 #define TXN_RELAY_TIMEOUT 5
+#define BLOCKS_FILE "blocks.txt"
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -848,6 +849,93 @@ static int blockcmp(blocklist_t *a, uchar *b)
 	return memcmp(a->hash, b, 32);
 }
 
+static void hash_to_hexline(char *hex, const uchar *hash)
+{
+	char fliphash[32];
+
+	bswap_256(fliphash, hash);
+	__bin2hex(hex, fliphash, 32);
+}
+
+static void hexline_to_hash(uchar *hash, const char *hex)
+{
+	char fliphash[32];
+
+	hex2bin(fliphash, hex, 32);
+	bswap_256(hash, fliphash);
+}
+
+static void dump_blocks_txt(void)
+{
+	FILE *fp;
+	blocklist_t *block;
+	char hex[68];
+
+	fp = fopen(BLOCKS_FILE, "we");
+	if (unlikely(!fp)) {
+		LOGERR("Unable to fopen %s for writing", BLOCKS_FILE);
+		return;
+	}
+
+	ck_rlock(&curblock.lock);
+	DL_FOREACH(blockhashes, block) {
+		hash_to_hexline(hex, block->hash);
+		fprintf(fp, "%s\n", hex);
+	}
+	ck_runlock(&curblock.lock);
+	fclose(fp);
+}
+
+static void load_blocks_txt(void)
+{
+	FILE *fp;
+	char buf[128];
+	blocklist_t *block, *last = NULL;
+	int count = 0;
+
+	fp = fopen(BLOCKS_FILE, "re");
+	if (!fp)
+		return;
+
+	ck_wlock(&curblock.lock);
+	while (fgets(buf, sizeof(buf), fp)) {
+		char *nl = strpbrk(buf, "\r\n");
+		uchar hash[32];
+
+		if (nl)
+			*nl = '\0';
+		if (!buf[0])
+			continue;
+		if (strlen(buf) != 64) {
+			LOGWARNING("Invalid %s line: %s", BLOCKS_FILE, buf);
+			continue;
+		}
+		hexline_to_hash(hash, buf);
+		block = ckalloc(sizeof(blocklist_t));
+		memcpy(block->hash, hash, 32);
+		block->source = -1;
+		block->requesters = 0;
+		DL_APPEND(blockhashes, block);
+		last = block;
+		count++;
+		if (count > 100) {
+			blocklist_t *old = blockhashes;
+
+			if (!old->requesters) {
+				DL_DELETE(blockhashes, old);
+				free(old);
+				count--;
+			}
+		}
+	}
+	if (last)
+		memcpy(curblock.hash, last->hash, 32);
+	ck_wunlock(&curblock.lock);
+	fclose(fp);
+	if (count)
+		LOGWARNING("Loaded %d block hashes from %s", count, BLOCKS_FILE);
+}
+
 static void dec_block_requesters(blocklist_t *block)
 {
 	if (!block)
@@ -1067,6 +1155,7 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 	if (new_block) {
 		display_newblock(blockhash, source);
 		relay_compact_block(blockhash, payload, plen, shortid_nonce, source);
+		dump_blocks_txt();
 		/* payload is stolen and released by relay_compact_block */
 	} else
 		dealloc(payload);
@@ -2063,6 +2152,7 @@ int prepare_ckp2p(void)
 	int i, p2purls;
 
 	cklock_init(&curblock.lock);
+	load_blocks_txt();
 	cklock_init(&peerlock);
 	cklock_init(&txn_relay_lock);
 
