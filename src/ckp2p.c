@@ -1014,6 +1014,7 @@ static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
 	HASH_FIND_INT(txn_relays, &source_peer, existing);
 	if (existing) {
 		ck_wunlock(&txn_relay_lock);
+		LOGNOTICE("No txn relay source peer %d available", source_peer);
 		return false;
 	}
 	relay = ckalloc(sizeof(txn_relay_t));
