@@ -75,6 +75,7 @@ static int num_threads;
 typedef struct blocklist {
 	uchar hash[32];
 	struct blocklist *next, *prev;
+	int source;
 } blocklist_t;
 
 static blocklist_t *blockhashes;
@@ -835,6 +836,7 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 			block = ckalloc(sizeof(blocklist_t));
 
 			memcpy(block->hash, blockhash, 32);
+			block->source = source;
 			DL_APPEND(blockhashes, block);
 			DL_COUNT(blockhashes, block, count);
 			LOGDEBUG("Block count %d", count);
