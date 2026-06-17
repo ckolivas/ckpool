@@ -881,8 +881,10 @@ static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
 	p2p_conn_t *source_conn;
 	int source_peer;
 
-	if (!block)
+	if (!block) {
+		LOGNOTICE("No block found for forward_getblocktxn");
 		return false;
+	}
 
 	source_peer = block->source;
 
@@ -906,6 +908,7 @@ static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
 
 	source_conn = get_peer(source_peer);
 	if (unlikely(!source_conn) || source_conn->sock < 0) {
+		LOGNOTICE("No source %d socket found for forward_getblocktxn", source_peer);
 		cancel_txn_relay(source_peer);
 		return false;
 	}
