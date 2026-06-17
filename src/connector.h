@@ -10,15 +10,15 @@
 #ifndef CONNECTOR_H
 #define CONNECTOR_H
 
-int64_t connector_newclientid(ckpool_t *ckp);
-void connector_upstream_msg(ckpool_t *ckp, char *msg);
-void connector_add_message(ckpool_t *ckp, json_t *val);
-void _connector_add_yymessage(ckpool_t *ckp, yyjson_mut_doc *doc, const char *file,
+int64_t connector_newclientid(void);
+void connector_upstream_msg(char *msg);
+void connector_add_message(json_t *val);
+void _connector_add_yymessage(yyjson_mut_doc *doc, const char *file,
 			     const char *func, const int line);
-#define connector_add_yymessage(ckp, doc) \
-	_connector_add_yymessage(ckp, doc, __FILE__, __func__, __LINE__)
+#define connector_add_yymessage(doc) \
+	_connector_add_yymessage(doc, __FILE__, __func__, __LINE__)
 char *connector_stats(void *data, const int runtime);
-void connector_send_fd(ckpool_t *ckp, const int fdno, const int sockd);
+void connector_send_fd(const int fdno, const int sockd);
 void *connector(void *arg);
 
 #endif /* CONNECTOR_H */

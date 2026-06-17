@@ -46,14 +46,13 @@
 void __attribute__((weak)) logmsg(int __maybe_unused loglevel, const char *fmt, ...)
 {
 	va_list ap;
-	char *buf;
 
 	va_start(ap, fmt);
-	VASPRINTF(&buf, fmt, ap);
+	vprintf(fmt, ap);
 	va_end(ap);
 
-	printf("%s\n", buf);
-	free(buf);
+	printf("\n");
+	fflush(stdout);
 }
 
 void rename_proc(const char *name)

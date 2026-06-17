@@ -32,30 +32,30 @@
 #include "stratifier.h"
 #include "connector.h"
 
-ckpool_t *global_ckp;
+ckpool_t ckpool;
 
-static bool open_logfile(ckpool_t *ckp)
+static bool open_logfile(void)
 {
-	if (ckp->logfd > 0) {
-		flock(ckp->logfd, LOCK_EX);
-		fflush(ckp->logfp);
-		Close(ckp->logfd);
+	if (ckpool.logfd > 0) {
+		flock(ckpool.logfd, LOCK_EX);
+		fflush(ckpool.logfp);
+		Close(ckpool.logfd);
 	}
-	ckp->logfp = fopen(ckp->logfilename, "ae");
-	if (unlikely(!ckp->logfp)) {
-		LOGEMERG("Failed to make open log file %s", ckp->logfilename);
+	ckpool.logfp = fopen(ckpool.logfilename, "ae");
+	if (unlikely(!ckpool.logfp)) {
+		LOGEMERG("Failed to make open log file %s", ckpool.logfilename);
 		return false;
 	}
 	/* Make logging line buffered */
-	setvbuf(ckp->logfp, NULL, _IOLBF, 0);
-	ckp->logfd = fileno(ckp->logfp);
-	ckp->lastopen_t = time(NULL);
+	setvbuf(ckpool.logfp, NULL, _IOLBF, 0);
+	ckpool.logfd = fileno(ckpool.logfp);
+	ckpool.lastopen_t = time(NULL);
 	return true;
 }
 
 /* Use ckmsgqs for logging to console and files to prevent logmsg from blocking
  * on any delays. */
-static void console_log(ckpool_t __maybe_unused *ckp, char *msg)
+static void console_log(char *msg)
 {
 	/* Add clear line only if stderr is going to console */
 	if (isatty(fileno(stderr)))
@@ -66,20 +66,20 @@ static void console_log(ckpool_t __maybe_unused *ckp, char *msg)
 	free(msg);
 }
 
-static void proclog(ckpool_t *ckp, char *msg)
+static void proclog(char *msg)
 {
 	time_t log_t = time(NULL);
 
 	/* Reopen log file every minute, allowing us to move/rename it and
 	 * create a new logfile */
-	if (log_t > ckp->lastopen_t + 60) {
+	if (log_t > ckpool.lastopen_t + 60) {
 		LOGDEBUG("Reopening logfile");
-		open_logfile(ckp);
+		open_logfile();
 	}
 
-	flock(ckp->logfd, LOCK_EX);
-	fprintf(ckp->logfp, "%s", msg);
-	flock(ckp->logfd, LOCK_UN);
+	flock(ckpool.logfd, LOCK_EX);
+	fprintf(ckpool.logfp, "%s", msg);
+	flock(ckpool.logfd, LOCK_UN);
 
 	free(msg);
 }
@@ -105,12 +105,12 @@ void get_timestamp(char *stamp)
 /* Log everything to the logfile, but display warnings on the console as well */
 void logmsg(int loglevel, const char *fmt, ...)
 {
-	int logfd = global_ckp->logfd;
+	int logfd = ckpool.logfd;
 	char *log, *buf = NULL;
 	char stamp[128];
 	va_list ap;
 
-	if (global_ckp->loglevel < loglevel || !fmt)
+	if (ckpool.loglevel < loglevel || !fmt)
 		return;
 
 	va_start(ap, fmt);
@@ -131,14 +131,17 @@ void logmsg(int loglevel, const char *fmt, ...)
 	else
 		ASPRINTF(&log, "%s %s\n", stamp, buf);
 
-	if (unlikely(!global_ckp->console_logger)) {
+	if (unlikely(!ckpool.console_logger)) {
 		fprintf(stderr, "%s", log);
 		goto out_free;
 	}
-	if (loglevel <= LOG_WARNING)
-		ckmsgq_add(global_ckp->console_logger, strdup(log));
-	if (logfd > 0)
-		ckmsgq_add(global_ckp->logger, strdup(log));
+	if (unlikely(loglevel <= LOG_WARNING))
+		ckmsgq_add(ckpool.console_logger, strdup(log));
+	if (likely(logfd > 0)) {
+		/* Hand log over to the ckmsgq to free */
+		ckmsgq_add(ckpool.logger, log);
+		goto out;
+	}
 out_free:
 	free(log);
 out:
@@ -150,7 +153,6 @@ static void *ckmsg_queue(void *arg)
 {
 	ckmsgq_t *ckmsgq = (ckmsgq_t *)arg;
 	ckmsgq_t *primary = ckmsgq->primary;
-	ckpool_t *ckp = ckmsgq->ckp;
 
 	pthread_detach(pthread_self());
 	rename_proc(ckmsgq->name);
@@ -174,19 +176,18 @@ static void *ckmsg_queue(void *arg)
 
 		if (!msg)
 			continue;
-		ckmsgq->func(ckp, msg->data);
+		ckmsgq->func(msg->data);
 		free(msg);
 	}
 	return NULL;
 }
 
-ckmsgq_t *create_ckmsgq(ckpool_t *ckp, const char *name, const void *func)
+ckmsgq_t *create_ckmsgq(const char *name, const void *func)
 {
 	ckmsgq_t *ckmsgq = ckzalloc(sizeof(ckmsgq_t));
 
 	strncpy(ckmsgq->name, name, 15);
 	ckmsgq->func = func;
-	ckmsgq->ckp = ckp;
 	ckmsgq->lock = ckalloc(sizeof(mutex_t));
 	ckmsgq->cond = ckalloc(sizeof(pthread_cond_t));
 	mutex_init(ckmsgq->lock);
@@ -197,7 +198,7 @@ ckmsgq_t *create_ckmsgq(ckpool_t *ckp, const char *name, const void *func)
 	return ckmsgq;
 }
 
-ckmsgq_t *create_ckmsgqs(ckpool_t *ckp, const char *name, const void *func, const int count)
+ckmsgq_t *create_ckmsgqs(const char *name, const void *func, const int count)
 {
 	ckmsgq_t *ckmsgq = ckzalloc(sizeof(ckmsgq_t) * count);
 	mutex_t *lock;
@@ -212,7 +213,6 @@ ckmsgq_t *create_ckmsgqs(ckpool_t *ckp, const char *name, const void *func, cons
 	for (i = 0; i < count; i++) {
 		snprintf(ckmsgq[i].name, 15, "%.6s%x", name, i);
 		ckmsgq[i].func = func;
-		ckmsgq[i].ckp = ckp;
 		ckmsgq[i].lock = lock;
 		ckmsgq[i].cond = cond;
 		ckmsgq[i].primary = &ckmsgq[0]; /* all workers consume from [0] */
@@ -371,7 +371,7 @@ static int pid_wait(const pid_t pid, const int ms)
 	return ret;
 }
 
-static void api_message(ckpool_t *ckp, char **buf, int *sockd)
+static void api_message(char **buf, int *sockd)
 {
 	apimsg_t *apimsg = ckalloc(sizeof(apimsg_t));
 
@@ -379,7 +379,7 @@ static void api_message(ckpool_t *ckp, char **buf, int *sockd)
 	*buf = NULL;
 	apimsg->sockd = *sockd;
 	*sockd = -1;
-	ckmsgq_add(ckp->ckpapi, apimsg);
+	ckmsgq_add(ckpool.ckpapi, apimsg);
 }
 
 /* Listen for incoming global requests. Always returns a response if possible */
@@ -387,7 +387,6 @@ static void *listener(void *arg)
 {
 	proc_instance_t *pi = (proc_instance_t *)arg;
 	unixsock_t *us = &pi->us;
-	ckpool_t *ckp = pi->ckp;
 	char *buf = NULL, *msg;
 	int sockd;
 
@@ -406,7 +405,7 @@ retry:
 		send_unix_msg(sockd, "failed");
 	} else if (buf[0] == '{') {
 		/* Any JSON messages received are for the RPC API to handle */
-		api_message(ckp, &buf, &sockd);
+		api_message(&buf, &sockd);
 	} else if (cmdmatch(buf, "shutdown")) {
 		LOGWARNING("Listener received shutdown message, terminating ckpool");
 		send_unix_msg(sockd, "exiting");
@@ -424,7 +423,7 @@ retry:
 			LOGWARNING("Invalid loglevel %d sent", loglevel);
 			send_unix_msg(sockd, "Invalid");
 		} else {
-			ckp->loglevel = loglevel;
+			ckpool.loglevel = loglevel;
 			send_unix_msg(sockd, "success");
 		}
 #ifndef CKP2P
@@ -432,49 +431,49 @@ retry:
 		int fdno = -1;
 
 		sscanf(buf, "getxfd%d", &fdno);
-		connector_send_fd(ckp, fdno, sockd);
+		connector_send_fd(fdno, sockd);
 #endif
 	} else if (cmdmatch(buf, "accept")) {
 		LOGWARNING("Listener received accept message, accepting clients");
-		send_proc(ckp->connector, "accept");
+		send_proc(ckpool.connector, "accept");
 		send_unix_msg(sockd, "accepting");
 	} else if (cmdmatch(buf, "reject")) {
 		LOGWARNING("Listener received reject message, rejecting clients");
-		send_proc(ckp->connector, "reject");
+		send_proc(ckpool.connector, "reject");
 		send_unix_msg(sockd, "rejecting");
 	} else if (cmdmatch(buf, "dropall")) {
 		LOGWARNING("Listener received dropall message, disconnecting all clients");
-		send_proc(ckp->stratifier, buf);
+		send_proc(ckpool.stratifier, buf);
 		send_unix_msg(sockd, "dropping all");
 	} else if (cmdmatch(buf, "reconnect")) {
 		LOGWARNING("Listener received request to send reconnect to clients");
-		send_proc(ckp->stratifier, buf);
+		send_proc(ckpool.stratifier, buf);
 		send_unix_msg(sockd, "reconnecting");
 	} else if (cmdmatch(buf, "restart")) {
 		LOGWARNING("Listener received restart message, attempting handover");
 		send_unix_msg(sockd, "restarting");
 		if (!fork()) {
-			if (!ckp->handover) {
-				ckp->initial_args[ckp->args++] = strdup("-H");
-				ckp->initial_args[ckp->args] = NULL;
+			if (!ckpool.handover) {
+				ckpool.initial_args[ckpool.args++] = strdup("-H");
+				ckpool.initial_args[ckpool.args] = NULL;
 			}
-			execv(ckp->initial_args[0], (char *const *)ckp->initial_args);
+			execv(ckpool.initial_args[0], (char *const *)ckpool.initial_args);
 		}
 #ifndef CKP2P
 	} else if (cmdmatch(buf, "stratifierstats")) {
 		LOGDEBUG("Listener received stratifierstats request");
-		msg = stratifier_stats(ckp, ckp->sdata);
+		msg = stratifier_stats(ckpool.sdata);
 		send_unix_msg(sockd, msg);
 		dealloc(msg);
 	} else if (cmdmatch(buf, "connectorstats")) {
 		LOGDEBUG("Listener received connectorstats request");
-		msg = connector_stats(ckp->cdata, 0);
+		msg = connector_stats(ckpool.cdata, 0);
 		send_unix_msg(sockd, msg);
 		dealloc(msg);
 #endif
 	} else if (cmdmatch(buf, "resetshares")) {
 		LOGWARNING("Resetting best shares");
-		send_proc(ckp->stratifier, buf);
+		send_proc(ckpool.stratifier, buf);
 		send_unix_msg(sockd, "resetting");
 	} else {
 		LOGINFO("Listener received unhandled message: %s", buf);
@@ -495,7 +494,7 @@ void empty_buffer(connsock_t *cs)
 	cs->buflen = cs->bufofs = 0;
 }
 
-int set_sendbufsize(ckpool_t *ckp, const int fd, const int len)
+int set_sendbufsize(const int fd, const int len)
 {
 	socklen_t optlen;
 	int opt;
@@ -516,14 +515,14 @@ int set_sendbufsize(ckpool_t *ckp, const int fd, const int len)
 	}
 	if (opt < len) {
 		LOGNOTICE("Failed to increase sendbufsize to %d, increase wmem_max or start %s privileged if using a remote btcd",
-			   len, ckp->name);
-		ckp->wmem_warn = true;
+			   len, ckpool.name);
+		ckpool.wmem_warn = true;
 	} else
 		LOGDEBUG("Increased sendbufsize to %d of desired %d", opt, len);
 	return opt;
 }
 
-int set_recvbufsize(ckpool_t *ckp, const int fd, const int len)
+int set_recvbufsize(const int fd, const int len)
 {
 	socklen_t optlen;
 	int opt;
@@ -544,8 +543,8 @@ int set_recvbufsize(ckpool_t *ckp, const int fd, const int len)
 	}
 	if (opt < len) {
 		LOGNOTICE("Failed to increase rcvbufsiz to %d, increase rmem_max or start %s privileged if using a remote btcd",
-			   len, ckp->name);
-		ckp->rmem_warn = true;
+			   len, ckpool.name);
+		ckpool.rmem_warn = true;
 	} else
 		LOGDEBUG("Increased rcvbufsiz to %d of desired %d", opt, len);
 	return opt;
@@ -574,7 +573,7 @@ static void clear_bufline(connsock_t *cs)
 	}
 }
 
-static void add_buflen(ckpool_t *ckp, connsock_t *cs, const char *readbuf, const int len)
+static void add_buflen(connsock_t *cs, const char *readbuf, const int len)
 {
 	int backoff = 1;
 	int buflen;
@@ -595,8 +594,8 @@ static void add_buflen(ckpool_t *ckp, connsock_t *cs, const char *readbuf, const
 	}
 	/* Increase receive buffer if possible to larger than the largest
 	 * message we're likely to buffer */
-	if (unlikely(!ckp->rmem_warn && buflen > cs->rcvbufsiz))
-		cs->rcvbufsiz = set_recvbufsize(ckp, cs->fd, buflen);
+	if (unlikely(!ckpool.rmem_warn && buflen > cs->rcvbufsiz))
+		cs->rcvbufsiz = set_recvbufsize(cs->fd, buflen);
 
 	memcpy(cs->buf + cs->bufofs, readbuf, len);
 	cs->bufofs += len;
@@ -605,7 +604,7 @@ static void add_buflen(ckpool_t *ckp, connsock_t *cs, const char *readbuf, const
 
 /* Receive as much data is currently available without blocking into a connsock
  * buffer. Returns total length of data read. */
-static int recv_available(ckpool_t *ckp, connsock_t *cs)
+static int recv_available(connsock_t *cs)
 {
 	char readbuf[PAGESIZE];
 	int len = 0, ret;
@@ -613,7 +612,7 @@ static int recv_available(ckpool_t *ckp, connsock_t *cs)
 	do {
 		ret = recv(cs->fd, readbuf, PAGESIZE - 4, MSG_DONTWAIT);
 		if (ret > 0) {
-			add_buflen(ckp, cs, readbuf, ret);
+			add_buflen(cs, readbuf, ret);
 			len += ret;
 		}
 	} while (ret > 0);
@@ -628,15 +627,14 @@ static int recv_available(ckpool_t *ckp, connsock_t *cs)
  * and -1 on error. */
 int read_socket_line(connsock_t *cs, float *timeout)
 {
-	ckpool_t *ckp = cs->ckp;
-	bool quiet = ckp->proxy | ckp->remote;
+	bool quiet = ckpool.proxy | ckpool.remote;
 	char *eom = NULL;
 	tv_t start, now;
 	float diff;
 	int ret;
 
 	clear_bufline(cs);
-	recv_available(ckp, cs); // Intentionally ignore return value
+	recv_available(cs); // Intentionally ignore return value
 	eom = memchr(cs->buf, '\n', cs->bufofs);
 
 	tv_time(&start);
@@ -663,7 +661,7 @@ int read_socket_line(connsock_t *cs, float *timeout)
 				LOGERR("Select %s in read_socket_line", !ret ? "timed out" : "failed");
 			goto out;
 		}
-		ret = recv_available(ckp, cs);
+		ret = recv_available(cs);
 		if (ret < 1) {
 			/* If we have done wait_read_select there should be
 			 * something to read and if we get nothing it means the
@@ -903,9 +901,9 @@ void yyjson_rpc_msg(connsock_t *cs, const char *rpc_req)
 	yyjson_doc_free(doc);
 }
 
-static void terminate_oldpid(const ckpool_t *ckp, proc_instance_t *pi, const pid_t oldpid)
+static void terminate_oldpid(const proc_instance_t *pi, const pid_t oldpid)
 {
-	if (!ckp->killold) {
+	if (!ckpool.killold) {
 		quit(1, "Process %s pid %d still exists, start ckpool with -H to get a handover or -k if you wish to kill it",
 				pi->processname, oldpid);
 	}
@@ -1010,13 +1008,13 @@ out:
 
 /* Open the file in path, check if there is a pid in there that still exists
  * and if not, write the pid into that file. */
-static bool write_pid(ckpool_t *ckp, const char *path, proc_instance_t *pi, const pid_t pid, const pid_t oldpid)
+static bool write_pid(const char *path, proc_instance_t *pi, const pid_t pid, const pid_t oldpid)
 {
 	FILE *fp;
 
-	if (ckp->handover && oldpid && !pid_wait(oldpid, 500)) {
+	if (ckpool.handover && oldpid && !pid_wait(oldpid, 500)) {
 		LOGWARNING("Old process pid %d failed to shutdown cleanly, terminating", oldpid);
-		terminate_oldpid(ckp, pi, oldpid);
+		terminate_oldpid(pi, oldpid);
 	}
 
 	fp = fopen(path, "we");
@@ -1032,28 +1030,27 @@ static bool write_pid(ckpool_t *ckp, const char *path, proc_instance_t *pi, cons
 
 static void name_process_sockname(unixsock_t *us, const proc_instance_t *pi)
 {
-	us->path = strdup(pi->ckp->socket_dir);
+	us->path = strdup(ckpool.socket_dir);
 	realloc_strcat(&us->path, pi->sockname);
 }
 
-static void open_process_sock(ckpool_t *ckp, const proc_instance_t *pi, unixsock_t *us)
+static void open_process_sock(const proc_instance_t *pi, unixsock_t *us)
 {
 	LOGDEBUG("Opening %s", us->path);
 	us->sockd = open_unix_server(us->path);
 	if (unlikely(us->sockd < 0))
 		quit(1, "Failed to open %s socket", pi->sockname);
-	if (chown(us->path, -1, ckp->gr_gid))
-		quit(1, "Failed to set %s to group id %d", us->path, ckp->gr_gid);
+	if (chown(us->path, -1, ckpool.gr_gid))
+		quit(1, "Failed to set %s to group id %d", us->path, ckpool.gr_gid);
 }
 
 #ifndef CKP2P
 static void create_process_unixsock(proc_instance_t *pi)
 {
 	unixsock_t *us = &pi->us;
-	ckpool_t *ckp = pi->ckp;
 
 	name_process_sockname(us, pi);
-	open_process_sock(ckp, pi, us);
+	open_process_sock(pi, us);
 }
 #endif
 
@@ -1062,8 +1059,8 @@ static void write_namepid(proc_instance_t *pi)
 	char s[256];
 
 	pi->pid = getpid();
-	sprintf(s, "%s%s.pid", pi->ckp->socket_dir, pi->processname);
-	if (!write_pid(pi->ckp, s, pi, pi->pid, pi->oldpid))
+	sprintf(s, "%s%s.pid", ckpool.socket_dir, pi->processname);
+	if (!write_pid(s, pi, pi->pid, pi->oldpid))
 		quit(1, "Failed to write %s pid %d", pi->processname, pi->pid);
 }
 
@@ -1071,20 +1068,20 @@ static void rm_namepid(const proc_instance_t *pi)
 {
 	char s[256];
 
-	sprintf(s, "%s%s.pid", pi->ckp->socket_dir, pi->processname);
+	sprintf(s, "%s%s.pid", ckpool.socket_dir, pi->processname);
 	unlink(s);
 }
 
-static void launch_logger(ckpool_t *ckp)
+static void launch_logger(void)
 {
-	ckp->logger = create_ckmsgq(ckp, "logger", &proclog);
-	ckp->console_logger = create_ckmsgq(ckp, "conlog", &console_log);
+	ckpool.logger = create_ckmsgq("logger", &proclog);
+	ckpool.console_logger = create_ckmsgq("conlog", &console_log);
 }
 
-static void clean_up(ckpool_t *ckp)
+static void clean_up(void)
 {
-	rm_namepid(&ckp->main);
-	dealloc(ckp->socket_dir);
+	rm_namepid(&ckpool.main);
+	dealloc(ckpool.socket_dir);
 }
 
 static void cancel_pthread(pthread_t *pth)
@@ -1097,14 +1094,12 @@ static void cancel_pthread(pthread_t *pth)
 
 static void sighandler(const int sig)
 {
-	ckpool_t *ckp = global_ckp;
-
 	signal(sig, SIG_IGN);
 	signal(SIGTERM, SIG_IGN);
 	LOGWARNING("Process %s received signal %d, shutting down",
-		   ckp->name, sig);
+		   ckpool.name, sig);
 
-	cancel_pthread(&ckp->pth_listener);
+	cancel_pthread(&ckpool.pth_listener);
 	exit(0);
 }
 
@@ -1266,59 +1261,59 @@ bool json_getdel_int64(int64_t *store, json_t *val, const char *res)
 	return ret;
 }
 
-static void parse_btcds(ckpool_t *ckp, const json_t *arr_val, const int arr_size)
+static void parse_btcds(const json_t *arr_val, const int arr_size)
 {
 	json_t *val;
 	int i;
 
-	ckp->btcds = arr_size;
-	ckp->btcdurl = ckzalloc(sizeof(char *) * arr_size);
-	ckp->btcdauth = ckzalloc(sizeof(char *) * arr_size);
-	ckp->btcdpass = ckzalloc(sizeof(char *) * arr_size);
-	ckp->btcdnotify = ckzalloc(sizeof(bool *) * arr_size);
+	ckpool.btcds = arr_size;
+	ckpool.btcdurl = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.btcdauth = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.btcdpass = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.btcdnotify = ckzalloc(sizeof(bool *) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		val = json_array_get(arr_val, i);
-		json_get_configstring(&ckp->btcdurl[i], val, "url");
-		json_get_configstring(&ckp->btcdauth[i], val, "auth");
-		json_get_configstring(&ckp->btcdpass[i], val, "pass");
-		json_get_bool(&ckp->btcdnotify[i], val, "notify");
+		json_get_configstring(&ckpool.btcdurl[i], val, "url");
+		json_get_configstring(&ckpool.btcdauth[i], val, "auth");
+		json_get_configstring(&ckpool.btcdpass[i], val, "pass");
+		json_get_bool(&ckpool.btcdnotify[i], val, "notify");
 	}
 }
 
-static void parse_p2purls(ckpool_t *ckp, const json_t *arr_val, const int arr_size)
+static void parse_p2purls(const json_t *arr_val, const int arr_size)
 {
 	json_t *val;
 	int i;
 
-	ckp->p2purls = arr_size;
-	ckp->p2purl = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.p2purls = arr_size;
+	ckpool.p2purl = ckzalloc(sizeof(char *) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		val = json_array_get(arr_val, i);
 
-		if (!_json_get_string(&ckp->p2purl[i], val, "p2purl"))
+		if (!_json_get_string(&ckpool.p2purl[i], val, "p2purl"))
 			LOGWARNING("Invalid p2purl entry number %d", i);
 	}
 }
 
-static void parse_proxies(ckpool_t *ckp, const json_t *arr_val, const int arr_size)
+static void parse_proxies(const json_t *arr_val, const int arr_size)
 {
 	json_t *val;
 	int i;
 
-	ckp->proxies = arr_size;
-	ckp->proxyurl = ckzalloc(sizeof(char *) * arr_size);
-	ckp->proxyauth = ckzalloc(sizeof(char *) * arr_size);
-	ckp->proxypass = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.proxies = arr_size;
+	ckpool.proxyurl = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.proxyauth = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.proxypass = ckzalloc(sizeof(char *) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		val = json_array_get(arr_val, i);
-		json_get_configstring(&ckp->proxyurl[i], val, "url");
-		json_get_configstring(&ckp->proxyauth[i], val, "auth");
-		if (!json_get_string(&ckp->proxypass[i], val, "pass"))
-			ckp->proxypass[i] = strdup("");
+		json_get_configstring(&ckpool.proxyurl[i], val, "url");
+		json_get_configstring(&ckpool.proxyauth[i], val, "auth");
+		if (!json_get_string(&ckpool.proxypass[i], val, "pass"))
+			ckpool.proxypass[i] = strdup("");
 	}
 }
 
-static bool parse_serverurls(ckpool_t *ckp, const json_t *arr_val)
+static bool parse_serverurls(const json_t *arr_val)
 {
 	bool ret = false;
 	int arr_size, i;
@@ -1334,15 +1329,15 @@ static bool parse_serverurls(ckpool_t *ckp, const json_t *arr_val)
 		LOGWARNING("Serverurl array empty");
 		goto out;
 	}
-	ckp->serverurls = arr_size;
-	ckp->serverurl = ckalloc(sizeof(char *) * arr_size);
-	ckp->server_highdiff = ckzalloc(sizeof(bool) * arr_size);
-	ckp->nodeserver = ckzalloc(sizeof(bool) * arr_size);
-	ckp->trusted = ckzalloc(sizeof(bool) * arr_size);
+	ckpool.serverurls = arr_size;
+	ckpool.serverurl = ckalloc(sizeof(char *) * arr_size);
+	ckpool.server_highdiff = ckzalloc(sizeof(bool) * arr_size);
+	ckpool.nodeserver = ckzalloc(sizeof(bool) * arr_size);
+	ckpool.trusted = ckzalloc(sizeof(bool) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		json_t *val = json_array_get(arr_val, i);
 
-		if (!_json_get_string(&ckp->serverurl[i], val, "serverurl"))
+		if (!_json_get_string(&ckpool.serverurl[i], val, "serverurl"))
 			LOGWARNING("Invalid serverurl entry number %d", i);
 	}
 	ret = true;
@@ -1350,7 +1345,7 @@ out:
 	return ret;
 }
 
-static void parse_nodeservers(ckpool_t *ckp, const json_t *arr_val)
+static void parse_nodeservers(const json_t *arr_val)
 {
 	int arr_size, i, j, total_urls;
 
@@ -1365,22 +1360,22 @@ static void parse_nodeservers(ckpool_t *ckp, const json_t *arr_val)
 		LOGWARNING("Nodeserver array empty");
 		return;
 	}
-	total_urls = ckp->serverurls + arr_size;
-	ckp->serverurl = realloc(ckp->serverurl, sizeof(char *) * total_urls);
-	ckp->nodeserver = realloc(ckp->nodeserver, sizeof(bool) * total_urls);
-	ckp->trusted = realloc(ckp->trusted, sizeof(bool) * total_urls);
-	for (i = 0, j = ckp->serverurls; j < total_urls; i++, j++) {
+	total_urls = ckpool.serverurls + arr_size;
+	ckpool.serverurl = realloc(ckpool.serverurl, sizeof(char *) * total_urls);
+	ckpool.nodeserver = realloc(ckpool.nodeserver, sizeof(bool) * total_urls);
+	ckpool.trusted = realloc(ckpool.trusted, sizeof(bool) * total_urls);
+	for (i = 0, j = ckpool.serverurls; j < total_urls; i++, j++) {
 		json_t *val = json_array_get(arr_val, i);
 
-		if (!_json_get_string(&ckp->serverurl[j], val, "nodeserver"))
+		if (!_json_get_string(&ckpool.serverurl[j], val, "nodeserver"))
 			LOGWARNING("Invalid nodeserver entry number %d", i);
-		ckp->nodeserver[j] = true;
-		ckp->nodeservers++;
+		ckpool.nodeserver[j] = true;
+		ckpool.nodeservers++;
 	}
-	ckp->serverurls = total_urls;
+	ckpool.serverurls = total_urls;
 }
 
-static void parse_trusted(ckpool_t *ckp, const json_t *arr_val)
+static void parse_trusted(const json_t *arr_val)
 {
 	int arr_size, i, j, total_urls;
 
@@ -1395,22 +1390,22 @@ static void parse_trusted(ckpool_t *ckp, const json_t *arr_val)
 		LOGWARNING("Trusted array empty");
 		return;
 	}
-	total_urls = ckp->serverurls + arr_size;
-	ckp->serverurl = realloc(ckp->serverurl, sizeof(char *) * total_urls);
-	ckp->nodeserver = realloc(ckp->nodeserver, sizeof(bool) * total_urls);
-	ckp->trusted = realloc(ckp->trusted, sizeof(bool) * total_urls);
-	for (i = 0, j = ckp->serverurls; j < total_urls; i++, j++) {
+	total_urls = ckpool.serverurls + arr_size;
+	ckpool.serverurl = realloc(ckpool.serverurl, sizeof(char *) * total_urls);
+	ckpool.nodeserver = realloc(ckpool.nodeserver, sizeof(bool) * total_urls);
+	ckpool.trusted = realloc(ckpool.trusted, sizeof(bool) * total_urls);
+	for (i = 0, j = ckpool.serverurls; j < total_urls; i++, j++) {
 		json_t *val = json_array_get(arr_val, i);
 
-		if (!_json_get_string(&ckp->serverurl[j], val, "trusted"))
+		if (!_json_get_string(&ckpool.serverurl[j], val, "trusted"))
 			LOGWARNING("Invalid trusted server entry number %d", i);
-		ckp->trusted[j] = true;
+		ckpool.trusted[j] = true;
 	}
-	ckp->serverurls = total_urls;
+	ckpool.serverurls = total_urls;
 }
 
 
-static bool parse_redirecturls(ckpool_t *ckp, const json_t *arr_val)
+static bool parse_redirecturls(const json_t *arr_val)
 {
 	bool ret = false;
 	int arr_size, i;
@@ -1428,9 +1423,9 @@ static bool parse_redirecturls(ckpool_t *ckp, const json_t *arr_val)
 		LOGWARNING("redirecturl array empty");
 		goto out;
 	}
-	ckp->redirecturls = arr_size;
-	ckp->redirecturl = ckalloc(sizeof(char *) * arr_size);
-	ckp->redirectport = ckalloc(sizeof(char *) * arr_size);
+	ckpool.redirecturls = arr_size;
+	ckpool.redirecturl = ckalloc(sizeof(char *) * arr_size);
+	ckpool.redirectport = ckalloc(sizeof(char *) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		json_t *val = json_array_get(arr_val, i);
 
@@ -1438,8 +1433,8 @@ static bool parse_redirecturls(ckpool_t *ckp, const json_t *arr_val)
 		/* See that the url properly resolves */
 		if (!url_from_serverurl(redirecturl, url, port))
 			quit(1, "Invalid redirecturl entry %d %s", i, redirecturl);
-		ckp->redirecturl[i] = strdup(strsep(&redirecturl, ":"));
-		ckp->redirectport[i] = strdup(port);
+		ckpool.redirecturl[i] = strdup(strsep(&redirecturl, ":"));
+		ckpool.redirectport[i] = strdup(port);
 	}
 	ret = true;
 out:
@@ -1447,16 +1442,16 @@ out:
 }
 
 
-static void parse_config(ckpool_t *ckp)
+static void parse_config(void)
 {
 	json_t *json_conf, *arr_val;
 	json_error_t err_val;
 	char *url, *vmask;
 	int arr_size;
 
-	json_conf = json_load_file(ckp->config, JSON_DISABLE_EOF_CHECK, &err_val);
+	json_conf = json_load_file(ckpool.config, JSON_DISABLE_EOF_CHECK, &err_val);
 	if (!json_conf) {
-		LOGWARNING("Json decode error for config file %s: (%d): %s", ckp->config,
+		LOGWARNING("Json decode error for config file %s: (%d): %s", ckpool.config,
 			   err_val.line, err_val.text);
 		return;
 	}
@@ -1464,81 +1459,81 @@ static void parse_config(ckpool_t *ckp)
 	if (arr_val && json_is_array(arr_val)) {
 		arr_size = json_array_size(arr_val);
 		if (arr_size)
-			parse_btcds(ckp, arr_val, arr_size);
+			parse_btcds(arr_val, arr_size);
 	}
 	arr_val = json_object_get(json_conf, "p2purl");
 	if (arr_val && json_is_array(arr_val)) {
 		arr_size = json_array_size(arr_val);
 		if (arr_size)
-			parse_p2purls(ckp, arr_val, arr_size);
+			parse_p2purls(arr_val, arr_size);
 	}
-	json_get_string(&ckp->externalip, json_conf, "externalip");
-	json_get_string(&ckp->btcaddress, json_conf, "btcaddress");
-	json_get_string(&ckp->btcsig, json_conf, "btcsig");
-	if (ckp->btcsig && strlen(ckp->btcsig) > 38) {
-		LOGWARNING("Signature %s too long, truncating to 38 bytes", ckp->btcsig);
-		ckp->btcsig[38] = '\0';
+	json_get_string(&ckpool.externalip, json_conf, "externalip");
+	json_get_string(&ckpool.btcaddress, json_conf, "btcaddress");
+	json_get_string(&ckpool.btcsig, json_conf, "btcsig");
+	if (ckpool.btcsig && strlen(ckpool.btcsig) > 38) {
+		LOGWARNING("Signature %s too long, truncating to 38 bytes", ckpool.btcsig);
+		ckpool.btcsig[38] = '\0';
 	}
-	json_get_int(&ckp->blockpoll, json_conf, "blockpoll");
-	json_get_int(&ckp->nonce1length, json_conf, "nonce1length");
-	json_get_int(&ckp->nonce2length, json_conf, "nonce2length");
-	json_get_int(&ckp->update_interval, json_conf, "update_interval");
+	json_get_int(&ckpool.blockpoll, json_conf, "blockpoll");
+	json_get_int(&ckpool.nonce1length, json_conf, "nonce1length");
+	json_get_int(&ckpool.nonce2length, json_conf, "nonce2length");
+	json_get_int(&ckpool.update_interval, json_conf, "update_interval");
 	json_get_string(&vmask, json_conf, "version_mask");
 	if (vmask && strlen(vmask) && validhex(vmask))
-		sscanf(vmask, "%x", &ckp->version_mask);
+		sscanf(vmask, "%x", &ckpool.version_mask);
 	else
-		ckp->version_mask = 0x1fffe000;
+		ckpool.version_mask = 0x1fffe000;
 
 	/* Default don't drop idle clients */
-	json_get_int(&ckp->dropidle, json_conf, "dropidle");
+	json_get_int(&ckpool.dropidle, json_conf, "dropidle");
 	/* Look for an array first and then a single entry */
 	arr_val = json_object_get(json_conf, "serverurl");
-	if (!parse_serverurls(ckp, arr_val)) {
+	if (!parse_serverurls(arr_val)) {
 		if (json_get_string(&url, json_conf, "serverurl")) {
-			ckp->serverurl = ckalloc(sizeof(char *));
-			ckp->serverurl[0] = url;
-			ckp->serverurls = 1;
+			ckpool.serverurl = ckalloc(sizeof(char *));
+			ckpool.serverurl[0] = url;
+			ckpool.serverurls = 1;
 		}
 	}
 	arr_val = json_object_get(json_conf, "nodeserver");
-	parse_nodeservers(ckp, arr_val);
+	parse_nodeservers(arr_val);
 	arr_val = json_object_get(json_conf, "trusted");
-	parse_trusted(ckp, arr_val);
-	json_get_string(&ckp->upstream, json_conf, "upstream");
-	json_get_int64(&ckp->mindiff, json_conf, "mindiff");
-	json_get_int64(&ckp->startdiff, json_conf, "startdiff");
-	json_get_int64(&ckp->highdiff, json_conf, "highdiff");
-	json_get_int64(&ckp->maxdiff, json_conf, "maxdiff");
-	json_get_string(&ckp->logdir, json_conf, "logdir");
-	json_get_int(&ckp->maxclients, json_conf, "maxclients");
-	json_get_int(&ckp->prioclients, json_conf, "prioclients");
-	json_get_double(&ckp->donation, json_conf, "donation");
+	parse_trusted(arr_val);
+	json_get_string(&ckpool.upstream, json_conf, "upstream");
+	json_get_int64(&ckpool.mindiff, json_conf, "mindiff");
+	json_get_int64(&ckpool.startdiff, json_conf, "startdiff");
+	json_get_int64(&ckpool.highdiff, json_conf, "highdiff");
+	json_get_int64(&ckpool.maxdiff, json_conf, "maxdiff");
+	json_get_string(&ckpool.logdir, json_conf, "logdir");
+	json_get_int(&ckpool.maxclients, json_conf, "maxclients");
+	json_get_int(&ckpool.prioclients, json_conf, "prioclients");
+	json_get_double(&ckpool.donation, json_conf, "donation");
 	/* Avoid dust-sized donations */
-	if (ckp->donation < 0.1)
-		ckp->donation = 0;
-	else if (ckp->donation > 99.9)
-		ckp->donation = 99.9;
+	if (ckpool.donation < 0.1)
+		ckpool.donation = 0;
+	else if (ckpool.donation > 99.9)
+		ckpool.donation = 99.9;
 	arr_val = json_object_get(json_conf, "proxy");
 	if (arr_val && json_is_array(arr_val)) {
 		arr_size = json_array_size(arr_val);
 		if (arr_size)
-			parse_proxies(ckp, arr_val, arr_size);
+			parse_proxies(arr_val, arr_size);
 	}
 	arr_val = json_object_get(json_conf, "redirecturl");
 	if (arr_val)
-		parse_redirecturls(ckp, arr_val);
-	json_get_string(&ckp->zmqblock, json_conf, "zmqblock");
+		parse_redirecturls(arr_val);
+	json_get_string(&ckpool.zmqblock, json_conf, "zmqblock");
 
 	json_decref(json_conf);
 }
 
-static void manage_old_instance(ckpool_t *ckp, proc_instance_t *pi)
+static void manage_old_instance(proc_instance_t *pi)
 {
 	struct stat statbuf;
 	char path[256];
 	FILE *fp;
 
-	sprintf(path, "%s%s.pid", pi->ckp->socket_dir, pi->processname);
+	sprintf(path, "%s%s.pid", ckpool.socket_dir, pi->processname);
 	if (!stat(path, &statbuf)) {
 		int oldpid, ret;
 
@@ -1550,20 +1545,19 @@ static void manage_old_instance(ckpool_t *ckp, proc_instance_t *pi)
 		fclose(fp);
 		if (ret == 1 && !(kill_pid(oldpid, 0))) {
 			LOGNOTICE("Old process %s pid %d still exists", pi->processname, oldpid);
-			if (ckp->handover) {
+			if (ckpool.handover) {
 				LOGINFO("Saving pid to be handled at handover");
 				pi->oldpid = oldpid;
 				return;
 			}
-			terminate_oldpid(ckp, pi, oldpid);
+			terminate_oldpid(pi, oldpid);
 		}
 	}
 }
 
 #ifndef CKP2P
-static void prepare_child(ckpool_t *ckp, proc_instance_t *pi, void *process, char *name)
+static void prepare_child(proc_instance_t *pi, void *process, char *name)
 {
-	pi->ckp = ckp;
 	pi->processname = name;
 	pi->sockname = pi->processname;
 	create_process_unixsock(pi);
@@ -1619,49 +1613,46 @@ int main(int argc, char **argv)
 	int c, ret, i = 0, j;
 	char buf[512] = {};
 	char *appname;
-	ckpool_t ckp;
 
 	/* Make significant floating point errors fatal to avoid subtle bugs being missed */
 	feenableexcept(FE_DIVBYZERO | FE_INVALID);
 	json_set_alloc_funcs(json_ckalloc, free);
 
-	global_ckp = &ckp;
-	memset(&ckp, 0, sizeof(ckp));
-	ckp.starttime = time(NULL);
-	ckp.startpid = getpid();
+	ckpool.starttime = time(NULL);
+	ckpool.startpid = getpid();
 #ifdef CKP2P
-	ckp.loglevel = LOG_WARNING;
+	ckpool.loglevel = LOG_WARNING;
 #else
-	ckp.loglevel = LOG_NOTICE;
+	ckpool.loglevel = LOG_NOTICE;
 #endif
-	ckp.initial_args = ckalloc(sizeof(char *) * (argc + 2)); /* Leave room for extra -H */
-	for (ckp.args = 0; ckp.args < argc; ckp.args++)
-		ckp.initial_args[ckp.args] = strdup(argv[ckp.args]);
-	ckp.initial_args[ckp.args] = NULL;
+	ckpool.initial_args = ckalloc(sizeof(char *) * (argc + 2)); /* Leave room for extra -H */
+	for (ckpool.args = 0; ckpool.args < argc; ckpool.args++)
+		ckpool.initial_args[ckpool.args] = strdup(argv[ckpool.args]);
+	ckpool.initial_args[ckpool.args] = NULL;
 
 	appname = basename(argv[0]);
 	if (!strcmp(appname, "ckproxy"))
-		ckp.proxy = true;
+		ckpool.proxy = true;
 
 	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRrS:s:tu", long_options, &i)) != -1) {
 		switch (c) {
 			case 'B':
-				if (ckp.proxy)
+				if (ckpool.proxy)
 					quit(1, "Cannot set both proxy and btcsolo mode");
-				ckp.btcsolo = true;
+				ckpool.btcsolo = true;
 				break;
 			case 'c':
-				ckp.config = optarg;
+				ckpool.config = optarg;
 				break;
 			case 'D':
-				ckp.daemon = true;
+				ckpool.daemon = true;
 				break;
 			case 'g':
-				ckp.grpnam = optarg;
+				ckpool.grpnam = optarg;
 				break;
 			case 'H':
-				ckp.handover = true;
-				ckp.killold = true;
+				ckpool.handover = true;
+				ckpool.killold = true;
 				break;
 			case 'h':
 				for (j = 0; long_options[j].val; j++) {
@@ -1681,214 +1672,214 @@ int main(int argc, char **argv)
 				}
 				exit(0);
 			case 'k':
-				ckp.killold = true;
+				ckpool.killold = true;
 				break;
 			case 'L':
-				ckp.logshares = true;
+				ckpool.logshares = true;
 				break;
 			case 'l':
-				ckp.loglevel = atoi(optarg);
-				if (ckp.loglevel < LOG_EMERG || ckp.loglevel > LOG_DEBUG) {
+				ckpool.loglevel = atoi(optarg);
+				if (ckpool.loglevel < LOG_EMERG || ckpool.loglevel > LOG_DEBUG) {
 					quit(1, "Invalid loglevel (range %d - %d): %d",
-					     LOG_EMERG, LOG_DEBUG, ckp.loglevel);
+					     LOG_EMERG, LOG_DEBUG, ckpool.loglevel);
 				}
 				break;
 			case 'N':
-				if (ckp.proxy || ckp.redirector || ckp.userproxy || ckp.passthrough)
+				if (ckpool.proxy || ckpool.redirector || ckpool.userproxy || ckpool.passthrough)
 					quit(1, "Cannot set another proxy type or redirector and node mode");
-				ckp.proxy = ckp.passthrough = ckp.node = true;
+				ckpool.proxy = ckpool.passthrough = ckpool.node = true;
 				break;
 			case 'n':
-				ckp.name = optarg;
+				ckpool.name = optarg;
 				break;
 			case 'P':
-				if (ckp.proxy || ckp.redirector || ckp.userproxy || ckp.node)
+				if (ckpool.proxy || ckpool.redirector || ckpool.userproxy || ckpool.node)
 					quit(1, "Cannot set another proxy type or redirector and passthrough mode");
-				ckp.proxy = ckp.passthrough = true;
+				ckpool.proxy = ckpool.passthrough = true;
 				break;
 			case 'p':
-				if (ckp.passthrough || ckp.redirector || ckp.userproxy || ckp.node)
+				if (ckpool.passthrough || ckpool.redirector || ckpool.userproxy || ckpool.node)
 					quit(1, "Cannot set another proxy type or redirector and proxy mode");
-				ckp.proxy = true;
+				ckpool.proxy = true;
 				break;
 			case 'q':
-				ckp.quiet = true;
+				ckpool.quiet = true;
 				break;
 			case 'R':
-				if (ckp.proxy || ckp.passthrough || ckp.userproxy || ckp.node)
+				if (ckpool.proxy || ckpool.passthrough || ckpool.userproxy || ckpool.node)
 					quit(1, "Cannot set a proxy type or passthrough and redirector modes");
-				ckp.proxy = ckp.passthrough = ckp.redirector = true;
+				ckpool.proxy = ckpool.passthrough = ckpool.redirector = true;
 				break;
 			case 'r':
-				ckp.p2prelay = true;
-				if (ckp.proxy || ckp.redirector || ckp.node)
+				ckpool.p2prelay = true;
+				if (ckpool.proxy || ckpool.redirector || ckpool.node)
 					quit(1, "Cannot start as any other mode and relay only");
 				break;
 			case 's':
-				ckp.socket_dir = strdup(optarg);
+				ckpool.socket_dir = strdup(optarg);
 				break;
 			case 't':
-				if (ckp.proxy)
+				if (ckpool.proxy)
 					quit(1, "Cannot set a proxy type and trusted remote mode");
-				ckp.remote = true;
+				ckpool.remote = true;
 				break;
 			case 'u':
-				if (ckp.proxy || ckp.redirector || ckp.passthrough || ckp.node)
+				if (ckpool.proxy || ckpool.redirector || ckpool.passthrough || ckpool.node)
 					quit(1, "Cannot set both userproxy and another proxy type or redirector");
-				ckp.userproxy = ckp.proxy = true;
+				ckpool.userproxy = ckpool.proxy = true;
 				break;
 		}
 	}
 
-
 #ifdef CKP2P
-	ckp.p2prelay = true;
-	if (ckp.proxy || ckp.node || ckp.btcsolo)
+	ckpool.p2prelay = true;
+	if (ckpool.proxy || ckpool.node || ckpool.btcsolo)
 		quit(1, "Cannot set any ckpool mode from standalone ckp2p binary");
 #endif
 
-	if (!ckp.name) {
-		if (ckp.node)
-			ckp.name = "cknode";
-		else if (ckp.redirector)
-			ckp.name = "ckredirector";
-		else if (ckp.passthrough)
-			ckp.name = "ckpassthrough";
-		else if (ckp.proxy)
-			ckp.name = "ckproxy";
-		else if (ckp.p2prelay)
-			ckp.name = "ckp2p";
+	if (!ckpool.name) {
+		if (ckpool.node)
+			ckpool.name = "cknode";
+		else if (ckpool.redirector)
+			ckpool.name = "ckredirector";
+		else if (ckpool.passthrough)
+			ckpool.name = "ckpassthrough";
+		else if (ckpool.proxy)
+			ckpool.name = "ckproxy";
+#ifdef CKP2P
+		else if (ckpool.p2prelay)
+			ckpool.name = "ckp2p";
+#endif
 		else
-			ckp.name = "ckpool";
+			ckpool.name = "ckpool";
 	}
-	snprintf(buf, 15, "%s", ckp.name);
+	snprintf(buf, 15, "%s", ckpool.name);
 	prctl(PR_SET_NAME, buf, 0, 0, 0);
 	memset(buf, 0, 15);
 
-	if (ckp.grpnam) {
-		struct group *group = getgrnam(ckp.grpnam);
+	if (ckpool.grpnam) {
+		struct group *group = getgrnam(ckpool.grpnam);
 
 		if (!group)
-			quit(1, "Failed to find group %s", ckp.grpnam);
-		ckp.gr_gid = group->gr_gid;
+			quit(1, "Failed to find group %s", ckpool.grpnam);
+		ckpool.gr_gid = group->gr_gid;
 	} else
-		ckp.gr_gid = getegid();
+		ckpool.gr_gid = getegid();
 
-	if (!ckp.config) {
-		ckp.config = strdup(ckp.name);
-		realloc_strcat(&ckp.config, ".conf");
+	if (!ckpool.config) {
+		ckpool.config = strdup(ckpool.name);
+		realloc_strcat(&ckpool.config, ".conf");
 	}
-	if (!ckp.socket_dir) {
-		ckp.socket_dir = strdup("/tmp/");
-		realloc_strcat(&ckp.socket_dir, ckp.name);
+	if (!ckpool.socket_dir) {
+		ckpool.socket_dir = strdup("/tmp/");
+		realloc_strcat(&ckpool.socket_dir, ckpool.name);
 	}
-	trail_slash(&ckp.socket_dir);
+	trail_slash(&ckpool.socket_dir);
 
 	/* Ignore sigpipe */
 	signal(SIGPIPE, SIG_IGN);
 
-	ret = mkdir(ckp.socket_dir, 0750);
+	ret = mkdir(ckpool.socket_dir, 0750);
 	if (ret && errno != EEXIST)
-		quit(1, "Failed to make directory %s", ckp.socket_dir);
+		quit(1, "Failed to make directory %s", ckpool.socket_dir);
 
-	parse_config(&ckp);
+	parse_config();
 	/* Set defaults if not found in config file */
-	if (!ckp.btcds) {
-		ckp.btcds = 1;
-		ckp.btcdurl = ckzalloc(sizeof(char *));
-		ckp.btcdauth = ckzalloc(sizeof(char *));
-		ckp.btcdpass = ckzalloc(sizeof(char *));
-		ckp.btcdnotify = ckzalloc(sizeof(bool));
+	if (!ckpool.btcds) {
+		ckpool.btcds = 1;
+		ckpool.btcdurl = ckzalloc(sizeof(char *));
+		ckpool.btcdauth = ckzalloc(sizeof(char *));
+		ckpool.btcdpass = ckzalloc(sizeof(char *));
+		ckpool.btcdnotify = ckzalloc(sizeof(bool));
 	}
-	for (i = 0; i < ckp.btcds; i++) {
-		if (!ckp.btcdurl[i])
-			ckp.btcdurl[i] = strdup("localhost:8332");
-		if (!ckp.btcdauth[i])
-			ckp.btcdauth[i] = strdup("user");
-		if (!ckp.btcdpass[i])
-			ckp.btcdpass[i] = strdup("pass");
+	for (i = 0; i < ckpool.btcds; i++) {
+		if (!ckpool.btcdurl[i])
+			ckpool.btcdurl[i] = strdup("localhost:8332");
+		if (!ckpool.btcdauth[i])
+			ckpool.btcdauth[i] = strdup("user");
+		if (!ckpool.btcdpass[i])
+			ckpool.btcdpass[i] = strdup("pass");
 	}
-	if (!ckp.p2purls) {
-		ckp.p2purls = 1;
-		ckp.p2purl = ckzalloc(sizeof(char *));
-		ckp.p2purl[0] = strdup("localhost:8333");
+	if (!ckpool.p2purls) {
+		ckpool.p2purls = 1;
+		ckpool.p2purl = ckzalloc(sizeof(char *));
+		ckpool.p2purl[0] = strdup("localhost:8333");
 	}
 
-	ckp.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
+	ckpool.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
 
 	/* Donations on testnet are meaningless but required for complete
 	 * testing. Testnet and regtest addresses */
-	ckp.tndonaddress = "tb1qdxclx2qxdh0g67j27v6y6ls0xm9cl2w2xktjq2";
-	ckp.rtdonaddress = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
+	ckpool.tndonaddress = "tb1qdxclx2qxdh0g67j27v6y6ls0xm9cl2w2xktjq2";
+	ckpool.rtdonaddress = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
 
-	if (!ckp.btcaddress && !ckp.btcsolo && !ckp.proxy && !ckp.p2prelay)
+	if (!ckpool.btcaddress && !ckpool.btcsolo && !ckpool.proxy && !ckpool.p2prelay)
 		quit(0, "Non solo mining must have a btcaddress in config, aborting!");
-	if (!ckp.blockpoll)
-		ckp.blockpoll = 100;
-	if (!ckp.nonce1length)
-		ckp.nonce1length = 4;
-	else if (ckp.nonce1length < 2 || ckp.nonce1length > 8)
-		quit(0, "Invalid nonce1length %d specified, must be 2~8", ckp.nonce1length);
-	if (!ckp.nonce2length) {
+	if (!ckpool.blockpoll)
+		ckpool.blockpoll = 100;
+	if (!ckpool.nonce1length)
+		ckpool.nonce1length = 4;
+	else if (ckpool.nonce1length < 2 || ckpool.nonce1length > 8)
+		quit(0, "Invalid nonce1length %d specified, must be 2~8", ckpool.nonce1length);
+	if (!ckpool.nonce2length) {
 		/* nonce2length is zero by default in proxy mode */
-		if (!ckp.proxy)
-			ckp.nonce2length = 8;
-	} else if (ckp.nonce2length < 2 || ckp.nonce2length > 8)
-		quit(0, "Invalid nonce2length %d specified, must be 2~8", ckp.nonce2length);
-	if (!ckp.update_interval)
-		ckp.update_interval = 30;
-	if (!ckp.mindiff)
-		ckp.mindiff = 1;
-	if (!ckp.startdiff)
-		ckp.startdiff = 42;
-	if (!ckp.highdiff)
-		ckp.highdiff = 1000000;
-	if (!ckp.logdir)
-		ckp.logdir = strdup("logs");
-	if (!ckp.serverurls)
-		ckp.serverurl = ckzalloc(sizeof(char *));
-	if (ckp.proxy && !ckp.proxies)
-		quit(0, "No proxy entries found in config file %s", ckp.config);
-	if (ckp.redirector && !ckp.redirecturls)
-		quit(0, "No redirect entries found in config file %s", ckp.config);
-	if (!ckp.zmqblock)
-		ckp.zmqblock = "tcp://127.0.0.1:28332";
+		if (!ckpool.proxy)
+			ckpool.nonce2length = 8;
+	} else if (ckpool.nonce2length < 2 || ckpool.nonce2length > 8)
+		quit(0, "Invalid nonce2length %d specified, must be 2~8", ckpool.nonce2length);
+	if (!ckpool.update_interval)
+		ckpool.update_interval = 30;
+	if (!ckpool.mindiff)
+		ckpool.mindiff = 1;
+	if (!ckpool.startdiff)
+		ckpool.startdiff = 42;
+	if (!ckpool.highdiff)
+		ckpool.highdiff = 1000000;
+	if (!ckpool.logdir)
+		ckpool.logdir = strdup("logs");
+	if (!ckpool.serverurls)
+		ckpool.serverurl = ckzalloc(sizeof(char *));
+	if (ckpool.proxy && !ckpool.proxies)
+		quit(0, "No proxy entries found in config file %s", ckpool.config);
+	if (ckpool.redirector && !ckpool.redirecturls)
+		quit(0, "No redirect entries found in config file %s", ckpool.config);
+	if (!ckpool.zmqblock)
+		ckpool.zmqblock = "tcp://127.0.0.1:28332";
 
 	/* Create the log directory */
-	trail_slash(&ckp.logdir);
-	ret = mkdir(ckp.logdir, 0750);
+	trail_slash(&ckpool.logdir);
+	ret = mkdir(ckpool.logdir, 0750);
 	if (ret && errno != EEXIST)
-		quit(1, "Failed to make log directory %s", ckp.logdir);
+		quit(1, "Failed to make log directory %s", ckpool.logdir);
 
 	/* Create the user logdir */
-	sprintf(buf, "%s/users", ckp.logdir);
+	sprintf(buf, "%s/users", ckpool.logdir);
 	ret = mkdir(buf, 0750);
 	if (ret && errno != EEXIST)
 		quit(1, "Failed to make user log directory %s", buf);
 
 	/* Create the pool logdir */
-	sprintf(buf, "%s/pool", ckp.logdir);
+	sprintf(buf, "%s/pool", ckpool.logdir);
 	ret = mkdir(buf, 0750);
 	if (ret && errno != EEXIST)
 		quit(1, "Failed to make pool log directory %s", buf);
 
 	/* Create the logfile */
-	ASPRINTF(&ckp.logfilename, "%s%s.log", ckp.logdir, ckp.name);
-	if (!open_logfile(&ckp))
+	ASPRINTF(&ckpool.logfilename, "%s%s.log", ckpool.logdir, ckpool.name);
+	if (!open_logfile())
 		quit(1, "Failed to make open log file %s", buf);
-	launch_logger(&ckp);
+	launch_logger();
 
-	ckp.main.ckp = &ckp;
-	ckp.main.processname = strdup("main");
-	ckp.main.sockname = strdup("listener");
-	name_process_sockname(&ckp.main.us, &ckp.main);
-	ckp.oldconnfd = ckzalloc(sizeof(int *) * ckp.serverurls);
-	manage_old_instance(&ckp, &ckp.main);
-	if (ckp.handover) {
-		const char *path = ckp.main.us.path;
+	ckpool.main.processname = strdup("main");
+	ckpool.main.sockname = strdup("listener");
+	name_process_sockname(&ckpool.main.us, &ckpool.main);
+	ckpool.oldconnfd = ckzalloc(sizeof(int *) * ckpool.serverurls);
+	manage_old_instance(&ckpool.main);
+	if (ckpool.handover) {
+		const char *path = ckpool.main.us.path;
 
 		if (send_recv_path(path, "ping")) {
-			for (i = 0; i < ckp.serverurls; i++) {
+			for (i = 0; i < ckpool.serverurls; i++) {
 				char oldurl[INET6_ADDRSTRLEN], oldport[8];
 				char getfd[16];
 				int sockd;
@@ -1899,9 +1890,9 @@ int main(int argc, char **argv)
 					break;
 				if (!send_unix_msg(sockd, getfd))
 					break;
-				ckp.oldconnfd[i] = get_fd(sockd);
+				ckpool.oldconnfd[i] = get_fd(sockd);
 				Close(sockd);
-				sockd = ckp.oldconnfd[i];
+				sockd = ckpool.oldconnfd[i];
 				if (!sockd)
 					break;
 				if (url_from_socket(sockd, oldurl, oldport)) {
@@ -1909,7 +1900,7 @@ int main(int argc, char **argv)
 						   i, oldurl, oldport);
 				} else {
 					LOGWARNING("Inherited old server socket %d with new file descriptor %d!",
-						   i, ckp.oldconnfd[i]);
+						   i, ckpool.oldconnfd[i]);
 				}
 			}
 			send_recv_path(path, "reject");
@@ -1918,7 +1909,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (ckp.daemon) {
+	if (ckpool.daemon) {
 		int fd;
 
 		if (fork())
@@ -1932,28 +1923,28 @@ int main(int argc, char **argv)
 		}
 	}
 
-	write_namepid(&ckp.main);
-	open_process_sock(&ckp, &ckp.main, &ckp.main.us);
+	write_namepid(&ckpool.main);
+	open_process_sock(&ckpool.main, &ckpool.main.us);
 
 	ret = sysconf(_SC_OPEN_MAX);
-#if CKP2P
-	if (!ckp.maxclients)
-		ckp.maxclients = 4000;
-	if (!ckp.prioclients)
-		ckp.prioclients = 1;
+#ifdef CKP2P
+	if (!ckpool.maxclients)
+		ckpool.maxclients = 4000;
+	if (!ckpool.prioclients)
+		ckpool.prioclients = 1;
 #endif
-	if (ckp.maxclients > ret * 5 / 10) {
+	if (ckpool.maxclients > ret * 9 / 10) {
 		LOGWARNING("Cannot set maxclients to %d due to max open file limit of %d, reducing to %d",
-			   ckp.maxclients, ret, ret * 5 / 10);
-		ckp.maxclients = ret * 5 / 10;
-	} else if (!ckp.maxclients) {
+			   ckpool.maxclients, ret, ret * 9 / 10);
+		ckpool.maxclients = ret * 9 / 10;
+	} else if (!ckpool.maxclients) {
 		LOGNOTICE("Setting maxclients to %d due to max open file limit of %d",
 			  ret * 9 / 10, ret);
-		ckp.maxclients = ret * 9 / 10;
+		ckpool.maxclients = ret * 9 / 10;
 	}
 
-	// ckp.ckpapi = create_ckmsgq(&ckp, "api", &ckpool_api);
-	create_pthread(&ckp.pth_listener, listener, &ckp.main);
+	// ckpool.ckpapi = create_ckmsgq("api", &ckpool_api);
+	create_pthread(&ckpool.pth_listener, listener, &ckpool.main);
 
 	handler.sa_handler = &sighandler;
 	handler.sa_flags = 0;
@@ -1962,22 +1953,22 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &handler, NULL);
 
 	/* Launch separate processes from here */
-	if (prepare_ckp2p(&ckp)) {
+	if (prepare_ckp2p()) {
 		LOGEMERG("Failed to start ckp2p2, exiting");
 		exit(1);
 	}
 #ifndef CKP2P
-	if (!ckp.p2prelay) {
-		prepare_child(&ckp, &ckp.generator, generator, "generator");
-		prepare_child(&ckp, &ckp.stratifier, stratifier, "stratifier");
-		prepare_child(&ckp, &ckp.connector, connector, "connector");
+	if (!ckpool.p2prelay) {
+		prepare_child(&ckpool.generator, generator, "generator");
+		prepare_child(&ckpool.stratifier, stratifier, "stratifier");
+		prepare_child(&ckpool.connector, connector, "connector");
 	}
 #endif
 	/* Shutdown from here if the listener is sent a shutdown message */
-	if (ckp.pth_listener)
-		join_pthread(ckp.pth_listener);
+	if (ckpool.pth_listener)
+		join_pthread(ckpool.pth_listener);
 
-	clean_up(&ckp);
+	clean_up();
 
 	return 0;
 }

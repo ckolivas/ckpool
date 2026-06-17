@@ -90,15 +90,15 @@ struct genwork {
 	yyjson_val *gbtroot;
 };
 
-void parse_remote_txns(ckpool_t *ckp, const json_t *val);
-#define parse_upstream_txns(ckp, val) parse_remote_txns(ckp, val)
-void parse_upstream_auth(ckpool_t *ckp, json_t *val);
-void parse_upstream_workinfo(ckpool_t *ckp, json_t *val);
-void parse_upstream_block(ckpool_t *ckp, json_t *val);
-void parse_upstream_reqtxns(ckpool_t *ckp, json_t *val);
-char *stratifier_stats(ckpool_t *ckp, void *data);
-void _stratifier_add_yyrecv(ckpool_t *ckp, yyjson_mut_doc *doc, const char *file, const char *func, const int line);
-#define stratifier_add_yyrecv(ckp, val) _stratifier_add_yyrecv(ckp, doc, __FILE__, __func__, __LINE__)
+void parse_remote_txns(const json_t *val);
+#define parse_upstream_txns(val) parse_remote_txns(val)
+void parse_upstream_auth(json_t *val);
+void parse_upstream_workinfo(json_t *val);
+void parse_upstream_block(json_t *val);
+void parse_upstream_reqtxns(json_t *val);
+char *stratifier_stats(void *data);
+void _stratifier_add_yyrecv(yyjson_mut_doc *doc, const char *file, const char *func, const int line);
+#define stratifier_add_yyrecv(val) _stratifier_add_yyrecv(doc, __FILE__, __func__, __LINE__)
 void *stratifier(void *arg);
 
 #endif /* STRATIFIER_H */

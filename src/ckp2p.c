@@ -224,7 +224,7 @@ static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
 
 static void reset_reconnect(p2p_conn_t *conn)
 {
-	if (conn->peer < 0 || conn->peer > conn->ckp->prioclients)
+	if (conn->peer < 0 || conn->peer > ckpool.prioclients)
 		conn->reconnect = KEEPALIVE_INTERVAL;
 }
 
@@ -264,13 +264,13 @@ static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, ui
 }
 
 /* Safe way to read a peer pointer while the array may be resized */
-static p2p_conn_t *get_peer(ckpool_t *ckp, int peer)
+static p2p_conn_t *get_peer(int peer)
 {
 	p2p_conn_t *conn = NULL;
 
 	ck_rlock(&peerlock);
-	if (likely(peer < ckp->p2purls))
-		conn = ckp->p2pconn[peer];
+	if (likely(peer < ckpool.p2purls))
+		conn = ckpool.p2pconn[peer];
 	ck_runlock(&peerlock);
 
 	return conn;
@@ -525,9 +525,9 @@ static void evict_peer(p2p_conn_t *conn)
 	total_conns--;
 }
 
-static void evict_peerno(ckpool_t *ckp, int peer)
+static void evict_peerno(int peer)
 {
-	p2p_conn_t *conn = get_peer(ckp, peer);
+	p2p_conn_t *conn = get_peer(peer);
 
 	if (likely(conn))
 		evict_peer(conn);
@@ -563,7 +563,7 @@ static void add_connector(p2p_conn_t *conn)
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
 		new = true;
-		if (conn->peer > conn->ckp->prioclients)
+		if (conn->peer > ckpool.prioclients)
 			tv_monotonic(&conn->last_attempt);
 	}
 	ck_wunlock(&peerlock);
@@ -727,7 +727,7 @@ static void handle_inv(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	dealloc(payload);
 }
 
-static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
+static void relay_compact_block(const uchar *blockhash, uchar *cmpct_payload,
 				uint32_t cmpct_len, uint64_t shortid_nonce, int source);
 
 static void display_newblock(uchar *blockhash)
@@ -777,7 +777,7 @@ static int blockcmp(blocklist_t *a, uchar *b)
 }
 
 /* Function for testing cmpctblock validity by echoing back any received */
-static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int source)
+static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 {
 	uint64_t shortid_nonce_le, shortid_nonce;
 	bool new_block = false;
@@ -794,7 +794,7 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 
 	/* Trust priority peers implicitly; other peers only if diff is higher */
 	if (block_bits != current_bits) {
-		if (current_bits > block_bits || source < ckp->prioclients) {
+		if (current_bits > block_bits || source < ckpool.prioclients) {
 			LOGWARNING("Current bits set to 0x%08x (from peer %d)", block_bits, source);
 
 			ck_wlock(&curblock.lock);
@@ -812,7 +812,7 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 			   source, current_bits);
 		dealloc(payload);
 		if (likely(source))
-			evict_peerno(ckp, source);
+			evict_peerno(source);
 		else
 			LOGERR("Peer 0 compact block doesn't meet target!");
 		return;
@@ -852,7 +852,7 @@ static void handle_cmpctblock(ckpool_t *ckp, uchar *payload, uint32_t plen, int 
 
 	if (new_block) {
 		display_newblock(blockhash);
-		relay_compact_block(ckp, blockhash, payload, plen, shortid_nonce, source);
+		relay_compact_block(blockhash, payload, plen, shortid_nonce, source);
 		/* payload is stolen and released by relay_compact_block */
 	} else
 		dealloc(payload);
@@ -1055,7 +1055,6 @@ static void add_conn_epoll(p2p_conn_t *conn)
 static void *add_peer(void *arg)
 {
 	p2p_conn_t *conn = arg;
-	ckpool_t *ckp = conn->ckp;
 
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pap");
@@ -1078,36 +1077,36 @@ static void *add_peer(void *arg)
 	}
 
 	/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
-	int old = ckp->p2purls;
+	int old = ckpool.p2purls;
 
 	/* p2purl */
-	char **old_p2purl = ckp->p2purl;
-	ckp->p2purl = ckalloc(sizeof(char *) * (old + 1));
+	char **old_p2purl = ckpool.p2purl;
+	ckpool.p2purl = ckalloc(sizeof(char *) * (old + 1));
 	if (old > 0)
-		memcpy(ckp->p2purl, old_p2purl, sizeof(char *) * old);
+		memcpy(ckpool.p2purl, old_p2purl, sizeof(char *) * old);
 	char *new_url = ckalloc(strlen(conn->host) + strlen(conn->charport) + 2);
 	sprintf(new_url, "%s:%s", conn->host, conn->charport);
-	ckp->p2purl[old] = new_url;
+	ckpool.p2purl[old] = new_url;
 	if (old_p2purl) dealloc(old_p2purl);
 
 	/* p2pcs (for API consistency) */
-	connsock_t **old_p2pcs = ckp->p2pcs;
-	ckp->p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
+	connsock_t **old_p2pcs = ckpool.p2pcs;
+	ckpool.p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
 	if (old > 0)
-		memcpy(ckp->p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
-	ckp->p2pcs[old] = NULL;
+		memcpy(ckpool.p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
+	ckpool.p2pcs[old] = NULL;
 	if (old_p2pcs) dealloc(old_p2pcs);
 
 	/* p2pconn */
-	p2p_conn_t **old_p2pconn = ckp->p2pconn;
-	ckp->p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
+	p2p_conn_t **old_p2pconn = ckpool.p2pconn;
+	ckpool.p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
 	if (old > 0)
-		memcpy(ckp->p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
-	ckp->p2pconn[old] = conn;
+		memcpy(ckpool.p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
+	ckpool.p2pconn[old] = conn;
 	if (old_p2pconn) dealloc(old_p2pconn);
 
 	conn->peer = old;
-	ckp->p2purls = old + 1;
+	ckpool.p2purls = old + 1;
 	total_conns++;
 	_activate_conn(conn);
 
@@ -1123,7 +1122,7 @@ out:
 	return NULL;
 }
 
-static void add_peer_async(ckpool_t *ckp, const char *host, int port)
+static void add_peer_async(const char *host, int port)
 {
 	pthread_t pthread;
 	p2p_conn_t *conn;
@@ -1133,7 +1132,6 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 		return;
 
 	conn = ckzalloc(sizeof(*conn));
-	conn->ckp = ckp;
 	cklock_init(&conn->block_lock);
 	conn->sock = -1;
 	strncpy(conn->host, host, sizeof(conn->host) - 1);
@@ -1148,24 +1146,24 @@ static void add_peer_async(ckpool_t *ckp, const char *host, int port)
 	create_pthread(&pthread, add_peer, conn);
 }
 
-static inline bool client_watermarks(ckpool_t *ckp)
+static inline bool client_watermarks(void)
 {
 	bool ret = true;
 
-	if (total_conns >= ckp->maxclients * 4 / 3)
+	if (total_conns >= ckpool.maxclients * 4 / 3)
 		goto out;
-	if (active_conns >= ckp->maxclients)
+	if (active_conns >= ckpool.maxclients)
 		goto out;
 	ret = false;
 out:
 	return ret;
 }
 
-static bool pause_clients(ckpool_t *ckp)
+static bool pause_clients(void)
 {
 	bool ret = true;
 
-	if (client_watermarks(ckp))
+	if (client_watermarks())
 		goto out;
 	if (connectors_woken() >= num_threads)
 		goto out;
@@ -1176,12 +1174,12 @@ out:
 
 /* Parse an ADDRV2 message and extract/log all host:port pairs.
  * Supports IPv4 (netid=1) and IPv6 (netid=2). */
-static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
+static void parse_addrv2(uchar *data, uint32_t dlen)
 {
 	uint32_t pos = 0;
 	int i, count;
 
-	if (pause_clients(ckp)) {
+	if (pause_clients()) {
 		LOGDEBUG("Max client limit reached, not adding more p2p clients");
 		goto out;
 	}
@@ -1241,7 +1239,7 @@ static void parse_addrv2(ckpool_t *ckp, uchar *data, uint32_t dlen)
 			port = 8333;   /* default Bitcoin port if not specified */
 
 		if (!dup_peer(host, port))
-			add_peer_async(ckp, host, port);
+			add_peer_async(host, port);
 		else
 			LOGINFO("Dup addrv2: %s:%d", host, port);
 
@@ -1252,9 +1250,8 @@ out:
 	dealloc(data);
 }
 
-static void *p2p_receiver(void *arg)
+static void *p2p_receiver(void __maybe_unused *arg)
 {
-	ckpool_t *ckp = arg;
 	struct epoll_event event;
 
 	rename_proc("p2preceiver");
@@ -1277,7 +1274,7 @@ static void *p2p_receiver(void *arg)
 		idx = event.data.u64;
 
 		ck_rlock(&peerlock);
-		p2purls = ckp->p2purls;
+		p2purls = ckpool.p2purls;
 		ck_runlock(&peerlock);
 
 		if (unlikely(idx >= (uint64_t)p2purls)) {
@@ -1285,7 +1282,7 @@ static void *p2p_receiver(void *arg)
 			continue;
 		}
 
-		conn = get_peer(ckp, idx);
+		conn = get_peer(idx);
 		if (unlikely(!conn || conn->evicted))
 			continue;
 
@@ -1297,7 +1294,7 @@ static void *p2p_receiver(void *arg)
 	return NULL;
 }
 
-static void p2p_connector(ckpool_t __maybe_unused *ckp, p2p_conn_t *conn)
+static void p2p_connector(p2p_conn_t *conn)
 {
 	if (unlikely(conn->evicted))
 		goto out;
@@ -1326,7 +1323,7 @@ out:
 	return;
 }
 
-static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
+static void p2p_reader(p2p_conn_t *conn)
 {
 	uchar *payload = NULL;
 	struct pollfd fdpoll = {};
@@ -1389,7 +1386,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		LOGINFO("Received HEADERS (%u bytes) - ignoring", plen);
 	} else if (!strcmp(cmd, "cmpctblock")) {
 		LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
-		handle_cmpctblock(ckp, payload, plen, conn->peer);
+		handle_cmpctblock(payload, plen, conn->peer);
 		goto rearm;
 	} else if (!strcmp(cmd, "tx")) {
 		LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
@@ -1407,7 +1404,7 @@ static void p2p_reader(ckpool_t *ckp, p2p_conn_t *conn)
 		LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
 	} else if (!strcmp(cmd, "addrv2")) {
 		LOGINFO("Received ADDRV2 (%u bytes)", plen);
-		parse_addrv2(ckp, payload, plen);
+		parse_addrv2(payload, plen);
 		goto rearm; // Handler deallocates
 	} else if (!strcmp(cmd, "feefilter")) {
 		LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
@@ -1435,7 +1432,7 @@ out:
 }
 
 /* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
-static void dump_peers(ckpool_t *ckp)
+static void dump_peers(void)
 {
 	peerlist_t *p2ppeer;
 	int count = 0;
@@ -1446,9 +1443,9 @@ static void dump_peers(ckpool_t *ckp)
 		LOGERR("Unable to fopen peers.conf in dump_peers");
 		return;
 	}
-	fprintf(fp, "{\n\"maxclients\" : %d,\n", ckp->maxclients);
-	fprintf(fp, "\"prioclients\" : %d,\n", ckp->prioclients);
-	fprintf(fp, "\"externalip\" : \"%s\",\n", ckp->externalip);
+	fprintf(fp, "{\n\"maxclients\" : %d,\n", ckpool.maxclients);
+	fprintf(fp, "\"prioclients\" : %d,\n", ckpool.prioclients);
+	fprintf(fp, "\"externalip\" : \"%s\",\n", ckpool.externalip);
 	fprintf(fp, "\"p2purl\" : [");
 
 	ck_rlock(&peerlock);
@@ -1472,9 +1469,8 @@ static void dump_peers(ckpool_t *ckp)
 	LOGINFO("Stored %d peers in peers.conf", count);
 }
 
-static void *p2p_keepalive(void *arg)
+static void *p2p_keepalive(void __maybe_unused *arg)
 {
-	ckpool_t *ckp = arg;
 	ts_t last_update;
 	tv_t last_ping;
 
@@ -1491,7 +1487,7 @@ static void *p2p_keepalive(void *arg)
 		tv_t now;
 
 		ck_rlock(&peerlock);
-		p2purls = ckp->p2purls;
+		p2purls = ckpool.p2purls;
 		ck_runlock(&peerlock);
 #ifdef CKP2P
 		printf("Peers:%d, Connections:%d, Active:%d            \r", p2purls,
@@ -1507,11 +1503,11 @@ static void *p2p_keepalive(void *arg)
 		if (tvdiff(&now, &last_ping) > PING_INTERVAL) {
 			copy_tv(&last_ping, &now);
 			ping = true;
-			dump_peers(ckp);
+			dump_peers();
 		}
 
 		for (i = 0; i < p2purls ; i++) {
-			p2p_conn_t *conn = get_peer(ckp, i);
+			p2p_conn_t *conn = get_peer(i);
 
 			if (unlikely(!conn))
 				continue;
@@ -1526,12 +1522,12 @@ static void *p2p_keepalive(void *arg)
 					continue;
 				}
 
-				prio = (i < ckp->prioclients);
+				prio = (i < ckpool.prioclients);
 				/* Never evict priority clients */
 				if (!prio) {
 					int unresponsive = tvdiff(&now, &conn->last_alive);
 
-					if (client_watermarks(ckp))
+					if (client_watermarks())
 						timeout = FAST_EVICT;
 					if (unresponsive >= timeout) {
 						LOGWARNING("Dropping peer %d unresponsive for %d seconds",
@@ -1565,7 +1561,6 @@ static void *p2p_keepalive(void *arg)
 
 struct compact_block {
 	pthread_t pth;
-	ckpool_t *ckp;
 	uchar blockhash[32];
 	uchar *cmpct_payload;
 	uint32_t cmpct_len;
@@ -1579,7 +1574,6 @@ static void *submission_thread(void *arg)
 {
 	compact_block_t *cbt = arg;
 	char fliphash[32], hex[68];
-	ckpool_t *ckp = cbt->ckp;
 	int i, submitted = 0;
 	bool priosource;
 	int p2purls;
@@ -1587,17 +1581,17 @@ static void *submission_thread(void *arg)
 	pthread_detach(pthread_self());
 
 	ck_rlock(&peerlock);
-	p2purls = ckp->p2purls;
+	p2purls = ckpool.p2purls;
 	ck_runlock(&peerlock);
 
-	priosource = cbt->source < ckp->prioclients ? true : false;
+	priosource = cbt->source < ckpool.prioclients ? true : false;
 
 	for (i = 0; i < p2purls; i++) {
 		p2p_conn_t *conn;
 
 		/* Only relay to prioclients unless the compact block has come
 		 * from a priority source */
-		if (!priosource && i >= ckp->prioclients)
+		if (!priosource && i >= ckpool.prioclients)
 			break;
 
 		if (i == cbt->source) {
@@ -1605,7 +1599,7 @@ static void *submission_thread(void *arg)
 			continue;
 		}
 
-		conn = get_peer(ckp, i);
+		conn = get_peer(i);
 		if (unlikely(!conn)) {
 			LOGDEBUG("Skipping relaying compact block to uninitialised node %d", i);
 			continue;
@@ -1639,7 +1633,7 @@ static void *submission_thread(void *arg)
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
 		/* Disconnect all priority peers to avoid inducing latency at
 		 * their end in case they ask for more information from ckp2p.*/
-		if (i < ckp->prioclients) {
+		if (i < ckpool.prioclients) {
 			disconnect_conn(conn);
 			add_connector(conn);
 		}
@@ -1657,12 +1651,11 @@ static void *submission_thread(void *arg)
 	return NULL;
 }
 
-static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
+static void relay_compact_block(const uchar *blockhash, uchar *cmpct_payload,
 				uint32_t cmpct_len, uint64_t shortid_nonce, int source)
 {
 	compact_block_t *cbt = ckalloc(sizeof(compact_block_t));
 
-	cbt->ckp = ckp;
 	memcpy(cbt->blockhash, blockhash, 32);
 	/* Steal payload memory here */
 	cbt->cmpct_payload = cmpct_payload;
@@ -1673,18 +1666,17 @@ static void relay_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cm
 	create_pthread(&cbt->pth, submission_thread, cbt);
 }
 
-void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
+void submit_compact_block(const uchar *blockhash, uchar *cmpct_payload,
 			  uint32_t cmpct_len, uint64_t shortid_nonce)
 {
-	relay_compact_block(ckp, blockhash, cmpct_payload, cmpct_len, shortid_nonce, -1);
+	relay_compact_block(blockhash, cmpct_payload, cmpct_len, shortid_nonce, -1);
 }
 
-static p2p_conn_t *ckp2p_connect(ckpool_t *ckp, const char *host, const char *charport, int source)
+static p2p_conn_t *ckp2p_connect(const char *host, const char *charport, int source)
 {
 	p2p_conn_t *conn = ckzalloc(sizeof(*conn));
 	int port, i;
 
-	conn->ckp = ckp;
 	cklock_init(&conn->block_lock);
 	conn->peer = source;
 	conn->sock = -1;
@@ -1754,10 +1746,8 @@ static int create_p2p_listener(void)
 /* Acceptor thread – accepts incoming connections, runs full handshake,
  * adds them to the p2purl / p2pconn lists, and spawns reader/keepalive threads
  * exactly like outgoing peers. */
-static void *p2p_acceptor(void *arg)
+static void *p2p_acceptor(void __maybe_unused *arg)
 {
-	ckpool_t *ckp = arg;
-
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pa");
 
@@ -1770,7 +1760,7 @@ static void *p2p_acceptor(void *arg)
 		socklen_t clen = sizeof(client_addr);
 		int newsock;
 
-		while (client_watermarks(ckp))
+		while (client_watermarks())
 			sleep(KEEPALIVE_INTERVAL);
 		newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
 		if (newsock < 0) {
@@ -1788,7 +1778,6 @@ static void *p2p_acceptor(void *arg)
 		LOGNOTICE("Incoming ckp2p connection from %s:%d", host, port_num);
 
 		p2p_conn_t *conn = ckzalloc(sizeof(*conn));
-		conn->ckp = ckp;
 		cklock_init(&conn->block_lock);
 		conn->sock = newsock;
 		strncpy(conn->host, host, sizeof(conn->host) - 1);
@@ -1808,37 +1797,37 @@ static void *p2p_acceptor(void *arg)
 
 		ck_wlock(&peerlock);
 		/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
-		int old = ckp->p2purls;
+		int old = ckpool.p2purls;
 
 		/* p2purl */
-		char **old_p2purl = ckp->p2purl;
-		ckp->p2purl = ckalloc(sizeof(char *) * (old + 1));
+		char **old_p2purl = ckpool.p2purl;
+		ckpool.p2purl = ckalloc(sizeof(char *) * (old + 1));
 		if (old > 0)
-			memcpy(ckp->p2purl, old_p2purl, sizeof(char *) * old);
+			memcpy(ckpool.p2purl, old_p2purl, sizeof(char *) * old);
 		char *new_url = ckalloc(strlen(host) + strlen(serv) + 2);
 		sprintf(new_url, "%s:%s", host, serv);
-		ckp->p2purl[old] = new_url;
+		ckpool.p2purl[old] = new_url;
 		if (old_p2purl) dealloc(old_p2purl);
 
 		/* p2pcs (for API consistency) */
-		connsock_t **old_p2pcs = ckp->p2pcs;
-		ckp->p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
+		connsock_t **old_p2pcs = ckpool.p2pcs;
+		ckpool.p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
 		if (old > 0)
-			memcpy(ckp->p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
-		ckp->p2pcs[old] = NULL;
+			memcpy(ckpool.p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
+		ckpool.p2pcs[old] = NULL;
 		if (old_p2pcs) dealloc(old_p2pcs);
 
 		/* p2pconn */
-		p2p_conn_t **old_p2pconn = ckp->p2pconn;
-		ckp->p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
+		p2p_conn_t **old_p2pconn = ckpool.p2pconn;
+		ckpool.p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
 		if (old > 0)
-			memcpy(ckp->p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
-		ckp->p2pconn[old] = conn;
+			memcpy(ckpool.p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
+		ckpool.p2pconn[old] = conn;
 		if (old_p2pconn)
 			dealloc(old_p2pconn);
 
 		conn->peer = old;
-		ckp->p2purls = old + 1;
+		ckpool.p2purls = old + 1;
 		total_conns++;
 		_activate_conn(conn);
 
@@ -1856,7 +1845,7 @@ static void *p2p_acceptor(void *arg)
 	return NULL;
 }
 
-int prepare_ckp2p(ckpool_t *ckp)
+int prepare_ckp2p(void)
 {
 	pthread_t pthread;
 	connsock_t *cs;
@@ -1865,16 +1854,16 @@ int prepare_ckp2p(ckpool_t *ckp)
 	cklock_init(&curblock.lock);
 	cklock_init(&peerlock);
 
-	if (ckp->externalip) {
+	if (ckpool.externalip) {
 		connsock_t cslocal = {};
 		struct in_addr addr;
 
-		if (!extract_sockaddr(ckp->externalip, &cslocal.url, &cslocal.port)) {
-			LOGEMERG("Failed to extract address from externalip %s", ckp->externalip);
+		if (!extract_sockaddr(ckpool.externalip, &cslocal.url, &cslocal.port)) {
+			LOGEMERG("Failed to extract address from externalip %s", ckpool.externalip);
 			return -1;
 		}
 		if (inet_aton(cslocal.url, &addr) == 0) {
-			LOGEMERG("Failed to parse IP from externalip %s", ckp->externalip);
+			LOGEMERG("Failed to parse IP from externalip %s", ckpool.externalip);
 			free(cslocal.url);
 			free(cslocal.port);
 			return -1;
@@ -1887,53 +1876,53 @@ int prepare_ckp2p(ckpool_t *ckp)
 		externalip = addr.s_addr;
 	} else {
 		externalport = CKP2P_LISTEN_PORT;
-		ASPRINTF(&ckp->externalip, "127.0.0.1:%d", externalport);
+		ASPRINTF(&ckpool.externalip, "127.0.0.1:%d", externalport);
 	}
 
-	if (ckp->p2purls > ckp->maxclients * 4 / 3) {
-		ckp->p2purls = ckp->maxclients * 4 / 3;
-		LOGWARNING("Limiting peers to %d", ckp->p2purls);
+	if (ckpool.p2purls > ckpool.maxclients * 4 / 3) {
+		ckpool.p2purls = ckpool.maxclients * 4 / 3;
+		LOGWARNING("Limiting peers to %d", ckpool.p2purls);
 	}
-	p2purls = total_conns = ckp->p2purls;
-	ckp->p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckp->p2purls);
-	ckp->p2pcs = ckzalloc(sizeof(connsock_t *) * ckp->p2purls);
-	for (i = 0 ; i < ckp->p2purls ; i++) {
-		ckp->p2pcs[i] = ckzalloc(sizeof(connsock_t));
-		cs = ckp->p2pcs[i];
-		if (!extract_sockaddr(ckp->p2purl[i], &cs->url, &cs->port)) {
-			LOGEMERG("Failed to extract address from p2purl %s", ckp->p2purl[i]);
+	p2purls = total_conns = ckpool.p2purls;
+	ckpool.p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckpool.p2purls);
+	ckpool.p2pcs = ckzalloc(sizeof(connsock_t *) * ckpool.p2purls);
+	for (i = 0 ; i < ckpool.p2purls ; i++) {
+		ckpool.p2pcs[i] = ckzalloc(sizeof(connsock_t));
+		cs = ckpool.p2pcs[i];
+		if (!extract_sockaddr(ckpool.p2purl[i], &cs->url, &cs->port)) {
+			LOGEMERG("Failed to extract address from p2purl %s", ckpool.p2purl[i]);
 			return -1;
 		}
 	}
 
 	for (i = 0 ; i < p2purls ; i++) {
-		cs = ckp->p2pcs[i];
-		p2p_conn_t *conn = ckp->p2pconn[i] = ckp2p_connect(ckp, cs->url, cs->port, i);
+		cs = ckpool.p2pcs[i];
+		p2p_conn_t *conn = ckpool.p2pconn[i] = ckp2p_connect(cs->url, cs->port, i);
 		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
 		p2ppeer->conn = conn;
-		sprintf(p2ppeer->url, "%s", ckp->p2purl[i]);
+		sprintf(p2ppeer->url, "%s", ckpool.p2purl[i]);
 		HASH_ADD_STR(p2ppeers, url, p2ppeer);
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
 	num_threads = sysconf(_SC_NPROCESSORS_ONLN);
-	p2p_readers = create_ckmsgqs(ckp, "p2pread", &p2p_reader, num_threads);
-	p2p_connectors = create_ckmsgqs(ckp, "p2pconnect", &p2p_connector, num_threads);
+	p2p_readers = create_ckmsgqs("p2pread", &p2p_reader, num_threads);
+	p2p_connectors = create_ckmsgqs("p2pconnect", &p2p_connector, num_threads);
 
 	reader_epfd = epoll_create1(EPOLL_CLOEXEC);
 	if (reader_epfd < 0)
 		quit(1, "FATAL: Failed to create epoll in prepare_ckp2p");
 
-	create_pthread(&pthread, p2p_receiver, ckp);
-	create_pthread(&pthread, p2p_keepalive, ckp);
+	create_pthread(&pthread, p2p_receiver, NULL);
+	create_pthread(&pthread, p2p_keepalive, NULL);
 
 	/* Start listener thread for incoming ckp2p connections on port 8335 */
-	create_pthread(&pthread, p2p_acceptor, ckp);
+	create_pthread(&pthread, p2p_acceptor, NULL);
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
 
 	ck_wlock(&peerlock);
 	for (i = 0; i < p2purls; i++)
-		_add_connector(ckp->p2pconn[i]);
+		_add_connector(ckpool.p2pconn[i]);
 	ck_wunlock(&peerlock);
 
 	finished_init = true;

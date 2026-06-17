@@ -19,7 +19,6 @@ struct peerlist {
 typedef struct peerlist peerlist_t;
 
 struct p2p_conn {
-	ckpool_t *ckp;
 	int sock;
 	uchar magic[4];
 	uchar genesis[32];
@@ -47,6 +46,6 @@ struct p2p_conn {
 
 typedef struct p2p_conn p2p_conn_t;
 
-int prepare_ckp2p(ckpool_t *ckp);
-void submit_compact_block(ckpool_t *ckp, const uchar *blockhash, uchar *cmpct_payload,
+int prepare_ckp2p(void);
+void submit_compact_block(const uchar *blockhash, uchar *cmpct_payload,
 			  uint32_t cmpct_len, uint64_t shortid_nonce);

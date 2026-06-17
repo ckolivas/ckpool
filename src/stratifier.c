@@ -551,11 +551,11 @@ static int ser_bip34_height(uint8_t *buf, uint32_t height)
 	return nlen + 1;
 }
 
-static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
+static void generate_coinbase(workbase_t *wb)
 {
 	uint64_t u64, g64, d64 = 0;
 	uint32_t u32;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	char header[272];
 	int len, ofs = 0;
 	ts_t now;
@@ -572,7 +572,7 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
 
 	/* Put block height at start of template */
-	if (unlikely(ckp->regtest))
+	if (unlikely(ckpool.regtest))
 		len = ser_bip34_height(wb->coinb1bin + ofs, wb->height);
 	else
 		len = ser_number(wb->coinb1bin + ofs, wb->height);
@@ -593,8 +593,8 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	len = ser_number(wb->coinb1bin + ofs, now.tv_nsec);
 	ofs += len;
 
-	wb->enonce1varlen = ckp->nonce1length;
-	wb->enonce2varlen = ckp->nonce2length;
+	wb->enonce1varlen = ckpool.nonce1length;
+	wb->enonce2varlen = ckpool.nonce2length;
 	wb->coinb1bin[ofs++] = wb->enonce1varlen + wb->enonce2varlen;
 
 	wb->coinb1len = ofs;
@@ -607,13 +607,13 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	wb->coinb2bin = ckzalloc(512);
 	memcpy(wb->coinb2bin, "\x0a\x63\x6b\x70\x6f\x6f\x6c", 7);
 	wb->coinb2len = 7;
-	if (ckp->btcsig) {
-		int siglen = strlen(ckp->btcsig);
+	if (ckpool.btcsig) {
+		int siglen = strlen(ckpool.btcsig);
 
-		LOGDEBUG("Len %d sig %s", siglen, ckp->btcsig);
+		LOGDEBUG("Len %d sig %s", siglen, ckpool.btcsig);
 		if (siglen) {
 			wb->coinb2bin[wb->coinb2len++] = siglen;
-			memcpy(wb->coinb2bin + wb->coinb2len, ckp->btcsig, siglen);
+			memcpy(wb->coinb2bin + wb->coinb2len, ckpool.btcsig, siglen);
 			wb->coinb2len += siglen;
 		}
 	}
@@ -630,8 +630,8 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 
 	// Generation value
 	g64 = wb->coinbasevalue;
-	if (ckp->donvalid && ckp->donation > 0) {
-		double dbl64 = (double)g64 / 100 * ckp->donation;
+	if (ckpool.donvalid && ckpool.donation > 0) {
+		double dbl64 = (double)g64 / 100 * ckpool.donation;
 
 		d64 = dbl64;
 		g64 -= d64; // To guarantee integers add up to the original coinbasevalue
@@ -648,7 +648,7 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	wb->coinb3len = 0;
 	wb->coinb3bin = ckzalloc(256 + wb->insert_witness * (8 + witnessdata_size + 2));
 
-	if (ckp->donvalid && ckp->donation > 0) {
+	if (ckpool.donvalid && ckpool.donation > 0) {
 		u64 = htole64(d64);
 		memcpy(wb->coinb3bin, &u64, sizeof(uint64_t));
 		wb->coinb3len += sizeof(uint64_t); //8
@@ -657,7 +657,7 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 		memcpy(wb->coinb3bin + wb->coinb3len, sdata->dontxnbin, sdata->dontxnlen);
 		wb->coinb3len += sdata->dontxnlen;
 	} else
-		ckp->donation = 0;
+		ckpool.donation = 0;
 
 	if (wb->insert_witness) {
 		// 0 value
@@ -676,7 +676,7 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	memcpy(&wb->coinb3bin[wb->coinb3len], &u32, sizeof(uint32_t));
 	wb->coinb3len += sizeof(uint32_t); //4
 
-	if (!ckp->btcsolo) {
+	if (!ckpool.btcsolo) {
 		int coinbase_len, offset = 0;
 		char *coinbase, *cb;
 
@@ -690,22 +690,22 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 		dealloc(wb->coinb3bin);
 
 		/* Set this only once */
-		if (unlikely(!ckp->coinbase_valid)) {
+		if (unlikely(!ckpool.coinbase_valid)) {
 			char *cbstr;
 
 			/* We have enough to test the validity of the coinbase here */
-			coinbase_len = wb->coinb1len + ckp->nonce1length + ckp->nonce2length + wb->coinb2len;
+			coinbase_len = wb->coinb1len + ckpool.nonce1length + ckpool.nonce2length + wb->coinb2len;
 			coinbase = ckzalloc(coinbase_len);
 			memcpy(coinbase, wb->coinb1bin, wb->coinb1len);
 			offset += wb->coinb1len;
 			/* Space for nonce1 and 2 */
-			offset += ckp->nonce1length + ckp->nonce2length;
+			offset += ckpool.nonce1length + ckpool.nonce2length;
 			memcpy(coinbase + offset, wb->coinb2bin, wb->coinb2len);
 			offset += wb->coinb2len;
 			cb = bin2hex(coinbase, offset);
 			LOGDEBUG("Coinbase txn %s", cb);
 			free(coinbase);
-			cbstr = generator_checktxn(ckp, cb);
+			cbstr = generator_checktxn(cb);
 			if (cbstr) {
 				LOGNOTICE("Coinbase transaction confirmed valid");
 				LOGDEBUG("%s", cbstr);
@@ -716,23 +716,23 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 				exit(1);
 			}
 			free(cb);
-			ckp->coinbase_valid = true;
-			LOGWARNING("Mining from any incoming username to address %s", ckp->btcaddress);
-			if (ckp->donation)
-				LOGWARNING("%.1f percent donation to %s", ckp->donation, ckp->donaddress);
+			ckpool.coinbase_valid = true;
+			LOGWARNING("Mining from any incoming username to address %s", ckpool.btcaddress);
+			if (ckpool.donation)
+				LOGWARNING("%.1f percent donation to %s", ckpool.donation, ckpool.donaddress);
 		}
-	} else if (unlikely(!ckp->coinbase_valid)) {
+	} else if (unlikely(!ckpool.coinbase_valid)) {
 		/* Create a sample coinbase to test its validity in solo mode */
 		int coinbase_len, offset = 0;
 		char *coinbase, *cb;
 		char *cbstr;
 
-		coinbase_len = wb->coinb1len + ckp->nonce1length + ckp->nonce2length + wb->coinb2len +
+		coinbase_len = wb->coinb1len + ckpool.nonce1length + ckpool.nonce2length + wb->coinb2len +
 			       sdata->txnlen + wb->coinb3len + 1;
 		coinbase = ckzalloc(coinbase_len);
 		memcpy(coinbase, wb->coinb1bin, wb->coinb1len);
 		offset += wb->coinb1len;
-		offset += ckp->nonce1length + ckp->nonce2length;
+		offset += ckpool.nonce1length + ckpool.nonce2length;
 		memcpy(coinbase + offset, wb->coinb2bin, wb->coinb2len);
 		offset += wb->coinb2len;
 		coinbase[offset] = sdata->txnlen;
@@ -744,7 +744,7 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 		cb = bin2hex(coinbase, offset);
 		LOGDEBUG("Coinbase txn %s", cb);
 		free(coinbase);
-		cbstr = generator_checktxn(ckp, cb);
+		cbstr = generator_checktxn(cb);
 		if (cbstr) {
 			LOGNOTICE("Coinbase transaction confirmed valid");
 			LOGDEBUG("%s", cbstr);
@@ -755,10 +755,10 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 			exit(1);
 		}
 		free(cb);
-		ckp->coinbase_valid = true;
+		ckpool.coinbase_valid = true;
 		LOGWARNING("Mining solo to any incoming valid BTC address username");
-		if (ckp->donation)
-			LOGWARNING("%.1f percent donation to %s", ckp->donation, ckp->donaddress);
+		if (ckpool.donation)
+			LOGWARNING("%.1f percent donation to %s", ckpool.donation, ckpool.donaddress);
 	}
 
 	/* Set this just for node compatibility, though it's unused */
@@ -799,10 +799,10 @@ static void clear_userwb(sdata_t *sdata, int64_t id)
 	ck_wunlock(&sdata->instance_lock);
 }
 
-static void clear_workbase(ckpool_t *ckp, workbase_t *wb)
+static void clear_workbase(workbase_t *wb)
 {
-	if (ckp->btcsolo)
-		clear_userwb(ckp->sdata, wb->id);
+	if (ckpool.btcsolo)
+		clear_userwb(ckpool.sdata, wb->id);
 	free(wb->flags);
 	free(wb->txn_data);
 	free(wb->txn_hashes);
@@ -889,33 +889,33 @@ static void ssend_bulk_prepend(sdata_t *sdata, ckmsg_t *bulk_send, const int mes
 }
 
 /* Send a json msg to an upstream trusted remote server */
-static void upstream_json(ckpool_t *ckp, json_t *val)
+static void upstream_json(json_t *val)
 {
 	char *msg;
 
 	msg = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_COMPACT | JSON_EOL);
 	/* Connector absorbs and frees msg */
-	connector_upstream_msg(ckp, msg);
+	connector_upstream_msg(msg);
 }
 
 /* Upstream a json msgtype */
-static void upstream_json_msgtype(ckpool_t *ckp, json_t *val, const int msg_type)
+static void upstream_json_msgtype(json_t *val, const int msg_type)
 {
 	json_set_string(val, "method", stratum_msgs[msg_type]);
-	upstream_json(ckp, val);
+	upstream_json(val);
 }
 
 /* Upstream a json msgtype, duplicating the json */
-static void upstream_msgtype(ckpool_t *ckp, const json_t *val, const int msg_type)
+static void upstream_msgtype(const json_t *val, const int msg_type)
 {
 	json_t *json_msg = json_deep_copy(val);
 
 	json_set_string(json_msg, "method", stratum_msgs[msg_type]);
-	upstream_json(ckp, json_msg);
+	upstream_json(json_msg);
 	json_decref(json_msg);
 }
 
-static void send_node_workinfo(ckpool_t *ckp, sdata_t *sdata, const workbase_t *wb)
+static void send_node_workinfo(sdata_t *sdata, const workbase_t *wb)
 {
 	stratum_instance_t *client;
 	ckmsg_t *bulk_send = NULL;
@@ -978,8 +978,8 @@ static void send_node_workinfo(ckpool_t *ckp, sdata_t *sdata, const workbase_t *
 	}
 	ck_runlock(&sdata->instance_lock);
 
-	if (ckp->remote)
-		upstream_msgtype(ckp, wb_val, SM_WORKINFO);
+	if (ckpool.remote)
+		upstream_msgtype(wb_val, SM_WORKINFO);
 
 	json_decref(wb_val);
 
@@ -989,7 +989,7 @@ static void send_node_workinfo(ckpool_t *ckp, sdata_t *sdata, const workbase_t *
 	}
 }
 
-static json_t *generate_workinfo(ckpool_t *ckp, const workbase_t *wb, const char *func)
+static json_t *generate_workinfo(const workbase_t *wb, const char *func)
 {
 	char cdfield[64];
 	json_t *val;
@@ -998,7 +998,7 @@ static json_t *generate_workinfo(ckpool_t *ckp, const workbase_t *wb, const char
 
 	JSON_CPACK(val, "{sI,ss,ss,ss,ss,ss,ss,ss,ss,sI,so,ss,ss,ss,ss}",
 			"workinfoid", wb->id,
-			"poolinstance", ckp->name,
+			"poolinstance", ckpool.name,
 			"transactiontree", wb->txn_hashes,
 			"prevhash", wb->prevhash,
 			"coinbase1", wb->coinb1,
@@ -1011,14 +1011,14 @@ static json_t *generate_workinfo(ckpool_t *ckp, const workbase_t *wb, const char
 			"createdate", cdfield,
 			"createby", "code",
 			"createcode", func,
-			"createinet", ckp->serverurl[0]);
+			"createinet", ckpool.serverurl[0]);
 	return val;
 }
 
-static void send_workinfo(ckpool_t *ckp, sdata_t *sdata, const workbase_t *wb)
+static void send_workinfo(sdata_t *sdata, const workbase_t *wb)
 {
-	if (!ckp->proxy)
-		send_node_workinfo(ckp, sdata, wb);
+	if (!ckpool.proxy)
+		send_node_workinfo(sdata, wb);
 }
 
 /* Entered with instance_lock held, make sure wb can't be pulled from us */
@@ -1062,9 +1062,9 @@ static void generate_userwbs(sdata_t *sdata, workbase_t *wb)
 
 /* Add a new workbase to the table of workbases. Sdata is the global data in
  * pool mode but unique to each subproxy in proxy mode */
-static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_block)
+static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 {
-	sdata_t *ckp_sdata = ckp->sdata;
+	sdata_t *ckp_sdata = ckpool.sdata;
 	pool_stats_t *stats = &sdata->stats;
 	double old_diff = stats->network_diff;
 	workbase_t *tmp, *tmpa;
@@ -1079,7 +1079,7 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 	stats->network_diff = wb->network_diff;
 	if (stats->network_diff != old_diff)
 		LOGWARNING("Network diff set to %.1f", stats->network_diff);
-	len = strlen(ckp->logdir) + 8 + 1 + 16 + 1;
+	len = strlen(ckpool.logdir) + 8 + 1 + 16 + 1;
 	wb->logdir = ckzalloc(len);
 
 	/* In proxy mode, the wb->id is received in the notify update and
@@ -1087,7 +1087,7 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 	 * setting the workbase_id */
 	ck_wlock(&sdata->workbase_lock);
 	ckp_sdata->workbases_generated++;
-	if (!ckp->proxy)
+	if (!ckpool.proxy)
 		wb->mapped_id = wb->id = sdata->workbase_id++;
 	else
 		sdata->workbase_id = wb->id;
@@ -1101,15 +1101,15 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 		__bin2hex(sdata->lastswaphash, swap, 32);
 		sdata->blockchange_id = wb->id;
 	}
-	if (*new_block && ckp->logshares) {
-		sprintf(wb->logdir, "%s%08x/", ckp->logdir, wb->height);
+	if (*new_block && ckpool.logshares) {
+		sprintf(wb->logdir, "%s%08x/", ckpool.logdir, wb->height);
 		ret = mkdir(wb->logdir, 0750);
 		if (unlikely(ret && errno != EEXIST))
 			LOGERR("Failed to create log directory %s", wb->logdir);
 	}
 	sprintf(wb->idstring, "%016lx", wb->id);
-	if (ckp->logshares)
-		sprintf(wb->logdir, "%s%08x/%s", ckp->logdir, wb->height, wb->idstring);
+	if (ckpool.logshares)
+		sprintf(wb->logdir, "%s%08x/%s", ckpool.logdir, wb->height, wb->idstring);
 
 	HASH_ADD_I64(sdata->workbases, id, wb);
 	if (sdata->current_workbase)
@@ -1133,7 +1133,7 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 
 			/* Drop lock to avoid recursive locks */
 			age_share_hashtable(sdata, tmp->id);
-			clear_workbase(ckp, tmp);
+			clear_workbase(tmp);
 
 			ck_wlock(&sdata->workbase_lock);
 		}
@@ -1142,14 +1142,14 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 
 	/* This wb can't be pulled out from under us so no workbase lock is
 	 * required to generate_userwbs */
-	if (ckp->btcsolo)
+	if (ckpool.btcsolo)
 		generate_userwbs(sdata, wb);
 
 	if (*new_block)
 		purge_share_hashtable(sdata, wb->id);
 
-	if (!ckp->passthrough)
-		send_workinfo(ckp, sdata, wb);
+	if (!ckpool.passthrough)
+		send_workinfo(sdata, wb);
 }
 
 static void broadcast_ping(sdata_t *sdata);
@@ -1160,20 +1160,20 @@ static void broadcast_ping(sdata_t *sdata);
 
 /* Submit the transactions in node/remote mode so the local btcd has all the
  * transactions that will go into the next blocksolve. */
-static void submit_transaction(ckpool_t *ckp, const char *hash)
+static void submit_transaction(const char *hash)
 {
 	char *buf;
 
-	if (unlikely(!ckp->generator_ready))
+	if (unlikely(!ckpool.generator_ready))
 		return;
 	ASPRINTF(&buf, "submittxn:%s", hash);
-	send_proc(ckp->generator,buf);
+	send_proc(ckpool.generator,buf);
 	free(buf);
 }
 
 /* Build a hashlist of all transactions, allowing us to compare with the list of
  * existing transactions to determine which need to be propagated */
-static bool add_txn(ckpool_t *ckp, sdata_t *sdata, txntable_t **txns, const char *hash,
+static bool add_txn(sdata_t *sdata, txntable_t **txns, const char *hash,
 		    const char *data, bool local)
 {
 	bool found = false;
@@ -1181,7 +1181,7 @@ static bool add_txn(ckpool_t *ckp, sdata_t *sdata, txntable_t **txns, const char
 
 	/* Don't waste our time with a transaction hashlist if we don't have
 	 * any trusted or node servers configured */
-	if (!ckp->trusted && !ckp->nodeserver)
+	if (!ckpool.trusted && !ckpool.nodeserver)
 		return found;
 
 	/* Look for transactions we already know about and increment their
@@ -1212,17 +1212,17 @@ static bool add_txn(ckpool_t *ckp, sdata_t *sdata, txntable_t **txns, const char
 	else {
 		/* Get the data from our local bitcoind as a way of confirming it
 		 * already knows about this transaction. */
-		txn->data = generator_get_txn(ckp, hash);
+		txn->data = generator_get_txn(hash);
 		if (!txn->data) {
 			/* If our local bitcoind hasn't seen this transaction,
 			 * submit it for mempools to be ~synchronised */
-			submit_transaction(ckp, data);
+			submit_transaction(data);
 			txn->data = strdup(data);
 		}
 	}
 
 	txn->seen = true;
-	if (!local || ckp->node)
+	if (!local || ckpool.node)
 		txn->refcount = REFCOUNT_REMOTE;
 	else
 		txn->refcount = REFCOUNT_LOCAL;
@@ -1231,7 +1231,7 @@ static bool add_txn(ckpool_t *ckp, sdata_t *sdata, txntable_t **txns, const char
 	return true;
 }
 
-static void send_node_transactions(ckpool_t *ckp, sdata_t *sdata, const json_t *txn_val)
+static void send_node_transactions(sdata_t *sdata, const json_t *txn_val)
 {
 	stratum_instance_t *client;
 	ckmsg_t *bulk_send = NULL;
@@ -1265,8 +1265,8 @@ static void send_node_transactions(ckpool_t *ckp, sdata_t *sdata, const json_t *
 	}
 	ck_runlock(&sdata->instance_lock);
 
-	if (ckp->remote)
-		upstream_msgtype(ckp, txn_val, SM_TRANSACTIONS);
+	if (ckpool.remote)
+		upstream_msgtype(txn_val, SM_TRANSACTIONS);
 
 	if (bulk_send) {
 		LOGINFO("Sending transactions to mining nodes");
@@ -1274,13 +1274,13 @@ static void send_node_transactions(ckpool_t *ckp, sdata_t *sdata, const json_t *
 	}
 }
 
-static void submit_transaction_array(ckpool_t *ckp, const json_t *arr)
+static void submit_transaction_array(const json_t *arr)
 {
 	json_t *arr_val;
 	size_t index;
 
 	json_array_foreach(arr, index, arr_val) {
-		submit_transaction(ckp, json_string_value(arr_val));
+		submit_transaction(json_string_value(arr_val));
 	}
 }
 
@@ -1290,7 +1290,7 @@ static void clear_txn(txntable_t *txn)
 	free(txn);
 }
 
-static void update_txns(ckpool_t *ckp, sdata_t *sdata, txntable_t *txns, bool local)
+static void update_txns(sdata_t *sdata, txntable_t *txns, bool local)
 {
 	json_t *val, *txn_array = json_array(), *purged_txns = json_array();
 	int added = 0, purged = 0;
@@ -1342,7 +1342,7 @@ static void update_txns(ckpool_t *ckp, sdata_t *sdata, txntable_t *txns, bool lo
 
 	if (added) {
 		JSON_CPACK(val, "{so}", "transaction", txn_array);
-		send_node_transactions(ckp, sdata, val);
+		send_node_transactions(sdata, val);
 		json_decref(val);
 	} else
 		json_decref(txn_array);
@@ -1351,8 +1351,8 @@ static void update_txns(ckpool_t *ckp, sdata_t *sdata, txntable_t *txns, bool lo
 	 * case they've been removed from its mempool as well and we need them
 	 * again in the future for a remote workinfo that hasn't forgotten
 	 * about them. */
-	if (purged && ckp->nodeservers)
-		submit_transaction_array(ckp, purged_txns);
+	if (purged && ckpool.nodeservers)
+		submit_transaction_array(purged_txns);
 	json_decref(purged_txns);
 
 	if (added || purged) {
@@ -1363,7 +1363,7 @@ static void update_txns(ckpool_t *ckp, sdata_t *sdata, txntable_t *txns, bool lo
 
 /* Distill down a set of transactions into an efficient tree arrangement for
  * stratum messages and fast work assembly. */
-static txntable_t *wb_merkle_bin_txns(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb,
+static txntable_t *wb_merkle_bin_txns(sdata_t *sdata, workbase_t *wb,
 				      yyjson_val *txn_array, bool local)
 {
 	int i, j, binleft, binlen;
@@ -1412,7 +1412,7 @@ static txntable_t *wb_merkle_bin_txns(ckpool_t *ckp, sdata_t *sdata, workbase_t 
 				goto out;
 			}
 			txn = yyjson_get_str(yyjson_obj_get(arr_val, "data"));
-			add_txn(ckp, sdata, &txns, hash, txn, local);
+			add_txn(sdata, &txns, hash, txn, local);
 			len = strlen(txn);
 			memcpy(wb->txn_data + ofs, txn, len);
 			ofs += len;
@@ -1458,7 +1458,7 @@ out:
 }
 
 /* Wrapper for functions still using jansson txn arrays */
-static txntable_t *wb_merkle_bin_jtxns(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb,
+static txntable_t *wb_merkle_bin_jtxns(sdata_t *sdata, workbase_t *wb,
 				       json_t *jtxn_array, bool local)
 {
 	txntable_t *ret;
@@ -1470,7 +1470,7 @@ static txntable_t *wb_merkle_bin_jtxns(ckpool_t *ckp, sdata_t *sdata, workbase_t
 
 	doc = yyjson_read(s, strlen(s), 0);
 	root = yyjson_doc_get_root(doc);
-	ret = wb_merkle_bin_txns(ckp, sdata, wb, root, local);
+	ret = wb_merkle_bin_txns(sdata, wb, root, local);
 	yyjson_doc_free(doc);
 	free(s);
 	return ret;
@@ -1532,18 +1532,18 @@ static void gbt_witness_data(workbase_t *wb, yyjson_val *txn_array)
  * since checking should have been done earlier, and creates the base template
  * for generating work templates. This is a ckmsgq so all uses of this function
  * are serialised. */
-static void block_update(ckpool_t *ckp, int *prio)
+static void block_update(int *prio)
 {
 	bool new_block = false, ret = false;
 	const char *witnessdata_check;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	yyjson_val *txn_array;
 	txntable_t *txns;
 	int retries = 0;
 	workbase_t *wb;
 
 retry:
-	wb = generator_getbase(ckp);
+	wb = generator_getbase();
 	if (unlikely(!wb)) {
 		if (retries++ < 5 || *prio == GEN_PRIORITY) {
 			LOGWARNING("Generator returned failure in update_base, retry #%d", retries);
@@ -1555,10 +1555,8 @@ retry:
 	if (unlikely(retries))
 		LOGWARNING("Generator succeeded in update_base after retrying");
 
-	wb->ckp = ckp;
-
 	txn_array = yyjson_obj_get(wb->gbtroot, "transactions");
-	txns = wb_merkle_bin_txns(ckp, sdata, wb, txn_array, true);
+	txns = wb_merkle_bin_txns(sdata, wb, txn_array, true);
 
 	wb->insert_witness = false;
 
@@ -1571,13 +1569,13 @@ retry:
 			LOGERR("Witness from btcd: %s. Calculated Witness: %s", witnessdata_check + 4, wb->witnessdata);
 	}
 
-	generate_coinbase(ckp, wb);
+	generate_coinbase(wb);
 
-	add_base(ckp, sdata, wb, &new_block);
+	add_base(sdata, wb, &new_block);
 
 	if (new_block)
 		LOGNOTICE("Block hash changed to %s", sdata->lastswaphash);
-	if (ckp->btcsolo)
+	if (ckpool.btcsolo)
 		stratum_broadcast_updates(sdata, new_block);
 	else
 		stratum_broadcast_update(sdata, wb, new_block);
@@ -1586,12 +1584,12 @@ retry:
 	/* Update transactions after stratum broadcast to not delay
 	 * propagation. */
 	if (likely(txns))
-		update_txns(ckp, sdata, txns, true);
+		update_txns(sdata, txns, true);
 	/* Reset the update time to avoid stacked low priority notifies. Bring
 	 * forward the next notify in case of a new block. */
 	sdata->update_time = time(NULL);
 	if (new_block)
-		sdata->update_time -= ckp->update_interval / 2;
+		sdata->update_time -= ckpool.update_interval / 2;
 out:
 
 	cksem_post(&sdata->update_sem);
@@ -1652,14 +1650,14 @@ static void downstream_json(sdata_t *sdata, const json_t *val, const int64_t cli
 
 /* Find any transactions that are missing from our transaction table during
  * rebuild_txns by requesting their data from another server. */
-static void request_txns(ckpool_t *ckp, sdata_t *sdata, json_t *txns)
+static void request_txns(sdata_t *sdata, json_t *txns)
 {
 	json_t *val;
 
 	JSON_CPACK(val, "{so}", "hash", txns);
-	if (ckp->remote)
-		upstream_msgtype(ckp, val, SM_REQTXNS);
-	else if (ckp->node) {
+	if (ckpool.remote)
+		upstream_msgtype(val, SM_REQTXNS);
+	else if (ckpool.node) {
 		/* Nodes have no way to signal upstream pool yet */
 	} else {
 		/* We don't know which remote sent the transaction hash so ask
@@ -1671,7 +1669,7 @@ static void request_txns(ckpool_t *ckp, sdata_t *sdata, json_t *txns)
 
 /* Rebuilds transactions from txnhashes to be able to construct wb_merkle_bins
  * on remote workbases */
-static bool rebuild_txns(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
+static bool rebuild_txns(sdata_t *sdata, workbase_t *wb)
 {
 	const char *hashes = wb->txn_hashes;
 	json_t *txn_array, *missing_txns;
@@ -1719,7 +1717,7 @@ static bool rebuild_txns(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 		if (likely(txn_val))
 			continue;
 		/* See if we can find it in our local bitcoind */
-		data = generator_get_txn(ckp, hash);
+		data = generator_get_txn(hash);
 		if (!data) {
 			txn_val = json_string(hash);
 			json_array_append_new(missing_txns, txn_val);
@@ -1754,17 +1752,17 @@ static bool rebuild_txns(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 		/* These two structures are regenerated so free their ram */
 		json_decref(wb->merkle_array);
 		dealloc(wb->txn_hashes);
-		txns = wb_merkle_bin_jtxns(ckp, sdata, wb, txn_array, false);
+		txns = wb_merkle_bin_jtxns(sdata, wb, txn_array, false);
 		if (likely(txns))
-			update_txns(ckp, sdata, txns, false);
+			update_txns(sdata, txns, false);
 	} else {
 		if (!sdata->wbincomplete) {
 			sdata->wbincomplete = true;
-			if (ckp->proxy)
+			if (ckpool.proxy)
 				LOGWARNING("Unable to rebuild transactions to create workinfo, ignore displayed hashrate");
 		}
 		LOGINFO("Failed to find all txns in rebuild_txns");
-		request_txns(ckp, sdata, missing_txns);
+		request_txns(sdata, missing_txns);
 	}
 
 	json_decref(txn_array);
@@ -1781,7 +1779,7 @@ static void __add_to_remote_workbases(sdata_t *sdata, workbase_t *wb)
 	HASH_ADD(hh, sdata->remote_workbases, id, sizeof(int64_t) * 2, wb);
 }
 
-static void add_remote_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
+static void add_remote_base(sdata_t *sdata, workbase_t *wb)
 {
 	stratum_instance_t *client;
 	ckmsg_t *bulk_send = NULL;
@@ -1807,7 +1805,7 @@ static void add_remote_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 			HASH_DEL(sdata->remote_workbases, tmp);
 			ck_wunlock(&sdata->workbase_lock);
 
-			clear_workbase(ckp, tmp);
+			clear_workbase(tmp);
 
 			ck_wlock(&sdata->workbase_lock);
 		}
@@ -1815,7 +1813,7 @@ static void add_remote_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 	__add_to_remote_workbases(sdata, wb);
 	ck_wunlock(&sdata->workbase_lock);
 
-	val = generate_workinfo(ckp, wb, __func__);
+	val = generate_workinfo(wb, __func__);
 
 	/* Set jobid with mapped id for other nodes and remotes */
 	json_set_int64(val, "jobid", wb->mapped_id);
@@ -1878,14 +1876,13 @@ static void add_remote_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 	}
 }
 
-static void add_node_base(ckpool_t *ckp, json_t *val, bool trusted, int64_t client_id)
+static void add_node_base(json_t *val, bool trusted, int64_t client_id)
 {
 	workbase_t *wb = ckzalloc(sizeof(workbase_t));
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	bool new_block = false;
 	char header[272];
 
-	wb->ckp = ckp;
 	/* This is the client id if this workbase came from a remote trusted
 	 * server. */
 	wb->client_id = client_id;
@@ -1908,15 +1905,15 @@ static void add_node_base(ckpool_t *ckp, json_t *val, bool trusted, int64_t clie
 
 	json_intcpy(&wb->txns, val, "txns");
 	json_strdup(&wb->txn_hashes, val, "txn_hashes");
-	if (!ckp->proxy) {
+	if (!ckpool.proxy) {
 		/* This is a workbase from a trusted remote */
 		wb->merkle_array = json_object_dup(val, "merklehash");
 		json_intcpy(&wb->merkles, val, "merkles");
-		if (!rebuild_txns(ckp, sdata, wb))
+		if (!rebuild_txns(sdata, wb))
 			wb->incomplete = true;
 	} else {
-		if (!rebuild_txns(ckp, sdata, wb)) {
-			clear_workbase(ckp, wb);
+		if (!rebuild_txns(sdata, wb)) {
+			clear_workbase(wb);
 			return;
 		}
 	}
@@ -1945,9 +1942,9 @@ static void add_node_base(ckpool_t *ckp, json_t *val, bool trusted, int64_t clie
 	/* If this is from a remote trusted server or an upstream server, add
 	 * it to the remote_workbases hashtable */
 	if (trusted)
-		add_remote_base(ckp, sdata, wb);
+		add_remote_base(sdata, wb);
 	else
-		add_base(ckp, sdata, wb, &new_block);
+		add_base(sdata, wb, &new_block);
 
 	if (new_block)
 		LOGNOTICE("Block hash changed to %s", sdata->lastswaphash);
@@ -2016,12 +2013,12 @@ share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const 
 	return diff_from_target(hash);
 }
 
-static void add_remote_blockdata(ckpool_t *ckp, json_t *val, const int cblen, const char *coinbase,
+static void add_remote_blockdata(json_t *val, const int cblen, const char *coinbase,
 				 const uchar *data)
 {
 	char *buf;
 
-	json_set_string(val, "name", ckp->name);
+	json_set_string(val, "name", ckpool.name);
 	json_set_int(val, "cblen", cblen);
 	buf = bin2hex(coinbase, cblen);
 	json_set_string(val, "coinbasehex", buf);
@@ -2073,7 +2070,7 @@ static void send_nodes_block(sdata_t *sdata, const json_t *block_val, const int6
 
 
 /* Entered with workbase readcount. */
-static void send_node_block(ckpool_t *ckp, sdata_t *sdata, const char *enonce1, const char *nonce,
+static void send_node_block(sdata_t *sdata, const char *enonce1, const char *nonce,
 			    const char *nonce2, const uint32_t ntime32, const uint32_t version_mask,
 			    const int64_t jobid, const double diff, const int64_t client_id,
 			    const char *coinbase, const int cblen, const uchar *data)
@@ -2088,7 +2085,7 @@ static void send_node_block(ckpool_t *ckp, sdata_t *sdata, const char *enonce1, 
 		json_set_uint32(val, "version_mask", version_mask);
 		json_set_int64(val, "jobid", jobid);
 		json_set_double(val, "diff", diff);
-		add_remote_blockdata(ckp, val, cblen, coinbase, data);
+		add_remote_blockdata(val, cblen, coinbase, data);
 		send_nodes_block(sdata, val, client_id);
 		json_decref(val);
 	}
@@ -2162,7 +2159,7 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	off += cblen;
 
 	/* Submit via ckp2p */
-	submit_compact_block(ckp, hash, cmpct_payload, (uint32_t)off, shortid_nonce);
+	submit_compact_block(hash, cmpct_payload, (uint32_t)off, shortid_nonce);
 
 	dealloc(cmpct_payload);
 	LOGNOTICE("P2P: Submitted compact block %s (prefilled coinbase only)", blockhash);
@@ -2173,16 +2170,16 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 }
 
 /* Submit block data locally, absorbing and freeing gbt_block */
-static bool local_block_submit(ckpool_t *ckp, char *gbt_block, const uchar *flip32, int height)
+static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 {
-	bool ret = generator_submitblock(ckp, gbt_block);
+	bool ret = generator_submitblock(gbt_block);
 	char heighthash[68] = {}, rhash[68] = {};
 	uchar swap256[32];
 
 	free(gbt_block);
 	swap_256(swap256, flip32);
 	__bin2hex(rhash, swap256, 32);
-	generator_preciousblock(ckp, rhash);
+	generator_preciousblock(rhash);
 
 	/* Check failures that may be inconclusive but were submitted via other
 	 * means or accepted due to precious block call. */
@@ -2196,7 +2193,7 @@ static bool local_block_submit(ckpool_t *ckp, char *gbt_block, const uchar *flip
 		 * a low diff environment we may have successive blocks, and
 		 * this will be the last one solved locally. Trying to optimise
 		 * regtest/testnet will optimise against the mainnet case. */
-		if (generator_get_blockhash(ckp, height, heighthash)) {
+		if (generator_get_blockhash(height, heighthash)) {
 			ret = !strncmp(rhash, heighthash, 64);
 			LOGWARNING("Hash for forced possibly stale block, height %d confirms block was %s",
 				   height, ret ? "ACCEPTED" : "REJECTED");
@@ -2253,10 +2250,10 @@ static void put_workbase(sdata_t *sdata, workbase_t *wb)
 
 #define put_remote_workbase(sdata, wb) put_workbase(sdata, wb)
 
-static void block_solve(ckpool_t *ckp, json_t *val);
+static void block_solve(json_t *val);
 static void block_reject(json_t *val);
 
-static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
+static void submit_node_block(sdata_t *sdata, json_t *val)
 {
 	char *coinbase = NULL, *enonce1 = NULL, *nonce = NULL, *nonce2 = NULL, *gbt_block,
 		*coinbasehex, *swaphex;
@@ -2337,7 +2334,7 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 
 	/* Now we have enough to assemble a block */
 	gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
-	ret = local_block_submit(ckp, gbt_block, flip32, wb->height);
+	ret = local_block_submit(gbt_block, flip32, wb->height);
 
 	JSON_CPACK(bval, "{si,ss,ss,sI,ss,ss,si,ss,sI,sf,ss,ss,ss,ss}",
 			 "height", wb->height,
@@ -2353,11 +2350,11 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 			 "createdate", cdfield,
 			 "createby", "code",
 			 "createcode", __func__,
-			 "createinet", ckp->serverurl[0]);
+			 "createinet", ckpool.serverurl[0]);
 	put_workbase(sdata, wb);
 
 	if (ret)
-		block_solve(ckp, bval);
+		block_solve(bval);
 	else
 		block_reject(bval);
 
@@ -2467,19 +2464,19 @@ static void __del_client(sdata_t *sdata, stratum_instance_t *client)
 	}
 }
 
-static void connector_drop_client(ckpool_t *ckp, const int64_t id)
+static void connector_drop_client(const int64_t id)
 {
 	char buf[256];
 
 	LOGDEBUG("Stratifier requesting connector drop client %"PRId64, id);
 	snprintf(buf, 255, "dropclient=%"PRId64, id);
-	send_proc(ckp->connector, buf);
+	send_proc(ckpool.connector, buf);
 }
 
-static void drop_allclients(ckpool_t *ckp)
+static void drop_allclients(void)
 {
 	stratum_instance_t *client, *tmp;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	int kills = 0;
 
 	ck_wlock(&sdata->instance_lock);
@@ -2492,7 +2489,7 @@ static void drop_allclients(ckpool_t *ckp)
 		} else
 			client->dropped = true;
 		kills++;
-		connector_drop_client(ckp, client_id);
+		connector_drop_client(client_id);
 	}
 	sdata->stats.users = sdata->stats.workers = 0;
 	ck_wunlock(&sdata->instance_lock);
@@ -2505,8 +2502,6 @@ static void drop_allclients(ckpool_t *ckp)
 static sdata_t *duplicate_sdata(const sdata_t *sdata)
 {
 	sdata_t *dsdata = ckzalloc(sizeof(sdata_t));
-
-	dsdata->ckp = sdata->ckp;
 
 	/* Copy the transaction binaries for workbase creation */
 	memcpy(dsdata->txnbin, sdata->txnbin, 40);
@@ -2750,14 +2745,14 @@ static int64_t best_userproxy_headroom(sdata_t *sdata, const int userid)
 
 static void reconnect_client(sdata_t *sdata, stratum_instance_t *client);
 
-static void generator_recruit(ckpool_t *ckp, const int proxyid, const int recruits)
+static void generator_recruit(const int proxyid, const int recruits)
 {
 	char buf[256];
 
 	sprintf(buf, "recruit=%d:%d", proxyid, recruits);
 	LOGINFO("Stratifer requesting %d more subproxies of proxy %d from generator",
 		recruits, proxyid);
-	send_proc(ckp->generator,buf);
+	send_proc(ckpool.generator,buf);
 }
 
 /* Find how much headroom we have and connect up to that many clients that are
@@ -2800,7 +2795,7 @@ static void reconnect_global_clients(sdata_t *sdata)
 			reconnects, proxy->id);
 	}
 	if (headroom < 0)
-		generator_recruit(sdata->ckp, proxy->id, -headroom);
+		generator_recruit(proxy->id, -headroom);
 }
 
 static bool __subproxies_alive(proxy_t *proxy)
@@ -2913,12 +2908,12 @@ static void dead_proxyid(sdata_t *sdata, const int id, const int subid, const bo
 	/* When a proxy dies, recruit more of the global proxies for them to
 	 * fail over to in case user proxies are unavailable. */
 	if (headroom < 0)
-		generator_recruit(sdata->ckp, proxyid, -headroom);
+		generator_recruit(proxyid, -headroom);
 }
 
-static void update_subscribe(ckpool_t *ckp, const char *cmd)
+static void update_subscribe(const char *cmd)
 {
-	sdata_t *sdata = ckp->sdata, *dsdata;
+	sdata_t *sdata = ckpool.sdata, *dsdata;
 	int id = 0, subid = 0, userid = 0;
 	proxy_t *proxy, *old = NULL;
 	const char *buf;
@@ -2971,7 +2966,7 @@ static void update_subscribe(ckpool_t *ckp, const char *cmd)
 	proxy->global = global;
 	proxy->userid = userid;
 	proxy->subscribed = true;
-	proxy->diff = ckp->startdiff;
+	proxy->diff = ckpool.startdiff;
 	memset(proxy->baseurl, 0, 128);
 	memset(proxy->url, 0, 128);
 	memset(proxy->auth, 0, 128);
@@ -2989,8 +2984,8 @@ static void update_subscribe(ckpool_t *ckp, const char *cmd)
 	proxy->enonce1constlen = strlen(proxy->enonce1) / 2;
 	hex2bin(proxy->enonce1bin, proxy->enonce1, proxy->enonce1constlen);
 	proxy->nonce2len = json_integer_value(json_object_get(val, "nonce2len"));
-	if (ckp->nonce2length) {
-		proxy->enonce1varlen = proxy->nonce2len - ckp->nonce2length;
+	if (ckpool.nonce2length) {
+		proxy->enonce1varlen = proxy->nonce2len - ckpool.nonce2length;
 		if (proxy->enonce1varlen < 0)
 			proxy->enonce1varlen = 0;
 	} else if (proxy->nonce2len > 7)
@@ -3013,9 +3008,9 @@ static void update_subscribe(ckpool_t *ckp, const char *cmd)
 		LOGNOTICE("Upstream pool %s %d extranonce2 length %d, max proxy clients %"PRId64,
 			  proxy->url, id, proxy->nonce2len, proxy->max_clients);
 	}
-	if (ckp->nonce2length && proxy->enonce2varlen != ckp->nonce2length)
+	if (ckpool.nonce2length && proxy->enonce2varlen != ckpool.nonce2length)
 		LOGWARNING("Only able to set nonce2len %d of requested %d on proxy %d:%d",
-			   proxy->enonce2varlen, ckp->nonce2length, id, subid);
+			   proxy->enonce2varlen, ckpool.nonce2length, id, subid);
 	json_decref(val);
 
 	/* Set the priority on a new proxy now that we have all the fields
@@ -3049,7 +3044,7 @@ static void recruit_best_userproxy(sdata_t *sdata, const int userid, const int r
 	mutex_unlock(&sdata->proxy_lock);
 
 	if (id != -1)
-		generator_recruit(sdata->ckp, id, recruits);
+		generator_recruit(id, recruits);
 }
 
 /* Check how much headroom the userid proxies have and reconnect any clients
@@ -3088,9 +3083,9 @@ static void check_userproxies(sdata_t *sdata, proxy_t *proxy, const int userid)
 		recruit_best_userproxy(sdata, userid, -headroom);
 }
 
-static void update_notify(ckpool_t *ckp, const char *cmd)
+static void update_notify(const char *cmd)
 {
-	sdata_t *sdata = ckp->sdata, *dsdata;
+	sdata_t *sdata = ckpool.sdata, *dsdata;
 	bool new_block = false, clean;
 	int i, id = 0, subid = 0;
 	char header[272];
@@ -3121,7 +3116,6 @@ static void update_notify(ckpool_t *ckp, const char *cmd)
 	LOGINFO("Got updated notify for proxy %d:%d", id, subid);
 
 	wb = ckzalloc(sizeof(workbase_t));
-	wb->ckp = ckp;
 	wb->proxy = true;
 
 	json_get_int64(&wb->id, val, "jobid");
@@ -3170,7 +3164,7 @@ static void update_notify(ckpool_t *ckp, const char *cmd)
 	wb->diff = proxy->diff;
 	ck_runlock(&dsdata->workbase_lock);
 
-	add_base(ckp, dsdata, wb, &new_block);
+	add_base(dsdata, wb, &new_block);
 	if (new_block) {
 		if (subid)
 			LOGINFO("Block hash on proxy %d:%d changed to %s", id, subid, dsdata->lastswaphash);
@@ -3189,9 +3183,9 @@ out:
 
 static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client);
 
-static void update_diff(ckpool_t *ckp, const char *cmd)
+static void update_diff(const char *cmd)
 {
-	sdata_t *sdata = ckp->sdata, *dsdata;
+	sdata_t *sdata = ckpool.sdata, *dsdata;
 	stratum_instance_t *client, *tmp;
 	double old_diff, diff;
 	int id = 0, subid = 0;
@@ -3260,16 +3254,16 @@ static void update_diff(ckpool_t *ckp, const char *cmd)
 }
 
 #if 0
-static void generator_drop_proxy(ckpool_t *ckp, const int64_t id, const int subid)
+static void generator_drop_proxy(const int64_t id, const int subid)
 {
 	char msg[256];
 
 	sprintf(msg, "dropproxy=%ld:%d", id, subid);
-	send_proc(ckp->generator,msg);
+	send_proc(ckpool.generator,msg);
 }
 #endif
 
-static void free_proxy(ckpool_t *ckp, proxy_t *proxy)
+static void free_proxy(proxy_t *proxy)
 {
 	sdata_t *dsdata = proxy->sdata;
 
@@ -3289,7 +3283,7 @@ static void free_proxy(ckpool_t *ckp, proxy_t *proxy)
 		ck_wlock(&dsdata->workbase_lock);
 		HASH_ITER(hh, dsdata->workbases, wb, tmpwb) {
 			HASH_DEL(dsdata->workbases, wb);
-			clear_workbase(ckp, wb);
+			clear_workbase(wb);
 		}
 		ck_wunlock(&dsdata->workbase_lock);
 	}
@@ -3301,12 +3295,12 @@ static void free_proxy(ckpool_t *ckp, proxy_t *proxy)
 /* Remove subproxies that are flagged dead. Then see if there
  * are any retired proxies that no longer have any other subproxies and reap
  * those. */
-static void reap_proxies(ckpool_t *ckp, sdata_t *sdata)
+static void reap_proxies(sdata_t *sdata)
 {
 	proxy_t *proxy, *proxytmp, *subproxy, *subtmp;
 	int dead = 0;
 
-	if (!ckp->proxy)
+	if (!ckpool.proxy)
 		return;
 
 	mutex_lock(&sdata->proxy_lock);
@@ -3336,14 +3330,14 @@ static void reap_proxies(ckpool_t *ckp, sdata_t *sdata)
 			dead++;
 			HASH_DELETE(sh, proxy->subproxies, subproxy);
 			proxy->subproxy_count--;
-			free_proxy(ckp, subproxy);
+			free_proxy(subproxy);
 		}
 		/* Should we reap the parent proxy too?*/
 		if (!proxy->deleted || proxy->subproxy_count > 1 || proxy->bound_clients)
 			continue;
 		HASH_DELETE(sh, proxy->subproxies, proxy);
 		HASH_DELETE(hh, sdata->proxies, proxy);
-		free_proxy(ckp, proxy);
+		free_proxy(proxy);
 	}
 	mutex_unlock(&sdata->proxy_lock);
 
@@ -3450,7 +3444,7 @@ static void _dec_instance_ref(sdata_t *sdata, stratum_instance_t *client, const 
 		LOGERR("Instance ref count dropped below zero from %s %s:%d", file, func, line);
 
 	if (dropped)
-		reap_proxies(sdata->ckp, sdata);
+		reap_proxies(sdata);
 }
 
 #define dec_instance_ref(sdata, instance) _dec_instance_ref(sdata, instance, __FILE__, __func__, __LINE__)
@@ -3471,10 +3465,10 @@ static stratum_instance_t *__recruit_stratum_instance(sdata_t *sdata)
 }
 
 /* Enter with write instance_lock held, drops and grabs it again */
-static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, const char *address,
+static stratum_instance_t *__stratum_add_instance(int64_t id, const char *address,
 						  int server)
 {
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	int64_t pass_id;
 
@@ -3488,17 +3482,16 @@ static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, con
 	client->id = id;
 	client->session_id = ++sdata->session_id;
 	strcpy(client->address, address);
-	/* Sanity check to not overflow lookup in ckp->serverurl[] */
-	if (server >= ckp->serverurls)
+	/* Sanity check to not overflow lookup in ckpool.serverurl[] */
+	if (server >= ckpool.serverurls)
 		server = 0;
 	client->server = server;
-	client->diff = client->old_diff = ckp->startdiff;
-	if (ckp->server_highdiff && ckp->server_highdiff[server]) {
-		client->suggest_diff = ckp->highdiff;
+	client->diff = client->old_diff = ckpool.startdiff;
+	if (ckpool.server_highdiff && ckpool.server_highdiff[server]) {
+		client->suggest_diff = ckpool.highdiff;
 		if (client->suggest_diff > client->diff)
 			client->diff = client->old_diff = client->suggest_diff;
 	}
-	client->ckp = ckp;
 	tv_time(&client->ldc);
 	/* Points to ckp sdata in ckpool mode, but is changed later in proxy
 	 * mode . */
@@ -3520,7 +3513,7 @@ static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, con
 			sprintf(client->identity, "passthrough:%"PRId64" subclient:%"PRId64,
 				pass_id, id);
 		}
-		client->virtualid = connector_newclientid(ckp);
+		client->virtualid = connector_newclientid();
 	} else {
 		sprintf(client->identity, "%"PRId64, id);
 		client->virtualid = id;
@@ -3567,13 +3560,13 @@ static inline bool remote_server(stratum_instance_t *client)
 
 /* Ask the connector asynchronously to send us dropclient commands if this
  * client no longer exists. */
-static void connector_test_client(ckpool_t *ckp, const int64_t id)
+static void connector_test_client(const int64_t id)
 {
 	char buf[256];
 
 	LOGDEBUG("Stratifier requesting connector test client %"PRId64, id);
 	snprintf(buf, 255, "testclient=%"PRId64, id);
-	send_proc(ckp->connector, buf);
+	send_proc(ckpool.connector, buf);
 }
 
 /* For creating a list of sends without locking that can then be concatenated
@@ -3581,8 +3574,7 @@ static void connector_test_client(ckpool_t *ckp, const int64_t id)
  * locks. Sends only to sdata bound clients (everyone in ckpool) */
 static void stratum_broadcast(sdata_t *sdata, yyjson_mut_doc *doc, const int msg_type)
 {
-	ckpool_t *ckp = sdata->ckp;
-	sdata_t *ckp_sdata = ckp->sdata;
+	sdata_t *ckp_sdata = ckpool.sdata;
 	stratum_instance_t *client, *tmp;
 	ckmsg_t *bulk_send = NULL;
 	yyjson_mut_val *root;
@@ -3593,7 +3585,7 @@ static void stratum_broadcast(sdata_t *sdata, yyjson_mut_doc *doc, const int msg
 		return;
 	}
 
-	if (ckp->node) {
+	if (ckpool.node) {
 		yyjson_mut_doc_free(doc);
 		return;
 	}
@@ -3641,11 +3633,10 @@ static void stratum_broadcast(sdata_t *sdata, yyjson_mut_doc *doc, const int msg
 static void stratum_add_send(sdata_t *sdata, json_t *val, const int64_t client_id,
 			     const int msg_type)
 {
-	ckpool_t *ckp = sdata->ckp;
 	int64_t remote_id;
 	smsg_t *msg;
 
-	if (ckp->node) {
+	if (ckpool.node) {
 		/* Node shouldn't be sending any messages as it only uses the
 		 * stratifier for monitoring activity. */
 		json_decref(val);
@@ -3679,11 +3670,10 @@ static void stratum_add_yysend(sdata_t *sdata, yyjson_mut_doc *doc, const int64_
 			       const int msg_type)
 
 {
-	ckpool_t *ckp = sdata->ckp;
 	int64_t remote_id;
 	smsg_t *msg;
 
-	if (ckp->node) {
+	if (ckpool.node) {
 		/* Node shouldn't be sending any messages as it only uses the
 		 * stratifier for monitoring activity. */
 		yyjson_mut_doc_free(doc);
@@ -3716,7 +3706,7 @@ static void stratum_add_yysend(sdata_t *sdata, yyjson_mut_doc *doc, const int64_
 	free(msg);
 }
 
-static void drop_client(ckpool_t *ckp, sdata_t *sdata, const int64_t id)
+static void drop_client(sdata_t *sdata, const int64_t id)
 {
 	char_entry_t *entries = NULL;
 	stratum_instance_t *client;
@@ -3741,7 +3731,7 @@ static void drop_client(ckpool_t *ckp, sdata_t *sdata, const int64_t id)
 
 	if (entries)
 		notice_msg_entries(&entries);
-	reap_proxies(ckp, sdata);
+	reap_proxies(sdata);
 }
 
 static void stratum_broadcast_message(sdata_t *sdata, const char *msg)
@@ -3919,10 +3909,10 @@ static void block_share_summary(sdata_t *sdata)
 		   sdiff, bdiff);
 }
 
-static void block_solve(ckpool_t *ckp, json_t *val)
+static void block_solve(json_t *val)
 {
 	char *msg, *workername = NULL;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	char cdfield[64];
 	double diff = 0;
 	int height = 0;
@@ -3939,7 +3929,7 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 	json_get_string(&workername, val, "workername");
 
 	if (!workername) {
-		ASPRINTF(&msg, "Block solved by %s!", ckp->name);
+		ASPRINTF(&msg, "Block solved by %s!", ckpool.name);
 		LOGWARNING("Solved and confirmed block!");
 	} else {
 		json_t *user_val, *worker_val;
@@ -3947,7 +3937,7 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 		user_instance_t *user;
 		char *s;
 
-		ASPRINTF(&msg, "Block %d solved by %s @ %s!", height, workername, ckp->name);
+		ASPRINTF(&msg, "Block %d solved by %s @ %s!", height, workername, ckpool.name);
 		LOGWARNING("Solved and confirmed block %d by %s", height, workername);
 		user = user_by_workername(sdata, workername);
 		worker = get_worker(sdata, user, workername);
@@ -4011,7 +4001,7 @@ static void ckmsgq_stats(ckmsgq_t *ckmsgq, const int size, json_t **val)
 	JSON_CPACK(*val, "{si,si,sI}", "count", objects, "memory", memsize, "generated", generated);
 }
 
-char *stratifier_stats(ckpool_t *ckp, void *data)
+char *stratifier_stats(void *data)
 {
 	json_t *val = json_object(), *subval;
 	int64_t memsize, generated;
@@ -4033,7 +4023,7 @@ char *stratifier_stats(ckpool_t *ckp, void *data)
 	json_set_object(val, "remote_workbases", subval);
 
 	ck_rlock(&sdata->instance_lock);
-	if (ckp->btcsolo) {
+	if (ckpool.btcsolo) {
 		user_instance_t *user, *tmpuser;
 		int subobjects;
 
@@ -4109,7 +4099,7 @@ static void reconnect_client(sdata_t *sdata, stratum_instance_t *client)
 	/* Already requested? */
 	if (client->reconnect_request) {
 		if (time(NULL) - client->reconnect_request >= 60)
-			connector_drop_client(sdata->ckp, client->id);
+			connector_drop_client(client->id);
 		return;
 	}
 	client->reconnect_request = time(NULL);
@@ -4117,22 +4107,22 @@ static void reconnect_client(sdata_t *sdata, stratum_instance_t *client)
 	stratum_add_yysend(sdata, doc, client->id, SM_RECONNECT);
 }
 
-static void dead_proxy(ckpool_t *ckp, sdata_t *sdata, const char *buf)
+static void dead_proxy(sdata_t *sdata, const char *buf)
 {
 	int id = 0, subid = 0;
 
 	sscanf(buf, "deadproxy=%d:%d", &id, &subid);
 	dead_proxyid(sdata, id, subid, false, false);
-	reap_proxies(ckp, sdata);
+	reap_proxies(sdata);
 }
 
-static void del_proxy(ckpool_t *ckp, sdata_t *sdata, const char *buf)
+static void del_proxy(sdata_t *sdata, const char *buf)
 {
 	int id = 0, subid = 0;
 
 	sscanf(buf, "delproxy=%d:%d", &id, &subid);
 	dead_proxyid(sdata, id, subid, false, true);
-	reap_proxies(ckp, sdata);
+	reap_proxies(sdata);
 }
 
 static void reconnect_client_id(sdata_t *sdata, const int64_t client_id)
@@ -4664,9 +4654,9 @@ static void get_uptime(sdata_t *sdata, int *sockd)
 	send_api_response(val, *sockd);
 }
 
-static void stratum_loop(ckpool_t *ckp, proc_instance_t *pi)
+static void stratum_loop(proc_instance_t *pi)
 {
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	unix_msg_t *umsg = NULL;
 	int ret = 0;
 	char *buf;
@@ -4682,15 +4672,15 @@ retry:
 		time_t end_t;
 
 		end_t = time(NULL);
-		if (end_t - sdata->update_time >= ckp->update_interval) {
+		if (end_t - sdata->update_time >= ckpool.update_interval) {
 			sdata->update_time = end_t;
-			if (!ckp->proxy) {
+			if (!ckpool.proxy) {
 				LOGDEBUG("%ds elapsed in strat_loop, updating gbt base",
-					 ckp->update_interval);
+					 ckpool.update_interval);
 				update_base(sdata, GEN_NORMAL);
-			} else if (!ckp->passthrough) {
+			} else if (!ckpool.passthrough) {
 				LOGDEBUG("%ds elapsed in strat_loop, pinging miners",
-					 ckp->update_interval);
+					 ckpool.update_interval);
 				broadcast_ping(sdata);
 			}
 		}
@@ -4722,7 +4712,7 @@ retry:
 		char *msg;
 
 		LOGDEBUG("Stratifier received stats request");
-		msg = stratifier_stats(ckp, sdata);
+		msg = stratifier_stats(sdata);
 		send_unix_msg(umsg->sockd, msg);
 		goto retry;
 	}
@@ -4793,12 +4783,12 @@ retry:
 		update_base(sdata, GEN_PRIORITY);
 	} else if (cmdmatch(buf, "subscribe")) {
 		/* Proxifier has a new subscription */
-		update_subscribe(ckp, buf);
+		update_subscribe(buf);
 	} else if (cmdmatch(buf, "notify")) {
 		/* Proxifier has a new notify ready */
-		update_notify(ckp, buf);
+		update_notify(buf);
 	} else if (cmdmatch(buf, "diff")) {
-		update_diff(ckp, buf);
+		update_diff(buf);
 	} else if (cmdmatch(buf, "dropclient")) {
 		int64_t client_id;
 
@@ -4806,7 +4796,7 @@ retry:
 		if (ret < 0)
 			LOGDEBUG("Stratifier failed to parse dropclient command: %s", buf);
 		else
-			drop_client(ckp, sdata, client_id);
+			drop_client(sdata, client_id);
 	} else if (cmdmatch(buf, "reconnclient")) {
 		int64_t client_id;
 
@@ -4816,15 +4806,15 @@ retry:
 		else
 			reconnect_client_id(sdata, client_id);
 	} else if (cmdmatch(buf, "dropall")) {
-		drop_allclients(ckp);
+		drop_allclients();
 	} else if (cmdmatch(buf, "reconnect")) {
 		request_reconnect(sdata, buf);
 	} else if (cmdmatch(buf, "deadproxy")) {
-		dead_proxy(ckp, sdata, buf);
+		dead_proxy(sdata, buf);
 	} else if (cmdmatch(buf, "delproxy")) {
-		del_proxy(ckp, sdata, buf);
+		del_proxy(sdata, buf);
 	} else if (cmdmatch(buf, "loglevel")) {
-		sscanf(buf, "loglevel=%d", &ckp->loglevel);
+		sscanf(buf, "loglevel=%d", &ckpool.loglevel);
 	} else if (cmdmatch(buf, "resetshares")) {
 		reset_bestshares(sdata);
 	} else
@@ -4832,10 +4822,9 @@ retry:
 	goto retry;
 }
 
-static void *blockupdate(void *arg)
+static void *blockupdate(void __maybe_unused *arg)
 {
-	ckpool_t *ckp = (ckpool_t *)arg;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	char hash[68];
 
 	pthread_detach(pthread_self());
@@ -4844,7 +4833,7 @@ static void *blockupdate(void *arg)
 	while (42) {
 		int ret;
 
-		ret = generator_getbest(ckp, hash);
+		ret = generator_getbest(hash);
 		switch (ret) {
 			case GETBEST_NOTIFY:
 				cksleep_ms(5000);
@@ -4857,7 +4846,7 @@ static void *blockupdate(void *arg)
 				[[fallthrough]];
 			case GETBEST_FAILED:
 			default:
-				cksleep_ms(ckp->blockpoll);
+				cksleep_ms(ckpool.blockpoll);
 		}
 	}
 	return NULL;
@@ -4880,12 +4869,12 @@ static void __fill_enonce1data(const workbase_t *wb, stratum_instance_t *client)
  * When the proxy space is less than 32 bits to work with, we look for an
  * unused enonce1 value and reject clients instead if there is no space left.
  * Needs to be entered with client holding a ref count. */
-static bool new_enonce1(ckpool_t *ckp, sdata_t *ckp_sdata, sdata_t *sdata, stratum_instance_t *client)
+static bool new_enonce1(sdata_t *ckp_sdata, sdata_t *sdata, stratum_instance_t *client)
 {
 	proxy_t *proxy = NULL;
 	uint64_t enonce1;
 
-	if (ckp->proxy) {
+	if (ckpool.proxy) {
 		if (!ckp_sdata->proxy)
 			return false;
 
@@ -4961,11 +4950,11 @@ static proxy_t *__best_subproxy(proxy_t *proxy)
  * in proxy mode where we find a subproxy based on the current proxy with room
  * for more clients. Signal the generator to recruit more subproxies if we are
  * running out of room. */
-static sdata_t *select_sdata(ckpool_t *ckp, sdata_t *ckp_sdata, const int userid)
+static sdata_t *select_sdata(sdata_t *ckp_sdata, const int userid)
 {
 	proxy_t *global, *proxy, *tmp, *best = NULL;
 
-	if (!ckp->proxy || ckp->passthrough)
+	if (!ckpool.proxy || ckpool.passthrough)
 		return ckp_sdata;
 
 	/* Proxies are ordered by priority so first available will be the best
@@ -4993,10 +4982,10 @@ static sdata_t *select_sdata(ckpool_t *ckp, sdata_t *ckp_sdata, const int userid
 	}
 	if (!userid) {
 		if (best->id != global->id || current_headroom(ckp_sdata, &proxy) < 2)
-			generator_recruit(ckp, global->id, 1);
+			generator_recruit(global->id, 1);
 	} else {
 		if (best_userproxy_headroom(ckp_sdata, userid) < 2)
-			generator_recruit(ckp, best->id, 1);
+			generator_recruit(best->id, 1);
 	}
 	return best->sdata;
 }
@@ -5077,8 +5066,7 @@ static yyjson_mut_doc *yyjson_string(const char *msg)
 static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t client_id,
 				       yyjson_mut_val *params_val)
 {
-	ckpool_t *ckp = client->ckp;
-	sdata_t *sdata, *ckp_sdata = ckp->sdata;
+	sdata_t *sdata, *ckp_sdata = ckpool.sdata;
 	int session_id = 0, userid = -1;
 	bool old_match = false;
 	yyjson_mut_doc *doc;
@@ -5091,8 +5079,8 @@ static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t
 		return yyjson_string("params not an array");
 	}
 
-	sdata = select_sdata(ckp, ckp_sdata, 0);
-	if (unlikely(!ckp->node && (!sdata || !sdata->current_workbase))) {
+	sdata = select_sdata(ckp_sdata, 0);
+	if (unlikely(!ckpool.node && (!sdata || !sdata->current_workbase))) {
 		LOGWARNING("Failed to provide subscription due to no %s", sdata ? "current workbase" : "sdata");
 		stratum_send_message(ckp_sdata, client, "Pool Initialising");
 		return yyjson_string("Initialising");
@@ -5116,7 +5104,7 @@ static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t
 			session_id = int_from_sessionid(buf);
 			LOGDEBUG("Found old session id %d", session_id);
 		}
-		if (!ckp->proxy && session_id && !subclient(client_id)) {
+		if (!ckpool.proxy && session_id && !subclient(client_id)) {
 			if ((client->enonce1_64 = disconnected_sessionid_exists(sdata, session_id, client_id))) {
 				sprintf(client->enonce1, "%016lx", client->enonce1_64);
 				old_match = true;
@@ -5134,10 +5122,10 @@ static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t
 		client->messages = true;
 
 	/* We got what we needed */
-	if (ckp->node)
+	if (ckpool.node)
 		return NULL;
 
-	if (ckp->proxy) {
+	if (ckpool.proxy) {
 		/* Use the session_id to tell us which user this was.
 			* If it's not available, see if there's an IP address
 			* which matches a recently disconnected session. */
@@ -5146,7 +5134,7 @@ static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t
 		if (userid == -1)
 			userid = userid_from_sessionip(ckp_sdata, client->address);
 		if (userid != -1) {
-			sdata_t *user_sdata = select_sdata(ckp, ckp_sdata, userid);
+			sdata_t *user_sdata = select_sdata(ckp_sdata, userid);
 
 			if (user_sdata)
 				sdata = user_sdata;
@@ -5154,14 +5142,14 @@ static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t
 	}
 
 	client->sdata = sdata;
-	if (ckp->proxy) {
+	if (ckpool.proxy) {
 		LOGINFO("Current %d, selecting proxy %d:%d for client %s", ckp_sdata->proxy->id,
 			sdata->subproxy->id, sdata->subproxy->subid, client->identity);
 	}
 
 	if (!old_match) {
 		/* Create a new extranonce1 based on a uint64_t pointer */
-		if (!new_enonce1(ckp, ckp_sdata, sdata, client)) {
+		if (!new_enonce1(ckp_sdata, sdata, client)) {
 			stratum_send_message(sdata, client, "Pool full of clients");
 			client->reject = 3;
 			yyjson_string("Proxy full");
@@ -5286,7 +5274,7 @@ static worker_instance_t *get_create_worker(sdata_t *sdata, user_instance_t *use
 					    const char *workername, bool *new_worker);
 
 /* Load the statistics of and create all known users at startup */
-static void read_userstats(ckpool_t *ckp, sdata_t *sdata, int tvsec_diff)
+static void read_userstats(sdata_t *sdata, int tvsec_diff)
 {
 	char dnam[256], s[4096], *username, *buf;
 	int ret, users = 0, workers = 0;
@@ -5300,7 +5288,7 @@ static void read_userstats(ckpool_t *ckp, sdata_t *sdata, int tvsec_diff)
 	DIR *d;
 	int fd;
 
-	snprintf(dnam, 255, "%susers", ckp->logdir);
+	snprintf(dnam, 255, "%susers", ckpool.logdir);
 	d = opendir(dnam);
 	if (!d) {
 		LOGNOTICE("No user directory found");
@@ -5512,12 +5500,12 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 /* This simply strips off the first part of the workername and matches it to a
  * user or creates a new one. Needs to be entered with client holding a ref
  * count. */
-static user_instance_t *generate_user(ckpool_t *ckp, stratum_instance_t *client,
+static user_instance_t *generate_user(stratum_instance_t *client,
 				      const char *workername)
 {
 	char *base_username = strdupa(workername), *username;
 	bool new_user = false, new_worker = false;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	worker_instance_t *worker;
 	user_instance_t *user;
 	int len;
@@ -5541,9 +5529,9 @@ static user_instance_t *generate_user(ckpool_t *ckp, stratum_instance_t *client,
 	__inc_worker(sdata,user, worker);
 	ck_wunlock(&sdata->instance_lock);
 
-	if (!ckp->proxy && (new_user || !user->btcaddress)) {
+	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
 		/* Is this a btc address based username? */
-		if (generator_checkaddr(ckp, username, &user->script, &user->segwit)) {
+		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
@@ -5556,31 +5544,31 @@ static user_instance_t *generate_user(ckpool_t *ckp, stratum_instance_t *client,
 	return user;
 }
 
-static void check_global_user(ckpool_t *ckp, user_instance_t *user, stratum_instance_t *client)
+static void check_global_user(user_instance_t *user, stratum_instance_t *client)
 {
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	proxy_t *proxy = best_proxy(sdata);
 	int proxyid = proxy->id;
 	char buf[256];
 
 	sprintf(buf, "globaluser=%d:%d:%"PRId64":%s,%s", proxyid, user->id, client->id,
 		user->username, client->password);
-	send_proc(ckp->generator,buf);
+	send_proc(ckpool.generator,buf);
 }
 
 /* Manage the response to auth, client must hold ref */
-static void client_auth(ckpool_t *ckp, stratum_instance_t *client, user_instance_t *user,
+static void client_auth(stratum_instance_t *client, user_instance_t *user,
 			const bool ret)
 {
 	if (ret) {
 		client->authorised = ret;
 		user->authorised = ret;
-		if (ckp->proxy) {
+		if (ckpool.proxy) {
 			LOGNOTICE("Authorised client %s to proxy %d:%d, worker %s as user %s",
 				  client->identity, client->proxyid, client->subproxyid,
 			          client->workername, user->username);
-			if (ckp->userproxy)
-				check_global_user(ckp, user, client);
+			if (ckpool.userproxy)
+				check_global_user(user, client);
 		} else {
 			LOGNOTICE("Authorised client %s %s worker %s as user %s",
 				  client->identity, client->address, client->workername,
@@ -5627,7 +5615,6 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 			    yyjson_mut_doc **err_doc)
 {
 	user_instance_t *user;
-	ckpool_t *ckp = client->ckp;
 	const char *buf, *pass;
 	bool ret = false;
 	int arr_size;
@@ -5664,7 +5651,7 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 		goto out;
 	}
 	pass = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 1));
-	user = generate_user(ckp, client, buf);
+	user = generate_user(client, buf);
 	client->user_id = user->id;
 	ts_realtime(&now);
 	client->start_time = now.tv_sec;
@@ -5691,16 +5678,16 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 			goto out;
 		}
 	}
-	if (!ckp->btcsolo || client->user_instance->btcaddress)
+	if (!ckpool.btcsolo || client->user_instance->btcaddress)
 		ret = true;
 
 	/* We do the preauth etc. in remote mode, and leave final auth to
 	 * upstream pool to complete. */
-	if (!ckp->remote || ckp->btcsolo)
-		client_auth(ckp, client, user, ret);
+	if (!ckpool.remote || ckpool.btcsolo)
+		client_auth(client, user, ret);
 out:
-	if (ckp->btcsolo && ret && !client->remote) {
-		sdata_t *sdata = ckp->sdata;
+	if (ckpool.btcsolo && ret && !client->remote) {
+		sdata_t *sdata = ckpool.sdata;
 		workbase_t *wb;
 
 		/* To avoid grabbing recursive lock */
@@ -5758,10 +5745,10 @@ static double time_bias(const double tdiff, const double period)
 }
 
 /* Needs to be entered with client holding a ref count. */
-static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double diff, const bool valid,
+static void add_submit(stratum_instance_t *client, const double diff, const bool valid,
 		       const bool submit)
 {
-	sdata_t *ckp_sdata = ckp->sdata, *sdata = client->sdata;
+	sdata_t *ckp_sdata = ckpool.sdata, *sdata = client->sdata;
 	worker_instance_t *worker = client->worker_instance;
 	double tdiff, bdiff, dsps, drr, network_diff, bias;
 	user_instance_t *user = client->user_instance;
@@ -5787,7 +5774,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 
 	ck_rlock(&sdata->workbase_lock);
 	next_blockid = sdata->workbase_id;
-	if (ckp->proxy)
+	if (ckpool.proxy)
 		network_diff = sdata->current_workbase->diff;
 	else
 		network_diff = sdata->current_workbase->network_diff;
@@ -5811,7 +5798,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 
 	/* Once we've updated user/client statistics in node mode, we can't
 	 * alter diff ourselves. */
-	if (ckp->node)
+	if (ckpool.node)
 		return;
 
 	client->ssdc++;
@@ -5861,14 +5848,14 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 	/* Clamp to mindiff ~ network_diff */
 
 	/* Set to higher of pool mindiff and optimal */
-	optimal = MAX(optimal, ckp->mindiff);
+	optimal = MAX(optimal, ckpool.mindiff);
 
 	/* Set to higher of optimal and user chosen diff */
 	optimal = MAX(optimal, mindiff);
 
 	/* Set to lower of optimal and pool maxdiff */
-	if (ckp->maxdiff)
-		optimal = MIN(optimal, ckp->maxdiff);
+	if (ckpool.maxdiff)
+		optimal = MIN(optimal, ckpool.maxdiff);
 
 	/* Set to lower of optimal and network_diff */
 	optimal = MIN(optimal, network_diff);
@@ -5900,14 +5887,14 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 }
 
 static void
-downstream_block(ckpool_t *ckp, sdata_t *sdata, const json_t *val, const int cblen,
+downstream_block(sdata_t *sdata, const json_t *val, const int cblen,
 		 const char *coinbase, const uchar *data)
 {
 	json_t *block_val = json_deep_copy(val);
 
 	/* Strip unnecessary fields and add extra fields needed */
 	json_set_string(block_val, "method", stratum_msgs[SM_BLOCK]);
-	add_remote_blockdata(ckp, block_val, cblen, coinbase, data);
+	add_remote_blockdata(block_val, cblen, coinbase, data);
 	downstream_json(sdata, block_val, 0, SSEND_PREPEND);
 	json_decref(block_val);
 }
@@ -5922,7 +5909,6 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 {
 	char blockhash[68], cdfield[64], *gbt_block;
 	sdata_t *sdata = client->sdata;
-	ckpool_t *ckp = wb->ckp;
 	double network_diff;
 	json_t *val = NULL;
 	uchar flip32[32];
@@ -5936,14 +5922,14 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 
 	LOGWARNING("Possible %sblock solve diff %lf !", stale ? "stale share " : "", diff);
 	/* Can't submit a block in proxy mode without the transactions */
-	if (!ckp->node && wb->proxy)
+	if (!ckpool.node && wb->proxy)
 		return;
 
 	ts_realtime(&ts_now);
 	sprintf(cdfield, "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
 
 	gbt_block = process_block(wb, coinbase, cblen, data, hash, flip32, blockhash);
-	send_node_block(ckp, sdata, client->enonce1, nonce, nonce2, ntime32, version_mask,
+	send_node_block(sdata, client->enonce1, nonce, nonce2, ntime32, version_mask,
 			wb->id, diff, client->id, coinbase, cblen, data);
 
 	val = json_object();
@@ -5953,7 +5939,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	json_set_int64(val, "workinfoid", wb->id);
 	json_set_string(val, "username", client->user_instance->username);
 	json_set_string(val, "workername", client->workername);
-	if (ckp->remote)
+	if (ckpool.remote)
 		json_set_int64(val, "clientid", client->virtualid);
 	else
 		json_set_int64(val, "clientid", client->id);
@@ -5967,20 +5953,20 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	json_set_string(val, "createdate", cdfield);
 	json_set_string(val, "createby", "code");
 	json_set_string(val, "createcode", __func__);
-	json_set_string(val, "createinet", ckp->serverurl[client->server]);
+	json_set_string(val, "createinet", ckpool.serverurl[client->server]);
 
-	if (ckp->remote) {
-		add_remote_blockdata(ckp, val, cblen, coinbase, data);
-		upstream_json_msgtype(ckp, val, SM_BLOCK);
+	if (ckpool.remote) {
+		add_remote_blockdata(val, cblen, coinbase, data);
+		upstream_json_msgtype(val, SM_BLOCK);
 	} else {
-		downstream_block(ckp, sdata, val, cblen, coinbase, data);
+		downstream_block(sdata, val, cblen, coinbase, data);
 	}
 
 	/* Submit block locally after sending it to remote locations avoiding
 	 * the delay of local verification */
-	ret = local_block_submit(ckp, gbt_block, flip32, wb->height);
+	ret = local_block_submit(gbt_block, flip32, wb->height);
 	if (ret)
-		block_solve(ckp, val);
+		block_solve(val);
 	else
 		block_reject(val);
 
@@ -5993,7 +5979,7 @@ static inline uchar *__user_coinb2(const stratum_instance_t *client, const workb
 	struct userwb *userwb;
 	int64_t id;
 
-	if (!client->ckp->btcsolo)
+	if (!ckpool.btcsolo)
 		goto out_nouserwb;
 
 	id = wb->id;
@@ -6116,7 +6102,6 @@ static void update_client(const stratum_instance_t *client, const int64_t client
 static void submit_share(stratum_instance_t *client, const int64_t jobid, const char *nonce2,
 			 const char *ntime, const char *nonce)
 {
-	ckpool_t *ckp = client->ckp;
 	json_t *json_msg;
 	char enonce2[32];
 
@@ -6124,7 +6109,7 @@ static void submit_share(stratum_instance_t *client, const int64_t jobid, const 
 	JSON_CPACK(json_msg, "{sIsssssssIsIsi}", "jobid", jobid, "nonce2", enonce2,
 			     "ntime", ntime, "nonce", nonce, "client_id", client->id,
 			     "proxy", client->proxyid, "subproxy", client->subproxyid);
-	generator_add_send(ckp, json_msg);
+	generator_add_send(json_msg);
 }
 
 static void check_best_diff(sdata_t *sdata, user_instance_t *user,worker_instance_t *worker,
@@ -6181,7 +6166,6 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 	uint32_t ntime32, version_mask32 = 0;
 	sdata_t *sdata = client->sdata;
 	enum share_err err = SE_NONE;
-	ckpool_t *ckp = client->ckp;
 	char idstring[24] = {};
 	workbase_t *wb = NULL;
 	yyjson_mut_doc *doc;
@@ -6234,7 +6218,7 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 	if (version_mask && strlen(version_mask) && validhex(version_mask)) {
 		sscanf(version_mask, "%x", &version_mask32);
 		// check version mask
-		if (version_mask32 && ((~ckp->version_mask) & version_mask32) != 0) {
+		if (version_mask32 && ((~ckpool.version_mask) & version_mask32) != 0) {
 			// means client changed some bits which server doesn't allow to change
 			err = SE_INVALID_VERSION_MASK;
 			goto out;
@@ -6378,11 +6362,11 @@ out_nowb:
 		submit_share(client, id, nonce2, ntime, nonce);
 	}
 
-	add_submit(ckp, client, diff, result, submit);
+	add_submit(client, diff, result, submit);
 
 	doc = yyjson_mut_pack("{sisIsssssssssfsfsssbsssissssssssssssssss}",
 		"workinfoid", id,
-		"clientid", ckp->remote ? client->virtualid : client->id,
+		"clientid", ckpool.remote ? client->virtualid : client->id,
 		"enonce1", client->enonce1,
 		"nonce2", nonce2,
 		"nonce", nonce,
@@ -6396,13 +6380,13 @@ out_nowb:
 		"createdate", cdfield,
 		"createby", "code",
 		"createcode", __func__,
-		"createinet", ckp->serverurl[client->server],
+		"createinet", ckpool.serverurl[client->server],
 		"workername", client->workername,
 		"username", user->username,
 		"address", client->address,
 		"agent", client->useragent);
 
-	if (ckp->logshares) {
+	if (ckpool.logshares) {
 		fp = fopen(fname, "ae");
 		if (likely(fp)) {
 			yyjson_mut_write_file(fname, doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL);
@@ -6412,8 +6396,8 @@ out_nowb:
 		} else
 			LOGERR("Failed to fopen %s", fname);
 	}
-	if (ckp->remote)
-		upstream_json_msgtype(ckp, yyjson_to_json(doc), SM_SHARE);
+	if (ckpool.remote)
+		upstream_json_msgtype(yyjson_to_json(doc), SM_SHARE);
 	yyjson_mut_doc_free(doc);
 out:
 	if (!sdata->wbincomplete && ((!result && !submit) || !share)) {
@@ -6422,8 +6406,8 @@ out:
 			client->first_invalid = now_t;
 		else if (client->first_invalid && client->first_invalid < now_t - 180 && client->reject < 3) {
 			LOGNOTICE("Client %s rejecting for 180s, disconnecting", client->identity);
-			if (ckp->node)
-				connector_drop_client(ckp, client->id);
+			if (ckpool.node)
+				connector_drop_client(client->id);
 			else
 				stratum_send_message(sdata, client, "Disconnecting for continuous invalid shares");
 			client->reject = 3;
@@ -6443,11 +6427,11 @@ out:
 	}
 
 	if (!share) {
-		if (ckp->remote) {
+		if (ckpool.remote) {
 #if 0
 			/* FIXME unused val */
 			val = json_object();
-			if (ckp->remote)
+			if (ckpool.remote)
 				json_set_int64(val, "clientid", client->virtualid);
 			else
 				json_set_int64(val, "clientid", client->id);
@@ -6462,7 +6446,7 @@ out:
 			json_set_string(val, "createdate", cdfield);
 			json_set_string(val, "createby", "code");
 			json_set_string(val, "createcode", __func__);
-			json_set_string(val, "createinet", ckp->serverurl[client->server]);
+			json_set_string(val, "createinet", ckpool.serverurl[client->server]);
 			json_decref(val);
 #endif
 		}
@@ -6516,11 +6500,10 @@ static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, const
 /* For sending a single stratum template update */
 static void stratum_send_update(sdata_t *sdata, const int64_t client_id, const bool clean)
 {
-	ckpool_t *ckp = sdata->ckp;
 	yyjson_mut_doc *doc;
 
 	if (unlikely(!sdata->current_workbase)) {
-		if (!ckp->proxy)
+		if (!ckpool.proxy)
 			LOGWARNING("No current workbase to send stratum update");
 		else
 			LOGDEBUG("No current workbase to send stratum update for client %"PRId64, client_id);
@@ -6627,7 +6610,7 @@ static void update_client(const stratum_instance_t *client, const int64_t client
 {
 	sdata_t *sdata = client->sdata;
 
-	if (!client->ckp->btcsolo)
+	if (!ckpool.btcsolo)
 		stratum_send_update(sdata, client_id, true);
 	stratum_send_diff(sdata, client);
 }
@@ -6678,7 +6661,7 @@ static json_params_t
 /* Implement support for the diff in the params as well as the originally
  * documented form of placing diff within the method. Needs to be entered with
  * client holding a ref count. */
-static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *method,
+static void suggest_diff(stratum_instance_t *client, const char *method,
 			 yyjson_mut_val *params_val)
 {
 	yyjson_mut_val *arr_val = yyjson_mut_arr_get(params_val, 0);
@@ -6695,8 +6678,8 @@ static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *
 		return;
 	}
 	/* Clamp suggest diff to global pool mindiff */
-	if (sdiff < ckp->mindiff)
-		sdiff = ckp->mindiff;
+	if (sdiff < ckpool.mindiff)
+		sdiff = ckpool.mindiff;
 	if (sdiff == client->suggest_diff)
 		return;
 	client->suggest_diff = sdiff;
@@ -6705,7 +6688,7 @@ static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *
 	client->diff_change_job_id = client->sdata->workbase_id;
 	client->old_diff = client->diff;
 	client->diff = sdiff;
-	stratum_send_diff(ckp->sdata, client);
+	stratum_send_diff(ckpool.sdata, client);
 }
 
 /* Send diff first when sending the first stratum template after subscribing */
@@ -6714,7 +6697,7 @@ static void init_client(const stratum_instance_t *client, const int64_t client_i
 	sdata_t *sdata = client->sdata;
 
 	stratum_send_diff(sdata, client);
-	if (!client->ckp->btcsolo)
+	if (!ckpool.btcsolo)
 		stratum_send_update(sdata, client_id, true);
 }
 
@@ -6767,7 +6750,7 @@ static void *setup_node(void *arg)
  * block. Increment the ref count to prevent the client pointer
  * dereferencing under us, allowing the thread to decrement it again when
  * finished. */
-static void add_mining_node(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *client)
+static void add_mining_node(sdata_t *sdata, stratum_instance_t *client)
 {
 	pthread_t pth;
 
@@ -6778,7 +6761,7 @@ static void add_mining_node(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *c
 	ck_wunlock(&sdata->instance_lock);
 
 	LOGWARNING("Added client %s %s as mining node on server %d:%s", client->identity,
-		   client->address, client->server, ckp->serverurl[client->server]);
+		   client->address, client->server, ckpool.serverurl[client->server]);
 
 	create_pthread(&pth, setup_node, client);
 }
@@ -6796,7 +6779,7 @@ static void add_remote_server(sdata_t *sdata, stratum_instance_t *client)
 }
 
 /* Enter with client holding ref count */
-static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *client,
+static void parse_method(sdata_t *sdata, stratum_instance_t *client,
 			 const int64_t client_id, yyjson_mut_val *id_val, yyjson_mut_val *method_val,
 			 yyjson_mut_val *params_val)
 {
@@ -6815,7 +6798,7 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 
 	if (cmdmatch(method, "mining.term")) {
 		LOGDEBUG("Mining terminate requested from %s %s", client->identity, client->address);
-		drop_client(ckp, sdata, client_id);
+		drop_client(sdata, client_id);
 		return;
 	}
 
@@ -6858,13 +6841,13 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 
 		/* Add this client as a trusted remote node in the connector and
 		 * drop the client in the stratifier */
-		if (!ckp->trusted[client->server] || ckp->proxy) {
+		if (!ckpool.trusted[client->server] || ckpool.proxy) {
 			LOGNOTICE("Dropping client %s %s trying to authorise as remote node on non trusted server %d",
 				  client->identity, client->address, client->server);
-			connector_drop_client(ckp, client_id);
+			connector_drop_client(client_id);
 		} else {
 			snprintf(buf, 255, "remote=%"PRId64, client_id);
-			send_proc(ckp->connector, buf);
+			send_proc(ckpool.connector, buf);
 			add_remote_server(sdata, client);
 		}
 		sprintf(client->identity, "remote:%"PRId64, client_id);
@@ -6876,15 +6859,15 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 
 		/* Add this client as a passthrough in the connector and
 		 * add it to the list of mining nodes in the stratifier */
-		if (!ckp->nodeserver[client->server] || ckp->proxy) {
+		if (!ckpool.nodeserver[client->server] || ckpool.proxy) {
 			LOGNOTICE("Dropping client %s %s trying to authorise as node on non node server %d",
 				  client->identity, client->address, client->server);
-			connector_drop_client(ckp, client_id);
-			drop_client(ckp, sdata, client_id);
+			connector_drop_client(client_id);
+			drop_client(sdata, client_id);
 		} else {
 			snprintf(buf, 255, "passthrough=%"PRId64, client_id);
-			send_proc(ckp->connector, buf);
-			add_mining_node(ckp, sdata, client);
+			send_proc(ckpool.connector, buf);
+			add_mining_node(sdata, client);
 			sprintf(client->identity, "node:%"PRId64, client_id);
 		}
 		return;
@@ -6893,11 +6876,11 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 	if (unlikely(cmdmatch(method, "mining.passthrough"))) {
 		char buf[256];
 
-		if (ckp->proxy || ckp->node ) {
+		if (ckpool.proxy || ckpool.node ) {
 			LOGNOTICE("Dropping client %s %s trying to connect as passthrough on unsupported server %d",
 				  client->identity, client->address, client->server);
-			connector_drop_client(ckp, client_id);
-			drop_client(ckp, sdata, client_id);
+			connector_drop_client(client_id);
+			drop_client(sdata, client_id);
 		} else {
 			/*Flag this as a passthrough and manage its messages
 			 * accordingly. No data from this client id should ever
@@ -6905,7 +6888,7 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 			LOGNOTICE("Adding passthrough client %s %s", client->identity, client->address);
 			client->passthrough = true;
 			snprintf(buf, 255, "passthrough=%"PRId64, client_id);
-			send_proc(ckp->connector, buf);
+			send_proc(ckpool.connector, buf);
 			sprintf(client->identity, "passthrough:%"PRId64, client_id);
 		}
 		return;
@@ -6934,7 +6917,7 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 
 		LOGINFO("Mining configure requested from %s %s", client->identity,
 			client->address);
-		sprintf(version_str, "%08x", ckp->version_mask);
+		sprintf(version_str, "%08x", ckpool.version_mask);
 
 		doc = yyjson_mut_doc_new(&ckyyalc);
 		newid_val = yyjson_mut_val_mut_copy(doc, id_val);
@@ -6956,7 +6939,7 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 	if (!client->subscribed) {
 		LOGINFO("Dropping %s from unsubscribed client %s %s", method,
 			client->identity, client->address);
-		connector_drop_client(ckp, client_id);
+		connector_drop_client(client_id);
 		return;
 	}
 
@@ -6968,7 +6951,7 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
 	}
 
 	if (cmdmatch(method, "mining.suggest")) {
-		suggest_diff(ckp, client, method, params_val);
+		suggest_diff(client, method, params_val);
 		return;
 	}
 
@@ -6996,7 +6979,7 @@ static void free_smsg(smsg_t *msg)
 
 /* Even though we check the results locally in node mode, check the upstream
  * results in case of runs of invalids. */
-static void parse_share_result(ckpool_t *ckp, stratum_instance_t *client, json_t *val)
+static void parse_share_result(stratum_instance_t *client, json_t *val)
 {
 	time_t now_t;
 	ts_t now;
@@ -7011,7 +6994,7 @@ static void parse_share_result(ckpool_t *ckp, stratum_instance_t *client, json_t
 		client->upstream_invalid = now_t;
 	else if (client->upstream_invalid && client->upstream_invalid < now_t - 150) {
 		LOGNOTICE("Client %s upstream rejects for 150s, disconnecting", client->identity);
-		connector_drop_client(ckp, client->id);
+		connector_drop_client(client->id);
 		client->reject = 3;
 	}
 }
@@ -7035,14 +7018,14 @@ static void parse_subscribe_result(stratum_instance_t *client, json_t *val)
 	LOGINFO("Client %s got enonce1 %lx string %s", client->identity, client->enonce1_64, client->enonce1);
 }
 
-static void parse_authorise_result(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *client,
+static void parse_authorise_result(sdata_t *sdata, stratum_instance_t *client,
 				   json_t *val)
 {
 	if (!json_is_true(val)) {
 		LOGNOTICE("Client %s was not authorised upstream, dropping", client->identity);
 		client->authorised = false;
-		connector_drop_client(ckp, client->id);
-		drop_client(ckp, sdata, client->id);
+		connector_drop_client(client->id);
+		drop_client(sdata, client->id);
 	} else
 		LOGINFO("Client %s was authorised upstream", client->identity);
 }
@@ -7086,10 +7069,10 @@ out:
 	return ret;
 }
 
-static user_instance_t *generate_remote_user(ckpool_t *ckp, const char *workername)
+static user_instance_t *generate_remote_user(const char *workername)
 {
 	char *base_username = strdupa(workername), *username;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	bool new_user = false;
 	user_instance_t *user;
 	int len;
@@ -7103,9 +7086,9 @@ static user_instance_t *generate_remote_user(ckpool_t *ckp, const char *workerna
 
 	user = get_create_user(sdata, username, &new_user);
 
-	if (!ckp->proxy && (new_user || !user->btcaddress)) {
+	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
 		/* Is this a btc address based username? */
-		if (generator_checkaddr(ckp, username, &user->script, &user->segwit)) {
+		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
@@ -7118,7 +7101,7 @@ static user_instance_t *generate_remote_user(ckpool_t *ckp, const char *workerna
 	return user;
 }
 
-static void parse_remote_share(ckpool_t *ckp, sdata_t *sdata, json_t *val, const char *buf)
+static void parse_remote_share(sdata_t *sdata, json_t *val, const char *buf)
 {
 	json_t *workername_val = json_object_get(val, "workername");
 	worker_instance_t *worker;
@@ -7137,7 +7120,7 @@ static void parse_remote_share(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 		return;
 	}
 	json_get_double(&sdiff, val, "sdiff");
-	user = generate_remote_user(ckp, workername);
+	user = generate_remote_user(workername);
 	user->authorised = true;
 	worker = get_worker(sdata, user, workername);
 	check_best_diff(sdata, user, worker, sdiff, NULL);
@@ -7161,7 +7144,7 @@ static void parse_remote_share(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 	LOGINFO("Added %.0lf remote shares to worker %s", diff, workername);
 }
 
-static void parse_remote_shareerr(ckpool_t *ckp, json_t *val, const char *buf)
+static void parse_remote_shareerr(json_t *val, const char *buf)
 {
 	const char *workername;
 
@@ -7171,7 +7154,7 @@ static void parse_remote_shareerr(ckpool_t *ckp, json_t *val, const char *buf)
 		return;
 	}
 	/* Return value ignored */
-	generate_remote_user(ckp, workername);
+	generate_remote_user(workername);
 }
 
 static void send_auth_response(sdata_t *sdata, const int64_t client_id, const bool ret,
@@ -7205,11 +7188,11 @@ static void send_yyauth_response(sdata_t *sdata, const int64_t client_id, const 
 	stratum_add_yysend(sdata, doc, client_id, SM_AUTHRESULT);
 }
 
-static void send_auth_success(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *client)
+static void send_auth_success(sdata_t *sdata, stratum_instance_t *client)
 {
 	char *buf;
 
-	ASPRINTF(&buf, "Authorised, welcome to %s %s!", ckp->name,
+	ASPRINTF(&buf, "Authorised, welcome to %s %s!", ckpool.name,
 		 client->user_instance->username);
 	stratum_send_message(sdata, client, buf);
 	free(buf);
@@ -7245,10 +7228,10 @@ static stratum_instance_t *ref_instance_by_virtualid(sdata_t *sdata, int64_t *cl
 	return ret;
 }
 
-void parse_upstream_auth(ckpool_t *ckp, json_t *val)
+void parse_upstream_auth(json_t *val)
 {
 	json_t *id_val = NULL, *err_val = NULL;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	bool ret, warn = false;
 	int64_t client_id;
@@ -7271,11 +7254,11 @@ void parse_upstream_auth(ckpool_t *ckp, json_t *val)
 		goto out;
 	}
 	if (ret)
-		send_auth_success(ckp, sdata, client);
+		send_auth_success(sdata, client);
 	else
 		send_auth_failure(sdata, client);
 	send_auth_response(sdata, client_id, ret, id_val, err_val);
-	client_auth(ckp, client, client->user_instance, ret);
+	client_auth(client, client->user_instance, ret);
 	dec_instance_ref(sdata, client);
 out:
 	if (unlikely(warn)) {
@@ -7286,14 +7269,14 @@ out:
 	}
 }
 
-void parse_upstream_workinfo(ckpool_t *ckp, json_t *val)
+void parse_upstream_workinfo(json_t *val)
 {
-	add_node_base(ckp, val, true, 0);
+	add_node_base(val, true, 0);
 }
 
-#define parse_remote_workinfo(ckp, val, client_id) add_node_base(ckp, val, true, client_id)
+#define parse_remote_workinfo(val, client_id) add_node_base(val, true, client_id)
 
-static void parse_remote_auth(ckpool_t *ckp, sdata_t *sdata, json_t *val, stratum_instance_t *remote,
+static void parse_remote_auth(sdata_t *sdata, json_t *val, stratum_instance_t *remote,
 			      const int64_t remote_id)
 {
 	json_t *params, *method, *id_val;
@@ -7301,7 +7284,7 @@ static void parse_remote_auth(ckpool_t *ckp, sdata_t *sdata, json_t *val, stratu
 	json_params_t *jp;
 	int64_t client_id;
 
-	if (ckp->btcsolo) {
+	if (ckpool.btcsolo) {
 		LOGWARNING("Got remote auth request in btcsolo mode, ignoring!");
 		return;
 	}
@@ -7319,7 +7302,7 @@ static void parse_remote_auth(ckpool_t *ckp, sdata_t *sdata, json_t *val, stratu
 	ck_wlock(&sdata->instance_lock);
 	client = __instance_by_id(sdata, client_id);
 	if (likely(!client))
-		client = __stratum_add_instance(ckp, client_id, remote->address, remote->server);
+		client = __stratum_add_instance(client_id, remote->address, remote->server);
 	client->remote = true;
 	json_strdup(&client->useragent, val, "useragent");
 	json_strcpy(client->enonce1, val, "enonce1");
@@ -7352,7 +7335,7 @@ static void parse_remote_workers(sdata_t *sdata, const json_t *val, const char *
 }
 
 /* Attempt to submit a remote block locally by recreating it from its workinfo */
-static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const char *buf,
+static void parse_remote_block(sdata_t *sdata, json_t *val, const char *buf,
 			       const int64_t client_id)
 {
 	json_t *workername_val = json_object_get(val, "workername"),
@@ -7402,7 +7385,7 @@ static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 		/* We rely on the remote server to give us the ID_BLOCK
 		 * responses, so only use this response to determine if we
 		 * should reset the best shares. */
-		if (local_block_submit(ckp, gbt_block, flip32, wb->height)) {
+		if (local_block_submit(gbt_block, flip32, wb->height)) {
 			block_share_summary(sdata);
 			reset_bestshares(sdata);
 		}
@@ -7424,19 +7407,19 @@ out_add:
 	/* Make a duplicate for use downstream */
 	res = json_deep_copy(val);
 	remap_workinfo_id(sdata, res, client_id);
-	if (!ckp->remote)
+	if (!ckpool.remote)
 		downstream_json(sdata, res, client_id, SSEND_PREPEND);
 
 	json_decref(res);
 }
 
-void parse_upstream_block(ckpool_t *ckp, json_t *val)
+void parse_upstream_block(json_t *val)
 {
 	char *buf;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 
 	buf = json_dumps(val, 0);
-	parse_remote_block(ckp, sdata, val, buf, 0);
+	parse_remote_block(sdata, val, buf, 0);
 	free(buf);
 }
 
@@ -7448,7 +7431,7 @@ static void send_remote_pong(sdata_t *sdata, stratum_instance_t *client)
 	stratum_add_yysend(sdata, doc, client->id, SM_PONG);
 }
 
-static void add_node_txns(ckpool_t *ckp, sdata_t *sdata, const json_t *val)
+static void add_node_txns(sdata_t *sdata, const json_t *val)
 {
 	json_t *txn_array, *txn_val, *data_val, *hash_val;
 	txntable_t *txns = NULL;
@@ -7471,17 +7454,17 @@ static void add_node_txns(ckpool_t *ckp, sdata_t *sdata, const json_t *val)
 			continue;
 		}
 
-		if (add_txn(ckp, sdata, &txns, hash, data, false))
+		if (add_txn(sdata, &txns, hash, data, false))
 			added++;
 	}
 
 	if (added)
-		update_txns(ckp, sdata, txns, false);
+		update_txns(sdata, txns, false);
 }
 
-void parse_remote_txns(ckpool_t *ckp, const json_t *val)
+void parse_remote_txns(const json_t *val)
 {
-	add_node_txns(ckp, ckp->sdata, val);
+	add_node_txns(ckpool.sdata, val);
 }
 
 static json_t *get_hash_transactions(sdata_t *sdata, const json_t *hashes)
@@ -7542,19 +7525,19 @@ static void parse_remote_reqtxns(sdata_t *sdata, const json_t *val, const int64_
 	stratum_add_send(sdata, ret, client_id, SM_TRANSACTIONS);
 }
 
-void parse_upstream_reqtxns(ckpool_t *ckp, json_t *val)
+void parse_upstream_reqtxns(json_t *val)
 {
-	json_t *ret = get_reqtxns(ckp->sdata, val, false);
+	json_t *ret = get_reqtxns(ckpool.sdata, val, false);
 	char *msg;
 
 	if (!ret)
 		return;
 	msg = json_dumps(ret, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_COMPACT | JSON_EOL);
 	json_decref(ret);
-	connector_upstream_msg(ckp, msg);
+	connector_upstream_msg(msg);
 }
 
-static void parse_trusted_msg(ckpool_t *ckp, sdata_t *sdata, json_t *val, stratum_instance_t *client)
+static void parse_trusted_msg(sdata_t *sdata, json_t *val, stratum_instance_t *client)
 {
 	json_t *method_val = json_object_get(val, "method");
 	char *buf = json_dumps(val, 0);
@@ -7568,17 +7551,17 @@ static void parse_trusted_msg(ckpool_t *ckp, sdata_t *sdata, json_t *val, stratu
 	}
 
 	if (likely(!safecmp(method, stratum_msgs[SM_SHARE])))
-		parse_remote_share(ckp, sdata, val, buf);
+		parse_remote_share(sdata, val, buf);
 	else if (!safecmp(method, stratum_msgs[SM_TRANSACTIONS]))
-		add_node_txns(ckp, sdata, val);
+		add_node_txns(sdata, val);
 	else if (!safecmp(method, stratum_msgs[SM_WORKINFO]))
-		parse_remote_workinfo(ckp, val, client->id);
+		parse_remote_workinfo(val, client->id);
 	else if (!safecmp(method, stratum_msgs[SM_AUTH]))
-		parse_remote_auth(ckp, sdata, val, client, client->id);
+		parse_remote_auth(sdata, val, client, client->id);
 	else if (!safecmp(method, stratum_msgs[SM_SHAREERR]))
-		parse_remote_shareerr(ckp, val, buf);
+		parse_remote_shareerr(val, buf);
 	else if (!safecmp(method, stratum_msgs[SM_BLOCK]))
-		parse_remote_block(ckp, sdata, val, buf, client->id);
+		parse_remote_block(sdata, val, buf, client->id);
 	else if (!safecmp(method, stratum_msgs[SM_REQTXNS]))
 		parse_remote_reqtxns(sdata, val, client->id);
 	else if (!safecmp(method, "workers"))
@@ -7592,11 +7575,11 @@ out:
 }
 
 /* Entered with client holding ref count */
-static void node_client_msg(ckpool_t *ckp, json_t *val, stratum_instance_t *client)
+static void node_client_msg(json_t *val, stratum_instance_t *client)
 {
 	json_t *params, *method, *res_val, *id_val;
 	int msg_type = node_msg_type(val);
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	yyjson_mut_doc *tmpdoc;
 	json_params_t *jp;
 	char *buf = NULL;
@@ -7619,7 +7602,7 @@ static void node_client_msg(ckpool_t *ckp, json_t *val, stratum_instance_t *clie
 			ckmsgq_add(sdata->sshareq, jp);
 			break;
 		case SM_SHARERESULT:
-			parse_share_result(ckp, client, res_val);
+			parse_share_result(client, res_val);
 			break;
 		case SM_DIFF:
 			parse_diff(client, params);
@@ -7643,7 +7626,7 @@ static void node_client_msg(ckpool_t *ckp, json_t *val, stratum_instance_t *clie
 			yyjson_mut_doc_free(doc);
 			break;
 		case SM_AUTHRESULT:
-			parse_authorise_result(ckp, sdata, client, res_val);
+			parse_authorise_result(sdata, client, res_val);
 			break;
 		case SM_NONE:
 			buf = json_dumps(val, 0);
@@ -7657,7 +7640,7 @@ out:
 	free(buf);
 }
 
-static void parse_node_msg(ckpool_t *ckp, sdata_t *sdata, json_t *val)
+static void parse_node_msg(sdata_t *sdata, json_t *val)
 {
 	int msg_type = node_msg_type(val);
 
@@ -7671,13 +7654,13 @@ static void parse_node_msg(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 	LOGDEBUG("Got node method %d:%s", msg_type, stratum_msgs[msg_type]);
 	switch (msg_type) {
 		case SM_TRANSACTIONS:
-			add_node_txns(ckp, sdata, val);
+			add_node_txns(sdata, val);
 			break;
 		case SM_WORKINFO:
-			add_node_base(ckp, val, false, 0);
+			add_node_base(val, false, 0);
 			break;
 		case SM_BLOCK:
-			submit_node_block(ckp, sdata, val);
+			submit_node_block(sdata, val);
 			break;
 		default:
 			break;
@@ -7685,7 +7668,7 @@ static void parse_node_msg(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 }
 
 /* Entered with client holding ref count */
-static void parse_instance_msg(ckpool_t *ckp, sdata_t *sdata, smsg_t *msg, stratum_instance_t *client)
+static void parse_instance_msg(sdata_t *sdata, smsg_t *msg, stratum_instance_t *client)
 {
 	yyjson_mut_val *root, *id_val, *method, *params;
 	int64_t client_id = msg->client_id;
@@ -7695,7 +7678,7 @@ static void parse_instance_msg(ckpool_t *ckp, sdata_t *sdata, smsg_t *msg, strat
 	if (client->reject == 3) {
 		LOGINFO("Dropping client %s %s tagged for lazy invalidation",
 			client->identity, client->address);
-		connector_drop_client(ckp, client_id);
+		connector_drop_client(client_id);
 		return;
 	}
 
@@ -7736,21 +7719,21 @@ static void parse_instance_msg(ckpool_t *ckp, sdata_t *sdata, smsg_t *msg, strat
 	/* At startup we block until there's a current workbase otherwise we
 	 * will reject miners with the initialising message. A slightly delayed
 	 * response to subscribe is better tolerated. */
-	while (unlikely(!ckp->proxy && !sdata->current_workbase)) {
+	while (unlikely(!ckpool.proxy && !sdata->current_workbase)) {
 		cksleep_ms(100);
 		if (!(++delays % 50))
 			LOGWARNING("%d Second delay waiting for bitcoind at startup", delays / 10);
 	}
 
-	parse_method(ckp, sdata, client, client_id, id_val, method, params);
+	parse_method(sdata, client, client_id, id_val, method, params);
 }
 
-static void srecv_process(ckpool_t *ckp, smsg_t *msg)
+static void srecv_process(smsg_t *msg)
 {
 	char address[INET6_ADDRSTRLEN], *buf = NULL;
 	bool noid = false, dropped = false;
 	yyjson_mut_val *root, *val;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	yyjson_mut_doc *doc;
 	int server;
@@ -7774,8 +7757,8 @@ static void srecv_process(ckpool_t *ckp, smsg_t *msg)
 
 	val = yyjson_mut_obj_get(root, "client_id");
 	if (unlikely(!val)) {
-		if (ckp->node)
-			parse_node_msg(ckp, sdata, msg->json_msg);
+		if (ckpool.node)
+			parse_node_msg(sdata, msg->json_msg);
 		else {
 			buf = yyjson_mut_write(doc, 0, NULL);
 			LOGWARNING("Failed to extract client_id from connector json smsg %s", buf);
@@ -7810,7 +7793,7 @@ static void srecv_process(ckpool_t *ckp, smsg_t *msg)
 	/* If client_id instance doesn't exist yet, create one */
 	if (unlikely(!client)) {
 		noid = true;
-		client = __stratum_add_instance(ckp, msg->client_id, address, server);
+		client = __stratum_add_instance(msg->client_id, address, server);
 	} else if (unlikely(client->dropped))
 		dropped = true;
 	if (likely(!dropped))
@@ -7821,28 +7804,28 @@ static void srecv_process(ckpool_t *ckp, smsg_t *msg)
 		/* Client may be NULL here */
 		LOGNOTICE("Stratifier skipped dropped instance %"PRId64" message from server %d",
 			  msg->client_id, server);
-		connector_drop_client(ckp, msg->client_id);
+		connector_drop_client(msg->client_id);
 		goto out;
 	}
 	if (unlikely(noid))
 		LOGINFO("Stratifier added instance %s server %d", client->identity, server);
 
-	if (!msg->json_msg && (client->trusted || ckp->node))
+	if (!msg->json_msg && (client->trusted || ckpool.node))
 		msg->json_msg = yyjson_to_json(doc);
 
 	if (client->trusted)
-		parse_trusted_msg(ckp, sdata, msg->json_msg, client);
-	else if (ckp->node)
-		node_client_msg(ckp, msg->json_msg, client);
+		parse_trusted_msg(sdata, msg->json_msg, client);
+	else if (ckpool.node)
+		node_client_msg(msg->json_msg, client);
 	else
-		parse_instance_msg(ckp, sdata, msg, client);
+		parse_instance_msg(sdata, msg, client);
 	dec_instance_ref(sdata, client);
 out:
 	free_smsg(msg);
 	free(buf);
 }
 
-void _stratifier_add_yyrecv(ckpool_t *ckp, yyjson_mut_doc *doc, const char *file, const char *func, const int line)
+void _stratifier_add_yyrecv(yyjson_mut_doc *doc, const char *file, const char *func, const int line)
 {
 	sdata_t *sdata;
 	smsg_t *msg;
@@ -7851,13 +7834,13 @@ void _stratifier_add_yyrecv(ckpool_t *ckp, yyjson_mut_doc *doc, const char *file
 		LOGWARNING("_stratifier_add_yyrecv received NULL doc from %s %s:%d", file, func, line);
 		return;
 	}
-	sdata = ckp->sdata;
+	sdata = ckpool.sdata;
 	msg = ckzalloc(sizeof(smsg_t));
 	msg->doc = doc;
 	ckmsgq_add(sdata->srecvs, msg);
 }
 
-static void ssend_process(ckpool_t *ckp, smsg_t *msg)
+static void ssend_process(smsg_t *msg)
 {
 	if (unlikely(!msg->doc && !msg->json_msg)) {
 		LOGERR("Sent null json msg to stratum_sender");
@@ -7873,14 +7856,14 @@ static void ssend_process(ckpool_t *ckp, smsg_t *msg)
 		/* Working with yyjson */
 
 		yyjson_mut_obj_add_sint(doc, root, "client_id", msg->client_id);
-		connector_add_yymessage(ckp, doc);
+		connector_add_yymessage(doc);
 		/* In case we have both doc and json_msg */
 		if (unlikely(msg->json_msg))
 			json_decref(msg->json_msg);
 	} else {
 		/* Working with jansson */
 		json_object_set_new_nocheck(msg->json_msg, "client_id", json_integer(msg->client_id));
-		connector_add_message(ckp, msg->json_msg);
+		connector_add_message(msg->json_msg);
 	}
 
 	/* The connector will free msg->json_msg or msg->doc */
@@ -7898,12 +7881,12 @@ static void discard_json_params(json_params_t *jp)
 	free(jp);
 }
 
-static void sshare_process(ckpool_t *ckp, json_params_t *jp)
+static void sshare_process(json_params_t *jp)
 {
 	enum share_err err_code = SE_NONE;
 	yyjson_mut_val *root, *newid_val;
 	stratum_instance_t *client;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	yyjson_mut_doc *doc;
 	int64_t client_id;
 	bool result;
@@ -7966,7 +7949,7 @@ static stratum_instance_t *preauth_ref_instance_by_id(sdata_t *sdata, const int6
 
 /* Send the auth upstream in trusted remote mode, allowing the connector to
  * asynchronously receive the response and return the auth response. */
-static void upstream_auth(ckpool_t *ckp, stratum_instance_t *client, json_params_t *jp)
+static void upstream_auth(stratum_instance_t *client, json_params_t *jp)
 {
 	json_t *val = json_object();
 	char cdfield[64];
@@ -7987,14 +7970,14 @@ static void upstream_auth(ckpool_t *ckp, stratum_instance_t *client, json_params
 	json_set_int64(val, "clientid", client->virtualid);
 	msg = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_COMPACT | JSON_EOL);
 	json_decref(val);
-	connector_upstream_msg(ckp, msg);
+	connector_upstream_msg(msg);
 }
 
-static void sauth_process(ckpool_t *ckp, json_params_t *jp)
+static void sauth_process(json_params_t *jp)
 {
 	yyjson_mut_doc *err_doc = NULL;
 	yyjson_mut_val *err_val;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	int64_t mindiff, client_id;
 	bool ret;
@@ -8011,11 +7994,11 @@ static void sauth_process(ckpool_t *ckp, json_params_t *jp)
 	if (ret) {
 		/* So far okay in remote mode, remainder to be done by upstream
 		 * pool */
-		if (ckp->remote && !ckp->btcsolo) {
-			upstream_auth(ckp, client, jp);
+		if (ckpool.remote && !ckpool.btcsolo) {
+			upstream_auth(client, jp);
 			goto out;
 		}
-		send_auth_success(ckp, sdata, client);
+		send_auth_success(sdata, client);
 	} else
 		send_auth_failure(sdata, client);
 	if (!err_doc) {
@@ -8042,7 +8025,7 @@ static void sauth_process(ckpool_t *ckp, json_params_t *jp)
 	else
 		mindiff = client->worker_instance->mindiff;
 	if (mindiff) {
-		mindiff = MAX(ckp->mindiff, mindiff);
+		mindiff = MAX(ckpool.mindiff, mindiff);
 		if (mindiff != client->diff) {
 			client->diff = mindiff;
 			stratum_send_diff(sdata, client);
@@ -8084,14 +8067,14 @@ static char *txnhashes_by_jobid(sdata_t *sdata, const int64_t id)
 	return ret;
 }
 
-static void send_transactions(ckpool_t *ckp, json_params_t *jp)
+static void send_transactions(json_params_t *jp)
 {
 	const char *msg = yyjson_mut_get_str(jp->yymethod),
 		*params = yyjson_mut_get_str(yyjson_mut_arr_get(jp->yyparams, 0));
 	stratum_instance_t *client = NULL;
 	yyjson_mut_val *root, *newid_val;
 	yyjson_mut_doc *doc;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	int64_t job_id = 0;
 	char *hashes;
 	time_t now_t;
@@ -8143,7 +8126,7 @@ static void send_transactions(ckpool_t *ckp, json_params_t *jp)
 	}
 
 	now_t = time(NULL);
-	if (now_t - client->last_txns < ckp->update_interval) {
+	if (now_t - client->last_txns < ckpool.update_interval) {
 		LOGNOTICE("Rate limiting get_txnhashes on client %"PRId64"!", jp->client_id);
 			root = yyjson_mut_pack_val(doc, "{ssso}",
 			      "error", "Ratelimit",
@@ -8211,13 +8194,13 @@ static void dump_log_entries(log_entry_t **entries)
 	}
 }
 
-static void upstream_workers(ckpool_t *ckp, user_instance_t *user)
+static void upstream_workers(user_instance_t *user)
 {
 	char *msg;
 
 	ASPRINTF(&msg, "{\"method\":\"workers\",\"username\":\"%s\",\"workers\":%d}\n",
 		 user->username, user->workers);
-	connector_upstream_msg(ckp, msg);
+	connector_upstream_msg(msg);
 }
 
 
@@ -8249,16 +8232,15 @@ static worker_instance_t *next_worker(sdata_t *sdata, user_instance_t *user, wor
 	return worker;
 }
 
-static void lazy_drop_client(ckpool_t *ckp, stratum_instance_t *client)
+static void lazy_drop_client(stratum_instance_t *client)
 {
 	client->dropped = true;
-	connector_drop_client(ckp, client->id);
+	connector_drop_client(client->id);
 }
 
-static void *statsupdate(void *arg)
+static void *statsupdate(void __maybe_unused *arg)
 {
-	ckpool_t *ckp = (ckpool_t *)arg;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	pool_stats_t *stats = &sdata->stats;
 
 	pthread_detach(pthread_self());
@@ -8301,14 +8283,14 @@ static void *statsupdate(void *arg)
 			 * connector may not have been informed about and should
 			 * disconnect. */
 			if (client->dropped)
-				connector_drop_client(ckp, client->id);
+				connector_drop_client(client->id);
 			else if (remote_server(client)) {
 				/* Do nothing to these */
 			} else if (!client->authorised) {
 				/* Test for clients that haven't authed in over a minute
 				 * and drop them lazily */
 				if (now.tv_sec > client->start_time + 60)
-					lazy_drop_client(ckp, client);
+					lazy_drop_client(client);
 			} else {
 				per_tdiff = tvdiff(&now, &client->last_share);
 				/* Decay times per connected instance */
@@ -8316,15 +8298,15 @@ static void *statsupdate(void *arg)
 					/* No shares for over a minute, decay to 0 */
 					decay_client(client, 0, &now);
 					idle_workers++;
-					if (ckp->dropidle && per_tdiff > ckp->dropidle) {
+					if (ckpool.dropidle && per_tdiff > ckpool.dropidle) {
 						/* Drop clients idle for longer than
-						 * ckp->dropidle in seconds if set */
+						 * ckpool.dropidle in seconds if set */
 						LOGINFO("Dropping client %"PRId64" due to being idle", client->id);
-						lazy_drop_client(ckp, client);
+						lazy_drop_client(client);
 					} else if (per_tdiff > 600) {
 						client->idle = true;
 						/* Test idle clients are still connected */
-						connector_test_client(ckp, client->id);
+						connector_test_client(client->id);
 					}
 				}
 			}
@@ -8458,12 +8440,12 @@ static void *statsupdate(void *arg)
 				yyjson_mut_arr_append(workers_arr, wval);
 			}
 
-			ASPRINTF(&fname, "%s/users/%s", ckp->logdir, user->username);
+			ASPRINTF(&fname, "%s/users/%s", ckpool.logdir, user->username);
 			s = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY | YYJSON_WRITE_NEWLINE_AT_END, NULL);
 			add_log_entry(&log_entries, &fname, &s);
 			yyjson_mut_doc_free(doc);
-			if (ckp->remote)
-				upstream_workers(ckp, user);
+			if (ckpool.remote)
+				upstream_workers(user);
 		}
 
 		if (remote_workers) {
@@ -8498,7 +8480,7 @@ static void *statsupdate(void *arg)
 		ghs10080 = stats->dsps10080 * nonces;
 		suffix_string(ghs10080, suffix10080, 16, 0);
 
-		ASPRINTF(&fname, "%s/pool/pool.status", ckp->logdir);
+		ASPRINTF(&fname, "%s/pool/pool.status", ckpool.logdir);
 		fp = fopen(fname, "we");
 		if (unlikely(!fp)) {
 			LOGERR("Failed to fopen %s", fname);
@@ -8553,7 +8535,7 @@ static void *statsupdate(void *arg)
 		fclose(fp);
 
 out_status:
-		if (ckp->proxy && sdata->proxy) {
+		if (ckpool.proxy && sdata->proxy) {
 			proxy_t *proxy, *proxytmp, *subproxy, *subtmp;
 
 			mutex_lock(&sdata->proxy_lock);
@@ -8654,17 +8636,17 @@ out_status:
 	return NULL;
 }
 
-static void read_poolstats(ckpool_t *ckp, int *tvsec_diff)
+static void read_poolstats(int *tvsec_diff)
 {
 	char *s = alloca(4096), *pstats, *dsps, *sps;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	pool_stats_t *stats = &sdata->stats;
 	tv_t now, last;
 	json_t *val;
 	FILE *fp;
 	int ret;
 
-	snprintf(s, 4095, "%s/pool/pool.status", ckp->logdir);
+	snprintf(s, 4095, "%s/pool/pool.status", ckpool.logdir);
 	fp = fopen(s, "re");
 	if (!fp) {
 		LOGINFO("Pool does not have a logfile to read");
@@ -8748,13 +8730,12 @@ static void read_poolstats(ckpool_t *ckp, int *tvsec_diff)
 
 static char *status_chars = "|/-\\";
 
-void *throbber(void *arg)
+void *throbber(void __maybe_unused *arg)
 {
-	ckpool_t *ckp = arg;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	int counter = 0;
 
-	if (ckp->quiet)
+	if (ckpool.quiet)
 		goto out;
 
 	rename_proc("throbber");
@@ -8765,7 +8746,7 @@ void *throbber(void *arg)
 		char stamp[128], hashrate[16], ch;
 
 		sleep(1);
-		if (ckp->quiet)
+		if (ckpool.quiet)
 			continue;
 		sdiff = sdata->stats.accounted_diff_shares;
 		stats = &sdata->stats;
@@ -8789,11 +8770,10 @@ out:
 	return NULL;
 }
 
-static void *zmqnotify(void *arg)
+static void *zmqnotify(void __maybe_unused *arg)
 {
 #ifdef HAVE_ZMQ_H
-	ckpool_t *ckp = arg;
-	sdata_t *sdata = ckp->sdata;
+	sdata_t *sdata = ckpool.sdata;
 	void *context, *notify;
 	int rc;
 
@@ -8806,10 +8786,10 @@ static void *zmqnotify(void *arg)
 	rc = zmq_setsockopt(notify, ZMQ_SUBSCRIBE, "hashblock", 0);
 	if (rc < 0)
 		quit(1, "zmq_setsockopt failed with errno %d", errno);
-	rc = zmq_connect(notify, ckp->zmqblock);
+	rc = zmq_connect(notify, ckpool.zmqblock);
 	if (rc < 0)
 		quit(1, "zmq_connect failed with errno %d", errno);
-	LOGNOTICE("ZMQ connected to %s", ckp->zmqblock);
+	LOGNOTICE("ZMQ connected to %s", ckpool.zmqblock);
 
 	while (42) {
 		zmq_msg_t message;
@@ -8863,49 +8843,47 @@ void *stratifier(void *arg)
 	pthread_t pth_blockupdate, pth_statsupdate, pth_throbber, pth_zmqnotify;
 	proc_instance_t *pi = (proc_instance_t *)arg;
 	int threads, tvsec_diff = 0;
-	ckpool_t *ckp = pi->ckp;
 	int64_t randomiser;
 	sdata_t *sdata;
 
 	rename_proc(pi->processname);
-	LOGWARNING("%s stratifier starting", ckp->name);
+	LOGWARNING("%s stratifier starting", ckpool.name);
 	sdata = ckzalloc(sizeof(sdata_t));
-	ckp->sdata = sdata;
-	sdata->ckp = ckp;
+	ckpool.sdata = sdata;
 	sdata->verbose = true;
 
 	/* Wait for the generator to have something for us */
-	while (!ckp->proxy && !ckp->generator_ready)
+	while (!ckpool.proxy && !ckpool.generator_ready)
 		cksleep_ms(10);
-	while (ckp->remote && !ckp->connector_ready)
+	while (ckpool.remote && !ckpool.connector_ready)
 		cksleep_ms(10);
 
-	if (!ckp->proxy) {
-		if (!generator_checkaddr(ckp, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
+	if (!ckpool.proxy) {
+		if (!generator_checkaddr(ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {
 			LOGEMERG("Fatal: btcaddress invalid according to bitcoind");
 			goto out;
 		}
 
 		/* Store this for use elsewhere */
 		hex2bin(scriptsig_header_bin, scriptsig_header, 41);
-		sdata->txnlen = address_to_txn(sdata->txnbin, ckp->btcaddress, ckp->script, ckp->segwit);
+		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit);
 
 		/* Find a valid donation address if possible */
-		if (generator_checkaddr(ckp, ckp->donaddress, &ckp->donscript, &ckp->donsegwit)) {
-			ckp->donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC donation address valid %s", ckp->donaddress);
-		} else if (generator_checkaddr(ckp, ckp->tndonaddress, &ckp->donscript, &ckp->donsegwit)) {
-			ckp->donaddress = ckp->tndonaddress;
-			ckp->donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC testnet donation address valid %s", ckp->donaddress);
-		} else if (generator_checkaddr(ckp, ckp->rtdonaddress, &ckp->donscript, &ckp->donsegwit)) {
-			ckp->donaddress = ckp->rtdonaddress;
-			ckp->donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC regtest donation address valid %s", ckp->donaddress);
-			ckp->regtest = true;
+		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			ckpool.donvalid = true;
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			LOGNOTICE("BTC donation address valid %s", ckpool.donaddress);
+		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			ckpool.donaddress = ckpool.tndonaddress;
+			ckpool.donvalid = true;
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			LOGNOTICE("BTC testnet donation address valid %s", ckpool.donaddress);
+		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			ckpool.donaddress = ckpool.rtdonaddress;
+			ckpool.donvalid = true;
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			LOGNOTICE("BTC regtest donation address valid %s", ckpool.donaddress);
+			ckpool.regtest = true;
 		} else
 			LOGNOTICE("No valid donation address found");
 	}
@@ -8916,7 +8894,7 @@ void *stratifier(void *arg)
 	/* Set the initial id to time as high bits so as to not send the same
 	 * id on restarts */
 	randomiser <<= 32;
-	if (!ckp->proxy)
+	if (!ckpool.proxy)
 		sdata->blockchange_id = sdata->workbase_id = randomiser;
 
 	cklock_init(&sdata->instance_lock);
@@ -8926,40 +8904,40 @@ void *stratifier(void *arg)
 	/* Create half as many share processing and receiving threads as there
 	 * are CPUs */
 	threads = sysconf(_SC_NPROCESSORS_ONLN) / 2 ? : 1;
-	sdata->updateq = create_ckmsgq(ckp, "updater", &block_update);
-	sdata->sshareq = create_ckmsgqs(ckp, "sprocessor", &sshare_process, threads);
-	sdata->ssends = create_ckmsgqs(ckp, "ssender", &ssend_process, threads);
-	sdata->sauthq = create_ckmsgq(ckp, "authoriser", &sauth_process);
-	sdata->stxnq = create_ckmsgq(ckp, "stxnq", &send_transactions);
-	sdata->srecvs = create_ckmsgqs(ckp, "sreceiver", &srecv_process, threads);
-	create_pthread(&pth_throbber, throbber, ckp);
-	read_poolstats(ckp, &tvsec_diff);
-	read_userstats(ckp, sdata, tvsec_diff);
+	sdata->updateq = create_ckmsgq("updater", &block_update);
+	sdata->sshareq = create_ckmsgqs("sprocessor", &sshare_process, threads);
+	sdata->ssends = create_ckmsgqs("ssender", &ssend_process, threads);
+	sdata->sauthq = create_ckmsgq("authoriser", &sauth_process);
+	sdata->stxnq = create_ckmsgq("stxnq", &send_transactions);
+	sdata->srecvs = create_ckmsgqs("sreceiver", &srecv_process, threads);
+	create_pthread(&pth_throbber, throbber, NULL);
+	read_poolstats(&tvsec_diff);
+	read_userstats(sdata, tvsec_diff);
 
 	/* Set diff impossibly large until we know the network diff */
 	sdata->stats.network_diff = ~0ULL;
 
 	cklock_init(&sdata->txn_lock);
 	cklock_init(&sdata->workbase_lock);
-	if (!ckp->proxy)
-		create_pthread(&pth_blockupdate, blockupdate, ckp);
+	if (!ckpool.proxy)
+		create_pthread(&pth_blockupdate, blockupdate, NULL);
 	else {
 		mutex_init(&sdata->proxy_lock);
 	}
 
 	mutex_init(&sdata->stats_lock);
 	mutex_init(&sdata->uastats_lock);
-	if (!ckp->passthrough || ckp->node)
-		create_pthread(&pth_statsupdate, statsupdate, ckp);
+	if (!ckpool.passthrough || ckpool.node)
+		create_pthread(&pth_statsupdate, statsupdate, NULL);
 
 	mutex_init(&sdata->share_lock);
-	if (!ckp->proxy)
-		create_pthread(&pth_zmqnotify, zmqnotify, ckp);
+	if (!ckpool.proxy)
+		create_pthread(&pth_zmqnotify, zmqnotify, NULL);
 
-	ckp->stratifier_ready = true;
-	LOGWARNING("%s stratifier ready", ckp->name);
+	ckpool.stratifier_ready = true;
+	LOGWARNING("%s stratifier ready", ckpool.name);
 
-	stratum_loop(ckp, pi);
+	stratum_loop(pi);
 out:
 	/* We should never get here unless there's a fatal error */
 	LOGEMERG("Stratifier failure, shutting down");
