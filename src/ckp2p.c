@@ -76,6 +76,7 @@ typedef struct blocklist {
 	uchar hash[32];
 	struct blocklist *next, *prev;
 	int source;
+	int requesters;
 } blocklist_t;
 
 static blocklist_t *blockhashes;
@@ -88,6 +89,19 @@ typedef struct wakelist {
 static wakelist_t *reader_wakes, *connector_wakes;
 
 static peerlist_t *p2ppeers;
+
+typedef struct txn_relay {
+	int source_peer;
+	int requester_peer;
+	blocklist_t *block;
+	tv_t sent;
+	UT_hash_handle hh;
+} txn_relay_t;
+
+static txn_relay_t *txn_relays;
+static cklock_t txn_relay_lock;
+
+#define TXN_RELAY_TIMEOUT 5
 
 /* Check if magic is unset (all zeros) */
 static bool magic_unset(const uchar m[4])
@@ -497,8 +511,6 @@ static void deactivate_conn(p2p_conn_t *conn)
 	ck_wunlock(&peerlock);
 }
 
-/* Disconnect after sending any block response to prevent being
- * asked for more info we don't have */
 static void disconnect_conn(p2p_conn_t *conn)
 {
 	LOGDEBUG("Disconnecting peer %d", conn->peer);
@@ -629,6 +641,13 @@ static int connectors_woken(void)
 	return ret;
 }
 
+static void add_conn_epoll(p2p_conn_t *conn);
+static void dec_block_requesters(blocklist_t *block);
+static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
+				const uchar *payload, uint32_t plen);
+static bool handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t plen);
+static void expire_txn_relays(tv_t *now);
+
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 0;
@@ -674,13 +693,65 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 
 static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
+	blocklist_t *block = NULL;
+	int source = -1;
+	p2p_conn_t *source_conn;
+
 	if (plen < 32) {
 		dealloc(payload);
 		return;
 	}
 
-	LOGINFO("Peer %d requested getblocktxn - cannot serve", conn->peer);
+	ck_rlock(&curblock.lock);
+	if (blockhashes) {
+		blocklist_t *b = blockhashes->prev;
 
+		while (42) {
+			if (b->requesters > 0) {
+				block = b;
+				break;
+			}
+			if (b == blockhashes)
+				break;
+			b = b->prev;
+		}
+		if (!block)
+			block = blockhashes->prev;
+	}
+	if (block)
+		source = block->source;
+	ck_runlock(&curblock.lock);
+
+	if (source < 0) {
+		LOGINFO("Peer %d requested getblocktxn but no block available",
+			conn->peer);
+		goto disconnect;
+	}
+
+	source_conn = get_peer(source);
+	if (unlikely(!source_conn) || source_conn->evicted || source_conn->sock < 0 ||
+		     !source_conn->handshake_done) {
+		LOGINFO("Peer %d requested getblocktxn but source peer %d unavailable",
+			conn->peer, source);
+		goto disconnect;
+	}
+
+	if (source_conn->peer == conn->peer) {
+		LOGINFO("Peer %d requested getblocktxn from itself - cannot serve",
+			conn->peer);
+		goto disconnect;
+	}
+
+	LOGINFO("Peer %d requested getblocktxn for block from source peer %d - relaying",
+		conn->peer, source);
+	if (forward_getblocktxn(conn->peer, block, payload, plen)) {
+		dealloc(payload);
+		return;
+	}
+
+	LOGWARNING("Failed to forward getblocktxn from peer %d via source peer %d",
+		   conn->peer, source);
+disconnect:
 	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
 	disconnect_conn(conn);
 	add_connector(conn);
@@ -777,6 +848,140 @@ static int blockcmp(blocklist_t *a, uchar *b)
 	return memcmp(a->hash, b, 32);
 }
 
+static void dec_block_requesters(blocklist_t *block)
+{
+	if (!block)
+		return;
+	ck_wlock(&curblock.lock);
+	if (block->requesters > 0)
+		block->requesters--;
+	ck_wunlock(&curblock.lock);
+}
+
+static void cancel_txn_relay(int source_peer)
+{
+	txn_relay_t *relay;
+
+	ck_wlock(&txn_relay_lock);
+	HASH_FIND_INT(txn_relays, &source_peer, relay);
+	if (relay)
+		HASH_DEL(txn_relays, relay);
+	ck_wunlock(&txn_relay_lock);
+	if (relay) {
+		dec_block_requesters(relay->block);
+		free(relay);
+	}
+}
+
+/* Register a pending relay and forward getblocktxn to the source peer. */
+static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
+				 const uchar *payload, uint32_t plen)
+{
+	txn_relay_t *relay, *existing;
+	p2p_conn_t *source_conn;
+	int source_peer;
+
+	if (!block)
+		return false;
+
+	source_peer = block->source;
+
+	ck_wlock(&txn_relay_lock);
+	HASH_FIND_INT(txn_relays, &source_peer, existing);
+	if (existing) {
+		ck_wunlock(&txn_relay_lock);
+		return false;
+	}
+	relay = ckalloc(sizeof(txn_relay_t));
+	relay->source_peer = source_peer;
+	relay->requester_peer = requester_peer;
+	relay->block = block;
+	tv_time(&relay->sent);
+	HASH_ADD_INT(txn_relays, source_peer, relay);
+	ck_wunlock(&txn_relay_lock);
+
+	ck_wlock(&curblock.lock);
+	block->requesters++;
+	ck_wunlock(&curblock.lock);
+
+	source_conn = get_peer(source_peer);
+	if (unlikely(!source_conn) || source_conn->sock < 0) {
+		cancel_txn_relay(source_peer);
+		return false;
+	}
+
+	p2p_send(source_conn, "getblocktxn", payload, plen);
+	return true;
+}
+
+/* Relay a blocktxn received from a source peer to the waiting requester. */
+static bool handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t plen)
+{
+	txn_relay_t *relay;
+	int requester_peer;
+	p2p_conn_t *requester;
+
+	ck_wlock(&txn_relay_lock);
+	HASH_FIND_INT(txn_relays, &source->peer, relay);
+	if (!relay) {
+		ck_wunlock(&txn_relay_lock);
+		return false;
+	}
+	requester_peer = relay->requester_peer;
+	HASH_DEL(txn_relays, relay);
+	ck_wunlock(&txn_relay_lock);
+	dec_block_requesters(relay->block);
+	free(relay);
+
+	requester = get_peer(requester_peer);
+	if (!requester || requester->sock < 0) {
+		dealloc(payload);
+		return true;
+	}
+
+	LOGNOTICE("Relaying blocktxn (%u bytes) from peer %d to peer %d",
+		  plen, source->peer, requester_peer);
+	p2p_send(requester, "blocktxn", payload, plen);
+	dealloc(payload);
+	return true;
+}
+
+static void expire_txn_relays(tv_t *now)
+{
+	txn_relay_t *relay, *tmp;
+	int expired_sources[32];
+	int expired_requesters[32];
+	blocklist_t *expired_blocks[32];
+	int n = 0, i;
+
+	ck_wlock(&txn_relay_lock);
+	HASH_ITER(hh, txn_relays, relay, tmp) {
+		if (tvdiff(now, &relay->sent) < TXN_RELAY_TIMEOUT)
+			continue;
+		if (n < 32) {
+			expired_sources[n] = relay->source_peer;
+			expired_requesters[n] = relay->requester_peer;
+			expired_blocks[n] = relay->block;
+			n++;
+		}
+		HASH_DEL(txn_relays, relay);
+		free(relay);
+	}
+	ck_wunlock(&txn_relay_lock);
+
+	for (i = 0; i < n; i++) {
+		p2p_conn_t *requester = get_peer(expired_requesters[i]);
+
+		dec_block_requesters(expired_blocks[i]);
+		LOGWARNING("Txn relay via source peer %d timed out for requester %d",
+			   expired_sources[i], expired_requesters[i]);
+		if (requester && requester->sock >= 0) {
+			disconnect_conn(requester);
+			add_connector(requester);
+		}
+	}
+}
+
 /* Function for testing cmpctblock validity by echoing back any received */
 static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 {
@@ -837,13 +1042,17 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 
 			memcpy(block->hash, blockhash, 32);
 			block->source = source;
+			block->requesters = 0;
 			DL_APPEND(blockhashes, block);
 			DL_COUNT(blockhashes, block, count);
 			LOGDEBUG("Block count %d", count);
 			if (count > 100) {
-				block = blockhashes;
-				DL_DELETE(blockhashes, block);
-				free(block);
+				blocklist_t *old = blockhashes;
+
+				if (!old->requesters) {
+					DL_DELETE(blockhashes, old);
+					free(old);
+				}
 			}
 			memcpy(curblock.hash, blockhash, 32);
 			new_block = true;
@@ -1395,6 +1604,8 @@ static void p2p_reader(p2p_conn_t *conn)
 	} else if (!strcmp(cmd, "block")) {
 		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
 	} else if (!strcmp(cmd, "blocktxn")) {
+		if (handle_blocktxn_relay(conn, payload, plen))
+			goto rearm;
 		LOGDEBUG("Received BLOCKTXN (%u bytes) - ignoring (block transactions response)", plen);
 	} else if (!strcmp(cmd, "getheaders")) {
 		LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
@@ -1501,6 +1712,8 @@ static void *p2p_keepalive(void __maybe_unused *arg)
 		cksleep_ms_r(&last_update, KEEPALIVE_INTERVAL * 1000);
 		cksleep_prepare_r(&last_update);
 		ts_to_tv(&now, &last_update);
+
+		expire_txn_relays(&now);
 
 		if (tvdiff(&now, &last_ping) > PING_INTERVAL) {
 			copy_tv(&last_ping, &now);
@@ -1633,13 +1846,6 @@ static void *submission_thread(void *arg)
 		ck_wunlock(&conn->block_lock);
 
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
-		/* Disconnect all priority peers to avoid inducing latency at
-		 * their end in case they ask for more information from ckp2p.*/
-		if (i < ckpool.prioclients) {
-			disconnect_conn(conn);
-			add_connector(conn);
-		}
-
 		submitted++;
 	}
 
@@ -1855,6 +2061,7 @@ int prepare_ckp2p(void)
 
 	cklock_init(&curblock.lock);
 	cklock_init(&peerlock);
+	cklock_init(&txn_relay_lock);
 
 	if (ckpool.externalip) {
 		connsock_t cslocal = {};
