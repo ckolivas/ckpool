@@ -121,7 +121,7 @@ static txn_relay_t *txn_relays;
 static cklock_t txn_relay_lock;
 static bool startup_bits_pending;
 
-#define TXN_RELAY_TIMEOUT_MS 500
+#define TXN_RELAY_TIMEOUT_MS 300
 #define TXN_RELAY_POLL_MS 100
 #define BLOCKS_FILE "blocks.txt"
 
