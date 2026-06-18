@@ -1352,13 +1352,10 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 	sha256(h1, 32, blockhash);
 
 	if (!hash_meets_target(blockhash, current_bits)) {
-		LOGWARNING("Compact block from peer %d does not meet current difficulty target (0x%08x) - dropping",
+		LOGWARNING("Dropping shitcoin peer %d not meeting difficulty target (0x%08x)",
 			   source, current_bits);
 		dealloc(payload);
-		if (likely(source))
-			evict_peerno(source);
-		else
-			LOGERR("Peer 0 compact block doesn't meet target!");
+		evict_peerno(source);
 		return;
 	}
 
