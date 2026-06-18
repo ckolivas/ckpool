@@ -82,6 +82,7 @@ typedef struct blocklist {
 static blocklist_t *blockhashes;
 
 #define FAST_SOURCES_MAX 512
+#define SLOW_SOURCES_MAX (FAST_SOURCES_MAX / 2)
 
 typedef struct {
 	uchar hash[32];
@@ -721,6 +722,7 @@ static int connectors_woken(void)
 static void add_conn_epoll(p2p_conn_t *conn);
 static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32_t plen);
 static bool block_has_pending_relay(blocklist_t *block);
+static bool peer_sent_block(int peer, const blocklist_t *block);
 static void try_extend_txn_relay(int peer, const uchar *hash);
 static void expire_txn_relays(tv_t *now);
 
@@ -770,7 +772,6 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
 	blocklist_t *block = NULL;
-	int source_count = 0;
 
 	if (plen < 32) {
 		dealloc(payload);
@@ -789,17 +790,14 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	ck_rlock(&curblock.lock);
 	if (blockhashes)
 		block = blockhashes->prev;
-	if (block && !memcmp(fastsources.hash, block->hash, 32))
-		source_count = fastsources.count;
 	ck_runlock(&curblock.lock);
 
-	if (!block || source_count < 1) {
-		LOGINFO("Peer %d requested getblocktxn but no block sources available",
-			conn->peer);
+	if (!block) {
+		LOGINFO("Peer %d requested getblocktxn but no block available", conn->peer);
 		goto disconnect;
 	}
 
-	LOGWARNING("Peer 0 requested getblocktxn - relaying to %d fast sources", source_count);
+	LOGWARNING("Peer 0 requested getblocktxn - forwarding txn request");
 	if (forward_getblocktxn(block, payload, plen))
 		goto out;
 
@@ -1146,7 +1144,99 @@ static void delete_txn_relay_group_locked(txn_relay_group_t *group)
 	free(group);
 }
 
-/* Register pending relays and forward getblocktxn to all fast sources. */
+static bool peer_sent_block(int peer, const blocklist_t *block)
+{
+	int i;
+
+	if (!block || peer < 0)
+		return false;
+	if (block->source == peer)
+		return true;
+	ck_rlock(&curblock.lock);
+	if (!memcmp(fastsources.hash, block->hash, 32)) {
+		for (i = 0; i < fastsources.count; i++) {
+			if (fastsources.peers[i] == peer) {
+				ck_runlock(&curblock.lock);
+				return true;
+			}
+		}
+	}
+	ck_runlock(&curblock.lock);
+	return false;
+}
+
+/* Try to add a connection as a txn relay source. Returns true if added. */
+static bool try_add_txn_relay_conn(p2p_conn_t *sc, int *sent, int conn_peers[],
+				   p2p_conn_t *conns[])
+{
+	int i, peer;
+	txn_relay_t *busy;
+
+	if (!sc || !sc->peer || *sent >= FAST_SOURCES_MAX)
+		return false;
+	peer = sc->peer;
+
+	for (i = 0; i < *sent; i++) {
+		if (conn_peers[i] == peer)
+			return false;
+	}
+
+	ck_rlock(&txn_relay_lock);
+	HASH_FIND_INT(txn_relays, &peer, busy);
+	ck_runlock(&txn_relay_lock);
+
+	if (busy)
+		return false;
+
+	if (unlikely(sc->evicted) || sc->sock < 0 || !sc->handshake_done)
+		return false;
+
+	conns[*sent] = sc;
+	conn_peers[(*sent)++] = peer;
+	return true;
+}
+
+static bool try_add_txn_relay_peer(int peer, int *sent, int conn_peers[],
+				   p2p_conn_t *conns[])
+{
+	return try_add_txn_relay_conn(get_peer(peer), sent, conn_peers, conns);
+}
+
+/* Add slow p2p peers that did not send this compact block. */
+static int add_slow_txn_sources(const blocklist_t *block, int sent,
+				int conn_peers[], p2p_conn_t *conns[])
+{
+	peerlist_t *p2ppeer;
+	int slow_added = 0, slow_max;
+
+	slow_max = SLOW_SOURCES_MAX - sent;
+	if (slow_max < 1)
+		return sent;
+
+	ck_rlock(&peerlock);
+	for (p2ppeer = p2ppeers; p2ppeer && slow_added < slow_max && sent < FAST_SOURCES_MAX;
+	     p2ppeer = p2ppeer->hh.next) {
+		p2p_conn_t *conn = p2ppeer->conn;
+		int peer;
+
+		if (!conn)
+			continue;
+		peer = conn->peer;
+		if (peer < ckpool.prioclients)
+			continue;
+		if (peer_sent_block(peer, block))
+			continue;
+		if (try_add_txn_relay_conn(conn, &sent, conn_peers, conns))
+			slow_added++;
+	}
+	ck_runlock(&peerlock);
+
+	if (slow_added)
+		LOGWARNING("Added %d slow sources for txn relay (%d total)", slow_added, sent);
+	return sent;
+}
+
+/* Register pending relays and forward getblocktxn to fast and slow sources. */
 static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32_t plen)
 {
 	txn_relay_group_t *group;
@@ -1181,30 +1271,14 @@ static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32
 	}
 	ck_runlock(&curblock.lock);
 
-	if (!source_count)
-		return false;
-
-	for (i = 0; i < source_count; i++) {
-		int sp = sources[i];
-		p2p_conn_t *sc;
-		txn_relay_t *busy;
-
-		if (!sp)
+	for (i = 0; i < source_count && sent < FAST_SOURCES_MAX; i++) {
+		if (!sources[i])
 			continue;
-
-		ck_rlock(&txn_relay_lock);
-		HASH_FIND_INT(txn_relays, &sp, busy);
-		ck_runlock(&txn_relay_lock);
-		if (busy)
-			continue;
-
-		sc = get_peer(sp);
-		if (unlikely(!sc) || sc->evicted || sc->sock < 0 || !sc->handshake_done)
-			continue;
-
-		conns[sent] = sc;
-		conn_peers[sent++] = sp;
+		try_add_txn_relay_peer(sources[i], &sent, conn_peers, conns);
 	}
+
+	if (sent < FAST_SOURCES_MAX)
+		sent = add_slow_txn_sources(block, sent, conn_peers, conns);
 
 	if (!sent)
 		return false;
