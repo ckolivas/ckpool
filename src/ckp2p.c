@@ -102,6 +102,8 @@ static peerlist_t *p2ppeers;
 
 typedef struct txn_relay_group {
 	blocklist_t *block;
+	uchar *payload;
+	uint32_t plen;
 	tv_t sent;
 	int pending;
 	bool done;
@@ -719,6 +721,7 @@ static int connectors_woken(void)
 static void add_conn_epoll(p2p_conn_t *conn);
 static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32_t plen);
 static bool block_has_pending_relay(blocklist_t *block);
+static void try_extend_txn_relay(int peer, const uchar *hash);
 static void expire_txn_relays(tv_t *now);
 
 static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
@@ -1039,6 +1042,7 @@ static bool block_has_pending_relay(blocklist_t *block)
 static void add_fast_source(const uchar *hash, int peer)
 {
 	int i;
+	bool added = false;
 
 	ck_wlock(&curblock.lock);
 	if (memcmp(fastsources.hash, hash, 32)) {
@@ -1053,10 +1057,75 @@ static void add_fast_source(const uchar *hash, int peer)
 	}
 	if (fastsources.count < FAST_SOURCES_MAX) {
 		fastsources.peers[fastsources.count++] = peer;
+		added = true;
 		LOGDEBUG("Fast source %d added (%d/%d) for current block",
 			 peer, fastsources.count, FAST_SOURCES_MAX);
 	}
 	ck_wunlock(&curblock.lock);
+
+	if (added)
+		try_extend_txn_relay(peer, hash);
+}
+
+/* Forward a pending getblocktxn to a newly discovered fast source. */
+static void try_extend_txn_relay(int peer, const uchar *hash)
+{
+	txn_relay_group_t *group;
+	txn_relay_t *relay, *existing;
+	p2p_conn_t *sc;
+	uchar *payload;
+	uint32_t plen;
+	int pending;
+
+	if (!peer)
+		return;
+
+	ck_wlock(&txn_relay_lock);
+	group = txn_relay_pending;
+	if (!group || group->done || !group->payload || !group->block)
+		goto out;
+	if (memcmp(group->block->hash, hash, 32))
+		goto out;
+	if (group->pending >= FAST_SOURCES_MAX)
+		goto out;
+	HASH_FIND_INT(txn_relays, &peer, existing);
+	if (existing)
+		goto out;
+
+	payload = group->payload;
+	plen = group->plen;
+	ck_wunlock(&txn_relay_lock);
+
+	sc = get_peer(peer);
+	if (unlikely(!sc) || sc->evicted || sc->sock < 0 || !sc->handshake_done)
+		return;
+
+	ck_wlock(&txn_relay_lock);
+	group = txn_relay_pending;
+	if (!group || group->done || !group->payload || !group->block)
+		goto out;
+	if (memcmp(group->block->hash, hash, 32))
+		goto out;
+	if (group->pending >= FAST_SOURCES_MAX)
+		goto out;
+	HASH_FIND_INT(txn_relays, &peer, existing);
+	if (existing)
+		goto out;
+
+	relay = ckalloc(sizeof(txn_relay_t));
+	relay->source_peer = peer;
+	relay->group = group;
+	HASH_ADD_INT(txn_relays, source_peer, relay);
+	group->pending++;
+	pending = group->pending;
+	ck_wunlock(&txn_relay_lock);
+
+	p2p_send(sc, "getblocktxn", payload, plen);
+	LOGWARNING("Extended txn relay to fast source %d (%d/%d)", peer, pending,
+		   FAST_SOURCES_MAX);
+	return;
+out:
+	ck_wunlock(&txn_relay_lock);
 }
 
 /* Must hold txn_relay_lock */
@@ -1072,6 +1141,8 @@ static void delete_txn_relay_group_locked(txn_relay_group_t *group)
 	}
 	if (txn_relay_pending == group)
 		txn_relay_pending = NULL;
+	if (group->payload)
+		dealloc(group->payload);
 	free(group);
 }
 
@@ -1140,6 +1211,9 @@ static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32
 
 	group = ckalloc(sizeof(txn_relay_group_t));
 	group->block = block;
+	group->payload = ckalloc(plen);
+	memcpy(group->payload, payload, plen);
+	group->plen = plen;
 	tv_monotonic(&group->sent);
 	group->pending = sent;
 	group->done = false;
