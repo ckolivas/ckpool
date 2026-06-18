@@ -81,7 +81,7 @@ typedef struct blocklist {
 
 static blocklist_t *blockhashes;
 
-#define FAST_SOURCES_MAX 16
+#define FAST_SOURCES_MAX 512
 
 typedef struct {
 	uchar hash[32];
