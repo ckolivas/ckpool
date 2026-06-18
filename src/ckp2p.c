@@ -38,6 +38,7 @@
 #define EVICT_TIMEOUT 3600
 #define P2P_LISTEN_PORT 8333
 #define CKP2P_LISTEN_PORT 8335
+#define NODE_NETWORK 1ULL
 
 static const struct {
 	const char *name;
@@ -237,6 +238,62 @@ static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
 
 	/* IPv6 not supported by ckp2p yet */
 	return false;
+}
+
+/* Return true if a VERSION payload indicates a blocksonly peer. */
+static bool version_is_blocksonly(const uchar *payload, uint32_t plen)
+{
+	uint32_t version;
+	uint64_t services;
+	bool blocksonly;
+
+	if (plen < 12)
+		return false;
+
+	memcpy(&version, payload, 4);
+	version = le32toh(version);
+
+	memcpy(&services, payload + 4, 8);
+	services = le64toh(services);
+
+	blocksonly = !(services & NODE_NETWORK);
+
+	/* fRelay was added in protocol 70001 */
+	if (!blocksonly && version >= 70001 && plen >= 81) {
+		uint32_t off = 80;
+
+		if (off < plen) {
+			uint8_t ualen = payload[off++];
+
+			off += ualen;
+			if (off + 5 <= plen) {
+				off += 4; /* start_height */
+				if (!payload[off])
+					blocksonly = true;
+			}
+		}
+	}
+
+	return blocksonly;
+}
+
+/* Reject blocksonly peers unless they are configured priority peers. */
+static bool reject_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint32_t plen)
+{
+	if (!version_is_blocksonly(payload, plen))
+		return false;
+
+	/* peer is -1 for incoming/dynamic peers until added; priority peers are always >= 0 */
+	if (conn->peer >= 0 && conn->peer < ckpool.prioclients) {
+		LOGNOTICE("Keeping blocksonly priority peer %d", conn->peer);
+		return false;
+	}
+
+	if (conn->peer >= 0)
+		LOGNOTICE("Rejecting blocksonly peer %d", conn->peer);
+	else
+		LOGNOTICE("Rejecting blocksonly peer %s:%d", conn->host, conn->port);
+	return true;
 }
 
 static void reset_reconnect(p2p_conn_t *conn)
@@ -1237,6 +1294,12 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 		LOGINFO("Received %s (%u bytes)", cmd, plen);
 		if (!strcmp(cmd, "version")) {
 			LOGINFO("Received VERSION from peer");
+			if (reject_blocksonly_peer(conn, payload, plen)) {
+				dealloc(payload);
+				close(conn->sock);
+				conn->sock = -1;
+				return false;
+			}
 			dealloc(payload);
 			break;
 		}
@@ -1332,6 +1395,13 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 			if (dup_peer(conn->host, conn->port)) {
 				LOGNOTICE("Duplicate incoming peer %s:%s, will not reconnect if dropped", conn->host, conn->charport);
 				conn->incoming_only = true;
+			}
+
+			if (reject_blocksonly_peer(conn, payload, plen)) {
+				dealloc(payload);
+				close(conn->sock);
+				conn->sock = -1;
+				return false;
 			}
 
 			if (payload)
