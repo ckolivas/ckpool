@@ -121,7 +121,7 @@ static txn_relay_t *txn_relays;
 static cklock_t txn_relay_lock;
 static bool startup_bits_pending;
 
-#define TXN_RELAY_TIMEOUT_MS 300
+#define TXN_RELAY_TIMEOUT_MS 10000
 #define TXN_RELAY_POLL_MS 50
 #define BLOCKS_FILE "blocks.txt"
 
@@ -792,23 +792,15 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		block = blockhashes->prev;
 	ck_runlock(&curblock.lock);
 
-	if (!block) {
-		LOGINFO("Peer %d requested getblocktxn but no block available", conn->peer);
-		goto disconnect;
-	}
+	if (block) {
+		LOGWARNING("Peer 0 requested getblocktxn - forwarding txn request");
+		if (!forward_getblocktxn(block, payload, plen))
+			LOGWARNING("Failed to forward getblocktxn to network peers");
+	} else
+		LOGINFO("Peer 0 requested getblocktxn but no block available");
 
-	LOGWARNING("Peer 0 requested getblocktxn - forwarding txn request");
-	if (forward_getblocktxn(block, payload, plen))
-		goto out;
-
-	LOGWARNING("Failed to forward getblocktxn from peer %d to fast sources",
-		   conn->peer);
-disconnect:
-	/* Disconnect immediately so bitcoind doesn't wait the full timeout */
 	disconnect_conn(conn);
 	add_connector(conn);
-
-out:
 	dealloc(payload);
 }
 
@@ -1236,6 +1228,118 @@ static int add_slow_txn_sources(const blocklist_t *block, int sent,
 	return sent;
 }
 
+static bool skip_bytes(uint32_t dlen, uint32_t *pos, uint32_t len)
+{
+	if (*pos + len > dlen)
+		return false;
+	*pos += len;
+	return true;
+}
+
+static bool skip_script(const uchar *data, uint32_t dlen, uint32_t *pos)
+{
+	int64_t slen = parse_varint(data, dlen, pos);
+
+	if (slen < 0 || (uint64_t)slen > dlen - *pos)
+		return false;
+	*pos += slen;
+	return true;
+}
+
+/* Return serialized byte length of one transaction, or -1 on error. */
+static int parse_tx_size(const uchar *data, uint32_t dlen, uint32_t start)
+{
+	uint32_t pos = start;
+	int64_t vin, vout, i, stack, j;
+	bool witness = false;
+
+	if (start >= dlen || !skip_bytes(dlen, &pos, 4))
+		return -1;
+
+	if (pos + 2 <= dlen && !data[pos] && data[pos + 1] == 1) {
+		witness = true;
+		pos += 2;
+	}
+
+	vin = parse_varint(data, dlen, &pos);
+	if (vin < 0)
+		return -1;
+	for (i = 0; i < vin; i++) {
+		if (!skip_bytes(dlen, &pos, 36) || !skip_script(data, dlen, &pos) ||
+		    !skip_bytes(dlen, &pos, 4))
+			return -1;
+	}
+
+	vout = parse_varint(data, dlen, &pos);
+	if (vout < 0)
+		return -1;
+	for (i = 0; i < vout; i++) {
+		if (!skip_bytes(dlen, &pos, 8) || !skip_script(data, dlen, &pos))
+			return -1;
+	}
+
+	if (witness) {
+		for (i = 0; i < vin; i++) {
+			stack = parse_varint(data, dlen, &pos);
+			if (stack < 0)
+				return -1;
+			for (j = 0; j < stack; j++) {
+				if (!skip_script(data, dlen, &pos))
+					return -1;
+			}
+		}
+	}
+
+	if (!skip_bytes(dlen, &pos, 4))
+		return -1;
+
+	return pos - start;
+}
+
+static void submit_blocktxn_to_peer0(const uchar *payload, uint32_t plen)
+{
+	uint32_t pos = 32;
+	int64_t count, i;
+	int submitted = 0;
+	p2p_conn_t *peer0;
+
+	if (plen < 33) {
+		LOGWARNING("Blocktxn too short to parse");
+		return;
+	}
+
+	peer0 = get_peer(0);
+	if (!peer0 || peer0->sock < 0) {
+		LOGWARNING("Cannot submit blocktxn transactions - peer 0 not connected");
+		return;
+	}
+
+	count = parse_varint(payload, plen, &pos);
+	if (count < 0 || count > 100000) {
+		LOGWARNING("Invalid blocktxn transaction count %lld", (long long)count);
+		return;
+	}
+
+	for (i = 0; i < count; i++) {
+		int txlen = parse_tx_size(payload, plen, pos);
+
+		if (txlen < 0) {
+			LOGWARNING("Failed to parse blocktxn transaction %lld/%lld",
+				   (long long)i, (long long)count);
+			return;
+		}
+		if (pos + (uint32_t)txlen > plen) {
+			LOGWARNING("Blocktxn transaction %lld overflows payload", (long long)i);
+			return;
+		}
+		p2p_send(peer0, "tx", payload + pos, (uint32_t)txlen);
+		pos += txlen;
+		submitted++;
+	}
+
+	LOGWARNING("Submitted %d blocktxn transactions to peer 0", submitted);
+}
+
 /* Register pending relays and forward getblocktxn to fast and slow sources. */
 static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32_t plen)
 {
@@ -1309,12 +1413,11 @@ static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32
 	return true;
 }
 
-/* Relay the first blocktxn received to the waiting requester. */
+/* Parse the first blocktxn response and submit its transactions to peer 0. */
 static void handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t plen)
 {
 	txn_relay_t *relay;
 	txn_relay_group_t *group;
-	p2p_conn_t *requester;
 	bool forward = false;
 
 	ck_wlock(&txn_relay_lock);
@@ -1334,15 +1437,9 @@ static void handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t p
 	if (!forward)
 		goto out;
 
-	requester = get_peer(0);
-	if (!requester || requester->sock < 0) {
-		LOGNOTICE("Got BLOCKTXN but peer 0 is not connected");
-		goto out;
-	}
-
-	LOGWARNING("Relaying blocktxn (%u bytes) from peer %d to peer 0",
+	LOGWARNING("Received blocktxn (%u bytes) from peer %d - submitting transactions to peer 0",
 		   plen, source->peer);
-	p2p_send(requester, "blocktxn", payload, plen);
+	submit_blocktxn_to_peer0(payload, plen);
 out:
 	dealloc(payload);
 }
