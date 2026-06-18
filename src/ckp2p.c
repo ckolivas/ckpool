@@ -1153,7 +1153,7 @@ static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
 	group = ckalloc(sizeof(txn_relay_group_t));
 	group->requester_peer = requester_peer;
 	group->block = block;
-	tv_time(&group->sent);
+	tv_monotonic(&group->sent);
 	group->pending = sent;
 	group->done = false;
 
@@ -1231,7 +1231,9 @@ static void expire_txn_relays(tv_t *now)
 
 	ck_wlock(&txn_relay_lock);
 	HASH_ITER(hh, txn_relay_groups, group, tmp) {
-		if (ms_tvdiff(now, &group->sent) < TXN_RELAY_TIMEOUT_MS)
+		int elapsed = ms_tvdiff(now, &group->sent);
+
+		if (elapsed >= 0 && elapsed < TXN_RELAY_TIMEOUT_MS)
 			continue;
 		if (!group->done && n < 32) {
 			expired_requesters[n] = group->requester_peer;
