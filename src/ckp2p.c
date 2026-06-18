@@ -751,7 +751,6 @@ static void handle_getdata(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 
 static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 {
-	int loglevel = ckpool.loglevel;
 	blocklist_t *block = NULL;
 	p2p_conn_t *source_conn;
 	int source = -1;
@@ -781,8 +780,6 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		source = block->source;
 	ck_runlock(&curblock.lock);
 
-	if (loglevel < LOG_INFO && (source < ckpool.prioclients || conn->peer < ckpool.prioclients))
-		ckpool.loglevel = LOG_INFO;
 	if (source < 0) {
 		LOGINFO("Peer %d requested getblocktxn but no block available",
 			conn->peer);
@@ -816,7 +813,6 @@ disconnect:
 	add_connector(conn);
 
 out:
-	ckpool.loglevel = loglevel;
 	dealloc(payload);
 }
 
@@ -1103,13 +1099,9 @@ static bool forward_getblocktxn(int requester_peer, blocklist_t *block,
 /* Relay a blocktxn received from a source peer to the waiting requester. */
 static void handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t plen)
 {
-	int loglevel = ckpool.loglevel;
 	p2p_conn_t *requester;
 	txn_relay_t *relay;
 	int requester_peer;
-
-	if (loglevel < LOG_INFO && source->peer < ckpool.prioclients)
-		ckpool.loglevel = LOG_INFO;
 
 	ck_wlock(&txn_relay_lock);
 	HASH_FIND_INT(txn_relays, &source->peer, relay);
@@ -1119,8 +1111,6 @@ static void handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t p
 		goto out;
 	}
 	requester_peer = relay->requester_peer;
-	if (loglevel < LOG_INFO && requester_peer < ckpool.prioclients)
-		ckpool.loglevel = LOG_INFO;
 
 	HASH_DEL(txn_relays, relay);
 	ck_wunlock(&txn_relay_lock);
@@ -1137,7 +1127,6 @@ static void handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t p
 		  plen, source->peer, requester_peer);
 	p2p_send(requester, "blocktxn", payload, plen);
 out:
-	ckpool.loglevel = loglevel;
 	dealloc(payload);
 }
 
