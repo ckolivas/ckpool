@@ -103,7 +103,8 @@ static txn_relay_t *txn_relays;
 static cklock_t txn_relay_lock;
 static bool startup_bits_pending;
 
-#define TXN_RELAY_TIMEOUT 5
+#define TXN_RELAY_TIMEOUT_MS 500
+#define TXN_RELAY_POLL_MS 100
 #define BLOCKS_FILE "blocks.txt"
 
 /* Check if magic is unset (all zeros) */
@@ -1140,7 +1141,7 @@ static void expire_txn_relays(tv_t *now)
 
 	ck_wlock(&txn_relay_lock);
 	HASH_ITER(hh, txn_relays, relay, tmp) {
-		if (tvdiff(now, &relay->sent) < TXN_RELAY_TIMEOUT)
+		if (ms_tvdiff(now, &relay->sent) < TXN_RELAY_TIMEOUT_MS)
 			continue;
 		if (n < 32) {
 			expired_sources[n] = relay->source_peer;
@@ -1164,6 +1165,21 @@ static void expire_txn_relays(tv_t *now)
 			add_connector(requester);
 		}
 	}
+}
+
+static void *p2p_txn_relay_watcher(void __maybe_unused *arg)
+{
+	tv_t now;
+
+	pthread_detach(pthread_self());
+	rename_proc("ckp2ptr");
+
+	while (42) {
+		cksleep_ms(TXN_RELAY_POLL_MS);
+		tv_monotonic(&now);
+		expire_txn_relays(&now);
+	}
+	return NULL;
 }
 
 /* Function for testing cmpctblock validity by echoing back any received */
@@ -1912,8 +1928,6 @@ static void *p2p_keepalive(void __maybe_unused *arg)
 		cksleep_prepare_r(&last_update);
 		ts_to_tv(&now, &last_update);
 
-		expire_txn_relays(&now);
-
 		if (tvdiff(&now, &last_ping) > PING_INTERVAL) {
 			copy_tv(&last_ping, &now);
 			ping = true;
@@ -2327,6 +2341,7 @@ int prepare_ckp2p(void)
 
 	create_pthread(&pthread, p2p_receiver, NULL);
 	create_pthread(&pthread, p2p_keepalive, NULL);
+	create_pthread(&pthread, p2p_txn_relay_watcher, NULL);
 
 	/* Start listener thread for incoming ckp2p connections on port 8335 */
 	create_pthread(&pthread, p2p_acceptor, NULL);
