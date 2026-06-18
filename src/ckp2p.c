@@ -2224,6 +2224,11 @@ static void *submission_thread(void *arg)
 	for (i = 0; i < p2purls; i++) {
 		p2p_conn_t *conn;
 
+		/* Only relay to prioclients unless the compact block has come
+		 * from the local peer 0 source */
+		if (cbt->source && i >= ckpool.prioclients)
+			break;
+
 		if (i == cbt->source) {
 			LOGDEBUG("Skipping relaying compact block to source node %d", i);
 			continue;
