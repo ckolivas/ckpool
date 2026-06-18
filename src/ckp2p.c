@@ -121,7 +121,7 @@ static cklock_t txn_relay_lock;
 static bool startup_bits_pending;
 
 #define TXN_RELAY_TIMEOUT_MS 300
-#define TXN_RELAY_POLL_MS 100
+#define TXN_RELAY_POLL_MS 50
 #define BLOCKS_FILE "blocks.txt"
 
 /* Check if magic is unset (all zeros) */
