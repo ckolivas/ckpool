@@ -1929,7 +1929,7 @@ int main(int argc, char **argv)
 	ret = sysconf(_SC_OPEN_MAX);
 #ifdef CKP2P
 	if (!ckpool.maxclients)
-		ckpool.maxclients = 4000;
+		ckpool.maxclients = 2000;
 	if (!ckpool.prioclients)
 		ckpool.prioclients = 1;
 #endif
