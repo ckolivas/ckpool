@@ -1062,7 +1062,7 @@ static void handle_blocktxn_relay(p2p_conn_t *source, uchar *payload, uint32_t p
 		goto out;
 	}
 	requester_peer = relay->requester_peer;
-	if (loglevel > LOG_INFO && requester_peer < ckpool.prioclients)
+	if (loglevel < LOG_INFO && requester_peer < ckpool.prioclients)
 		ckpool.loglevel = LOG_INFO;
 
 	HASH_DEL(txn_relays, relay);
