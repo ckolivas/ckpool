@@ -99,6 +99,8 @@ typedef struct wakelist {
 
 static wakelist_t *reader_wakes, *connector_wakes;
 
+static int prio_wakes;
+
 static peerlist_t *p2ppeers;
 
 typedef struct txn_relay_group {
@@ -624,7 +626,7 @@ static void evict_peerno(int peer)
 		evict_peer(conn);
 }
 
-/* Done under wlock peerlock for multiples */
+/* Done under wlock peerlock for multiples at startup only */
 static void _add_connector(p2p_conn_t *conn)
 {
 	wakelist_t *waker = NULL;
@@ -636,6 +638,8 @@ static void _add_connector(p2p_conn_t *conn)
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
 		new = true;
+		if (conn->peer < ckpool.prioclients)
+			prio_wakes++;
 	}
 
 	if (new)
@@ -656,6 +660,8 @@ static void add_connector(p2p_conn_t *conn)
 		new = true;
 		if (conn->peer > ckpool.prioclients)
 			tv_monotonic(&conn->last_attempt);
+		if (conn->peer < ckpool.prioclients)
+			prio_wakes++;
 	}
 	ck_wunlock(&peerlock);
 
@@ -688,8 +694,11 @@ static void del_connector(p2p_conn_t *conn)
 
 	ck_wlock(&peerlock);
 	HASH_FIND_INT(connector_wakes, &conn->peer, waker);
-	if (waker)
+	if (waker) {
 		HASH_DEL(connector_wakes, waker);
+		if (conn->peer < ckpool.prioclients)
+			prio_wakes--;
+	}
 	ck_wunlock(&peerlock);
 
 	dealloc(waker);
@@ -2230,8 +2239,10 @@ static void *p2p_keepalive(void __maybe_unused *arg)
 		fflush(NULL);
 #endif
 		/* Use re-entrant function since it can take a while to get
-		 * back here with many peers */
-		cksleep_ms_r(&last_update, KEEPALIVE_INTERVAL * 1000);
+		 * back here with many peers. Do not sleep if there are any
+		 * priority peers waiting to be reconnected */
+		if (!prio_wakes)
+			cksleep_ms_r(&last_update, KEEPALIVE_INTERVAL * 1000);
 		cksleep_prepare_r(&last_update);
 		ts_to_tv(&now, &last_update);
 
