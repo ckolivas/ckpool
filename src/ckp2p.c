@@ -121,6 +121,15 @@ typedef struct txn_relay {
 static txn_relay_group_t *txn_relay_pending;
 static txn_relay_t *txn_relays;
 static cklock_t txn_relay_lock;
+
+typedef struct peer0_tx {
+	struct peer0_tx *next, *prev;
+	uchar *data;
+	uint32_t len;
+} peer0_tx_t;
+
+static peer0_tx_t *pending_peer0_txs;
+static cklock_t pending_peer0_tx_lock;
 static bool startup_bits_pending;
 
 #define TXN_RELAY_TIMEOUT_MS 10000
@@ -1305,12 +1314,58 @@ static int parse_tx_size(const uchar *data, uint32_t dlen, uint32_t start)
 	return pos - start;
 }
 
+static void store_peer0_tx(const uchar *data, uint32_t len)
+{
+	peer0_tx_t *tx = ckalloc(sizeof(peer0_tx_t));
+
+	tx->data = ckalloc(len);
+	memcpy(tx->data, data, len);
+	tx->len = len;
+	ck_wlock(&pending_peer0_tx_lock);
+	DL_APPEND(pending_peer0_txs, tx);
+	ck_wunlock(&pending_peer0_tx_lock);
+}
+
+static void free_peer0_tx(peer0_tx_t *tx)
+{
+	if (tx->data)
+		dealloc(tx->data);
+	free(tx);
+}
+
+static void flush_pending_peer0_txs(p2p_conn_t *peer0)
+{
+	peer0_tx_t *tx, *tmp, *list = NULL;
+	int submitted = 0;
+
+	if (!peer0 || peer0->sock < 0 || !peer0->handshake_done)
+		return;
+
+	ck_wlock(&pending_peer0_tx_lock);
+	DL_FOREACH_SAFE(pending_peer0_txs, tx, tmp) {
+		DL_DELETE(pending_peer0_txs, tx);
+		DL_APPEND(list, tx);
+	}
+	ck_wunlock(&pending_peer0_tx_lock);
+
+	DL_FOREACH_SAFE(list, tx, tmp) {
+		p2p_send(peer0, "tx", tx->data, tx->len);
+		submitted++;
+		DL_DELETE(list, tx);
+		free_peer0_tx(tx);
+	}
+
+	if (submitted)
+		LOGWARNING("Submitted %d queued transactions to peer 0", submitted);
+}
+
 static void submit_blocktxn_to_peer0(const uchar *payload, uint32_t plen)
 {
 	uint32_t pos = 32;
 	int64_t count, i;
-	int submitted = 0;
+	int handled = 0;
 	p2p_conn_t *peer0;
+	bool submit_now;
 
 	if (plen < 33) {
 		LOGWARNING("Blocktxn too short to parse");
@@ -1318,10 +1373,7 @@ static void submit_blocktxn_to_peer0(const uchar *payload, uint32_t plen)
 	}
 
 	peer0 = get_peer(0);
-	if (!peer0 || peer0->sock < 0) {
-		LOGWARNING("Cannot submit blocktxn transactions - peer 0 not connected");
-		return;
-	}
+	submit_now = peer0 && peer0->sock >= 0 && peer0->handshake_done;
 
 	count = parse_varint(payload, plen, &pos);
 	if (count < 0 || count > 100000) {
@@ -1341,12 +1393,20 @@ static void submit_blocktxn_to_peer0(const uchar *payload, uint32_t plen)
 			LOGWARNING("Blocktxn transaction %lld overflows payload", (long long)i);
 			return;
 		}
-		p2p_send(peer0, "tx", payload + pos, (uint32_t)txlen);
+		if (submit_now)
+			p2p_send(peer0, "tx", payload + pos, (uint32_t)txlen);
+		else
+			store_peer0_tx(payload + pos, (uint32_t)txlen);
 		pos += txlen;
-		submitted++;
+		handled++;
 	}
 
-	LOGWARNING("Submitted %d blocktxn transactions to peer 0", submitted);
+	if (!handled)
+		return;
+	if (submit_now)
+		LOGWARNING("Submitted %d blocktxn transactions to peer 0", handled);
+	else
+		LOGWARNING("Queued %d blocktxn transactions for peer 0 reconnect", handled);
 }
 
 /* Register pending relays and forward getblocktxn to fast and slow sources. */
@@ -2058,6 +2118,9 @@ static void p2p_connector(p2p_conn_t *conn)
 
 	activate_conn(conn);
 
+	if (!conn->peer && conn->handshake_done)
+		flush_pending_peer0_txs(conn);
+
 	try_startup_bits_request(conn);
 	add_reader(conn);
 out:
@@ -2603,6 +2666,7 @@ int prepare_ckp2p(void)
 	load_blocks_txt();
 	cklock_init(&peerlock);
 	cklock_init(&txn_relay_lock);
+	cklock_init(&pending_peer0_tx_lock);
 
 	if (ckpool.externalip) {
 		connsock_t cslocal = {};
