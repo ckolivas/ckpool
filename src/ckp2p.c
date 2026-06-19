@@ -668,8 +668,12 @@ static void add_connector(p2p_conn_t *conn)
 	}
 	ck_wunlock(&peerlock);
 
-	if (new)
-		ckmsgq_add(p2p_connectors, conn);
+	if (new) {
+		if (conn->peer < ckpool.prioclients)
+			ckmsgq_add_front(p2p_connectors, conn);
+		else
+			ckmsgq_add(p2p_connectors, conn);
+	}
 }
 
 static void add_reader(p2p_conn_t *conn)
