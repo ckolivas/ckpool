@@ -1931,8 +1931,9 @@ int main(int argc, char **argv)
 
 	ret = sysconf(_SC_OPEN_MAX);
 #ifdef CKP2P
+	/* Default of 1000 seems the sweet spot for 1Gbps connections */
 	if (!ckpool.maxclients)
-		ckpool.maxclients = 2000;
+		ckpool.maxclients = 1000;
 	if (!ckpool.prioclients)
 		ckpool.prioclients = 1;
 #endif
