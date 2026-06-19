@@ -1219,7 +1219,7 @@ static int add_slow_txn_sources(const blocklist_t *block, int sent,
 		return sent;
 
 	ck_rlock(&peerlock);
-	for (p2ppeer = p2ppeers; p2ppeer && slow_added < slow_max && sent < FAST_SOURCES_MAX;
+	for (p2ppeer = p2ppeers; p2ppeer && slow_added < slow_max && sent < SLOW_SOURCES_MAX;
 	     p2ppeer = p2ppeer->hh.next) {
 		p2p_conn_t *conn = p2ppeer->conn;
 		int peer;
@@ -1439,13 +1439,16 @@ static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32
 	}
 	ck_runlock(&curblock.lock);
 
-	for (i = 0; i < source_count && sent < FAST_SOURCES_MAX; i++) {
+	for (i = 0; i < source_count && sent < SLOW_SOURCES_MAX; i++) {
 		if (!sources[i])
 			continue;
 		try_add_txn_relay_peer(sources[i], &sent, conn_peers, conns);
 	}
 
-	if (sent < FAST_SOURCES_MAX)
+	if (sent)
+		LOGWARNING("Forwarding getblocktxn to %d fast sources", sent);
+
+	if (sent < SLOW_SOURCES_MAX)
 		sent = add_slow_txn_sources(block, sent, conn_peers, conns);
 
 	if (!sent)
