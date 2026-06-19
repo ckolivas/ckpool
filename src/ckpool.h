@@ -363,8 +363,9 @@ void get_timestamp(char *stamp);
 
 ckmsgq_t *create_ckmsgq(const char *name, const void *func);
 ckmsgq_t *create_ckmsgqs(const char *name, const void *func, const int count);
-bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, const char *file, const char *func, const int line);
-#define ckmsgq_add(ckmsgq, data) _ckmsgq_add(ckmsgq, data, __FILE__, __func__, __LINE__)
+bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, bool front, const char *file, const char *func, const int line);
+#define ckmsgq_add(ckmsgq, data) _ckmsgq_add(ckmsgq, data, false, __FILE__, __func__, __LINE__)
+#define ckmsgq_add_front(ckmsgq, data) _ckmsgq_add(ckmsgq, data, true, __FILE__, __func__, __LINE__)
 bool ckmsgq_empty(ckmsgq_t *ckmsgq);
 unix_msg_t *get_unix_msg(proc_instance_t *pi);
 
