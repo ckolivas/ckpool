@@ -714,17 +714,6 @@ static void del_reader(p2p_conn_t *conn)
 	dealloc(waker);
 }
 
-static int connectors_woken(void)
-{
-	int ret;
-
-	ck_rlock(&peerlock);
-	ret = HASH_COUNT(connector_wakes);
-	ck_runlock(&peerlock);
-
-	return ret;
-}
-
 static void add_conn_epoll(p2p_conn_t *conn);
 static bool forward_getblocktxn(blocklist_t *block, const uchar *payload, uint32_t plen);
 static bool block_has_pending_relay(blocklist_t *block);
@@ -1941,19 +1930,6 @@ out:
 	return ret;
 }
 
-static bool pause_clients(void)
-{
-	bool ret = true;
-
-	if (client_watermarks())
-		goto out;
-	if (connectors_woken() >= num_threads * 16)
-		goto out;
-	ret = false;
-out:
-	return ret;
-}
-
 /* Parse an ADDRV2 message and extract/log all host:port pairs.
  * Supports IPv4 (netid=1) and IPv6 (netid=2). */
 static void parse_addrv2(uchar *data, uint32_t dlen)
@@ -1961,7 +1937,7 @@ static void parse_addrv2(uchar *data, uint32_t dlen)
 	uint32_t pos = 0;
 	int i, count;
 
-	if (pause_clients()) {
+	if (client_watermarks()) {
 		LOGDEBUG("Max client limit reached, not adding more p2p clients");
 		goto out;
 	}
