@@ -326,7 +326,7 @@ static bool reject_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint3
 
 static void reset_reconnect(p2p_conn_t *conn)
 {
-	if (conn->peer < 0 || conn->peer > ckpool.prioclients)
+	if (conn->peer < 0 || conn->peer >= ckpool.prioclients)
 		conn->reconnect = KEEPALIVE_INTERVAL;
 }
 
@@ -663,7 +663,7 @@ static void add_connector(p2p_conn_t *conn)
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
 		new = true;
-		if (conn->peer > ckpool.prioclients)
+		if (conn->peer >= ckpool.prioclients)
 			tv_monotonic(&conn->last_attempt);
 	}
 	ck_wunlock(&peerlock);
