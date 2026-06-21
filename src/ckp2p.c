@@ -305,23 +305,16 @@ static bool version_is_blocksonly(const uchar *payload, uint32_t plen)
 	return blocksonly;
 }
 
-/* Reject blocksonly peers unless they are configured priority peers. */
-static bool reject_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint32_t plen)
+/* Note blocksonly peers; they can still relay compact blocks. */
+static void note_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint32_t plen)
 {
 	if (!version_is_blocksonly(payload, plen))
-		return false;
-
-	/* peer is -1 for incoming/dynamic peers until added; priority peers are always >= 0 */
-	if (conn->peer >= 0 && conn->peer <= ckpool.prioclients) {
-		LOGNOTICE("Keeping blocksonly priority peer %d", conn->peer);
-		return false;
-	}
+		return;
 
 	if (conn->peer >= 0)
-		LOGNOTICE("Rejecting blocksonly peer %d", conn->peer);
+		LOGNOTICE("Accepting blocksonly peer %d", conn->peer);
 	else
-		LOGNOTICE("Rejecting blocksonly peer %s:%d", conn->host, conn->port);
-	return true;
+		LOGNOTICE("Accepting blocksonly peer %s:%d", conn->host, conn->port);
 }
 
 static void reset_reconnect(p2p_conn_t *conn)
@@ -1673,12 +1666,7 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 		LOGINFO("Received %s (%u bytes)", cmd, plen);
 		if (!strcmp(cmd, "version")) {
 			LOGINFO("Received VERSION from peer");
-			if (reject_blocksonly_peer(conn, payload, plen)) {
-				dealloc(payload);
-				close(conn->sock);
-				conn->sock = -1;
-				return false;
-			}
+			note_blocksonly_peer(conn, payload, plen);
 			dealloc(payload);
 			break;
 		}
@@ -1776,12 +1764,7 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 				conn->incoming_only = true;
 			}
 
-			if (reject_blocksonly_peer(conn, payload, plen)) {
-				dealloc(payload);
-				close(conn->sock);
-				conn->sock = -1;
-				return false;
-			}
+			note_blocksonly_peer(conn, payload, plen);
 
 			if (payload)
 				dealloc(payload);
