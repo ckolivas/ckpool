@@ -791,8 +791,8 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 		return;
 	}
 
-	if (conn->peer != 0) {
-		LOGNOTICE("Peer %d requested getblocktxn - only peer 0 allowed, disconnecting",
+	if (conn->peer != 1) {
+		LOGNOTICE("Peer %d requested getblocktxn - only peer 1 allowed, disconnecting",
 			  conn->peer);
 		dealloc(payload);
 		disconnect_conn(conn);
@@ -806,11 +806,11 @@ static void handle_getblocktxn(p2p_conn_t *conn, uchar *payload, uint32_t plen)
 	ck_runlock(&curblock.lock);
 
 	if (block) {
-		LOGWARNING("Peer 0 requested getblocktxn - forwarding txn request");
+		LOGWARNING("Peer 1 requested getblocktxn - forwarding txn request");
 		if (!forward_getblocktxn(block, payload, plen))
 			LOGWARNING("Failed to forward getblocktxn to network peers");
 	} else
-		LOGINFO("Peer 0 requested getblocktxn but no block available");
+		LOGINFO("Peer 1 requested getblocktxn but no block available");
 
 	disconnect_conn(conn);
 	add_connector(conn);
