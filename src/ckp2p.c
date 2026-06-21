@@ -227,6 +227,64 @@ static ssize_t write_exact(int sock, const void *buf, size_t len)
 	return (ssize_t)len;
 }
 
+/* Return true if an IPv4 address must not be used for P2P reconnection. */
+static bool ipv4_is_nonroutable(const uchar *ip)
+{
+	uint8_t a = ip[0];
+	uint8_t b = ip[1];
+	uint8_t c = ip[2];
+
+	/* 0.0.0.0/8 (this network), 127.0.0.0/8 (loopback) */
+	if (a == 0 || a == 127)
+		return true;
+
+	/* 10.0.0.0/8 (RFC1918 private) */
+	if (a == 10)
+		return true;
+
+	/* 100.64.0.0/10 (RFC6598 carrier-grade NAT) */
+	if (a == 100 && b >= 64 && b <= 127)
+		return true;
+
+	/* 169.254.0.0/16 (RFC3927 link-local) */
+	if (a == 169 && b == 254)
+		return true;
+
+	/* 172.16.0.0/12 (RFC1918 private) */
+	if (a == 172 && b >= 16 && b <= 31)
+		return true;
+
+	/* 192.0.0.0/24 (RFC6890 IETF protocol assignments) */
+	if (a == 192 && b == 0 && c == 0)
+		return true;
+
+	/* 192.0.2.0/24 (RFC5737 TEST-NET-1) */
+	if (a == 192 && b == 0 && c == 2)
+		return true;
+
+	/* 192.168.0.0/16 (RFC1918 private) */
+	if (a == 192 && b == 168)
+		return true;
+
+	/* 198.18.0.0/15 (RFC2544 benchmark testing) */
+	if (a == 198 && b >= 18 && b <= 19)
+		return true;
+
+	/* 198.51.100.0/24 (RFC5737 TEST-NET-2) */
+	if (a == 198 && b == 51 && c == 100)
+		return true;
+
+	/* 203.0.113.0/24 (RFC5737 TEST-NET-3) */
+	if (a == 203 && b == 0 && c == 113)
+		return true;
+
+	/* 224.0.0.0/4 (multicast), 240.0.0.0/4 (reserved) */
+	if (a >= 224)
+		return true;
+
+	return false;
+}
+
 /* Parse the addr_from field from a VERSION message payload.
  * Returns true only if a valid IPv4 listening address AND port (>0) was extracted. */
 static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
@@ -252,15 +310,16 @@ static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
 	/* IPv4-mapped address (::ffff:0.0.0.0/96) is the common case */
 	static const uchar v4mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
 	if (memcmp(ip, v4mapped, 12) == 0) {
-		struct in_addr ipv4;
-		memcpy(&ipv4.s_addr, ip + 12, 4);
-		inet_ntop(AF_INET, &ipv4, host_out, INET_ADDRSTRLEN);
-		if (!strncmp(host_out, "127", 3) || !strncmp(host_out, "192.168", 7) ||
-		    !strncmp(host_out, "10.",3) || !strncmp(host_out, "172", 3) ||
-		    !strncmp(host_out, "0.0.0.0", 7) || !strncmp(host_out, "169.254", 7)) {
-			LOGDEBUG("Peer advertised LAN address %s", host_out);
+		const uchar *ipv4 = ip + 12;
+		struct in_addr addr;
+
+		if (ipv4_is_nonroutable(ipv4)) {
+			inet_ntop(AF_INET, ipv4, host_out, INET_ADDRSTRLEN);
+			LOGDEBUG("Peer advertised non-routable address %s", host_out);
 			return false;
 		}
+		memcpy(&addr.s_addr, ipv4, 4);
+		inet_ntop(AF_INET, &addr, host_out, INET_ADDRSTRLEN);
 		return true;
 	}
 
