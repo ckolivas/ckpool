@@ -28,8 +28,8 @@ noinst_LIBRARIES = libckpool.a
 libckpool_a_SOURCES = libckpool.c sha2.c sha256_arm_shani.c sha256_code_release
 libckpool_a_LIBADD = $(native_objs)
 
-bin_PROGRAMS = ckpool ckpmsg
-EXTRA_PROGRAMS = ckp2p notifier
+bin_PROGRAMS = ckp2p
+EXTRA_PROGRAMS = notifier ckpool ckpmsg
 
 ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
                  yyjson.c yyjson_util.c ckp2p.c
@@ -47,8 +47,4 @@ notifier_SOURCES = notifier.c
 notifier_LDADD = libckpool.a @JANSSON_LIBS@
 
 install-exec-hook:
-	setcap CAP_NET_BIND_SERVICE=+eip $(bindir)/ckpool
-	$(LN_S) -f ckpool $(DESTDIR)$(bindir)/ckproxy
-
-uninstall-local:
-	rm -f $(bindir)/ckproxy
+	setcap CAP_NET_BIND_SERVICE=+eip $(bindir)/ckp2p

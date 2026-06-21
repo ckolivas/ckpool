@@ -124,7 +124,7 @@ if [ "$available_space_gb" -lt "$required_space" ]; then
 fi
 
 # Prompt for assumevalid block hash
-read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 000000000000000000012d5e7b4745f92b9cd60241854e38be68d9b182feabcb at block 944306, or 0 to disable): " assumevalid_hash
+read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 00000000000000000000c63fa7d726a1840c777a59ebc73f45a298989f78548a at block 951408, or 0 to disable): " assumevalid_hash
 if [ "$assumevalid_hash" = "0" ]; then
     assumevalid_line=""
     echo "Assumevalid disabled. Full blockchain verification will be performed."
@@ -132,7 +132,7 @@ elif [ -n "$assumevalid_hash" ]; then
     echo "Warning: Using assumevalid skips signature verification up to this block, reducing security. Ensure the hash is from a trusted source."
     assumevalid_line="assumevalid=$assumevalid_hash"
 else
-    assumevalid_line="assumevalid=000000000000000000012d5e7b4745f92b9cd60241854e38be68d9b182feabcb"
+    assumevalid_line="assumevalid=00000000000000000000c63fa7d726a1840c777a59ebc73f45a298989f78548a"
 fi
 
 # Prompt for donation to CKPool author
@@ -204,11 +204,11 @@ cd ..
 cp -r bitcoin-${BITCOIN_VERSION}/bin/* /usr/local/bin/
 rm -rf bitcoin-${BITCOIN_VERSION} ${BITCOIN_TAR} SHA256SUMS SHA256SUMS.asc
 
-# Calculate dbcache: 25% of total memory in MB, capped at 8192 MB
+# Calculate dbcache: 25% of total memory in MB, capped at 12000 MB
 total_mem=$(free -m | awk '/Mem:/ {print $2}')
 dbcache=$((total_mem * 25 / 100))
-if [ $dbcache -gt 8192 ]; then
-    dbcache=8192
+if [ $dbcache -gt 12000 ]; then
+    dbcache=12000
 fi
 
 # Set up Bitcoin Core config and datadir
@@ -227,6 +227,8 @@ blockmaxweight=3900000
 checkblocks=6
 blockreconstructionextratxn=1000
 dbcache=$dbcache
+minrelaytxfee=0.000001
+blockmintxfee=0.00001
 EOF
 
 # Install CKPool-Solo

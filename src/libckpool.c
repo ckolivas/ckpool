@@ -46,14 +46,13 @@
 void __attribute__((weak)) logmsg(int __maybe_unused loglevel, const char *fmt, ...)
 {
 	va_list ap;
-	char *buf;
 
 	va_start(ap, fmt);
-	VASPRINTF(&buf, fmt, ap);
+	vprintf(fmt, ap);
 	va_end(ap);
 
-	printf("%s\n", buf);
-	free(buf);
+	printf("\n");
+	fflush(stdout);
 }
 
 void rename_proc(const char *name)
@@ -1986,6 +1985,14 @@ void tv_time(tv_t *tv)
 void ts_realtime(ts_t *ts)
 {
 	clock_gettime(CLOCK_REALTIME, ts);
+}
+
+void tv_monotonic(tv_t *tv)
+{
+	ts_t now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	ts_to_tv(tv, &now);
 }
 
 void cksleep_prepare_r(ts_t *ts)
