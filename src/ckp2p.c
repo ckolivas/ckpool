@@ -1964,7 +1964,7 @@ static bool pause_clients(void)
 
 	if (client_watermarks())
 		goto out;
-	if (connectors_woken() >= num_threads)
+	if (connectors_woken() >= num_threads * 16)
 		goto out;
 	ret = false;
 out:
