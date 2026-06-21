@@ -312,7 +312,7 @@ static bool reject_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint3
 		return false;
 
 	/* peer is -1 for incoming/dynamic peers until added; priority peers are always >= 0 */
-	if (conn->peer >= 0 && conn->peer < ckpool.prioclients) {
+	if (conn->peer >= 0 && conn->peer <= ckpool.prioclients) {
 		LOGNOTICE("Keeping blocksonly priority peer %d", conn->peer);
 		return false;
 	}
@@ -326,7 +326,7 @@ static bool reject_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint3
 
 static void reset_reconnect(p2p_conn_t *conn)
 {
-	if (conn->peer < 0 || conn->peer >= ckpool.prioclients)
+	if (conn->peer < 0 || conn->peer > ckpool.prioclients)
 		conn->reconnect = KEEPALIVE_INTERVAL;
 }
 
@@ -663,13 +663,13 @@ static void add_connector(p2p_conn_t *conn)
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
 		new = true;
-		if (conn->peer >= ckpool.prioclients)
+		if (conn->peer > ckpool.prioclients)
 			tv_monotonic(&conn->last_attempt);
 	}
 	ck_wunlock(&peerlock);
 
 	if (new) {
-		if (conn->peer < ckpool.prioclients)
+		if (conn->peer <= ckpool.prioclients)
 			ckmsgq_add_front(p2p_connectors, conn);
 		else
 			ckmsgq_add(p2p_connectors, conn);
@@ -1227,7 +1227,7 @@ static int add_slow_txn_sources(const blocklist_t *block, int sent,
 		if (!conn)
 			continue;
 		peer = conn->peer;
-		if (peer < ckpool.prioclients)
+		if (peer <= ckpool.prioclients)
 			continue;
 		if (peer_sent_block(peer, block))
 			continue;
@@ -1576,7 +1576,7 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 
 	/* Trust priority peers implicitly; other peers only if diff is higher */
 	if (block_bits != current_bits) {
-		if (current_bits > block_bits || source < ckpool.prioclients) {
+		if (current_bits > block_bits || source <= ckpool.prioclients) {
 			LOGWARNING("Current bits set to 0x%08x (from peer %d)", block_bits, source);
 
 			ck_wlock(&curblock.lock);
@@ -2254,7 +2254,8 @@ static void dump_peers(void)
 	fprintf(fp, "\"p2purl\" : [");
 
 	ck_rlock(&peerlock);
-	for (p2ppeer = p2ppeers; p2ppeer!= NULL; p2ppeer = p2ppeer->hh.next) {
+	/* Start at peer 1 */
+	for (p2ppeer = p2ppeers->hh.next; p2ppeer!= NULL; p2ppeer = p2ppeer->hh.next) {
 		p2p_conn_t *conn = p2ppeer->conn;
 		struct in6_addr addr;
 
@@ -2327,7 +2328,7 @@ static void *p2p_keepalive(void __maybe_unused *arg)
 					continue;
 				}
 
-				prio = (i < ckpool.prioclients);
+				prio = (i <= ckpool.prioclients);
 				/* Never evict priority clients */
 				if (!prio) {
 					int unresponsive = tvdiff(&now, &conn->last_alive);
@@ -2388,12 +2389,13 @@ static void *submission_thread(void *arg)
 	p2purls = ckpool.p2purls;
 	ck_runlock(&peerlock);
 
-	for (i = 0; i < p2purls; i++) {
+	/* Do not submit to peer 0 */
+	for (i = 1; i < p2purls; i++) {
 		p2p_conn_t *conn;
 
 		/* Only relay to prioclients unless the compact block has come
 		 * from the local peer 0 source */
-		if (cbt->source && i >= ckpool.prioclients)
+		if (cbt->source && i > ckpool.prioclients)
 			break;
 
 		if (i == cbt->source) {
@@ -2434,10 +2436,10 @@ static void *submission_thread(void *arg)
 
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
 
-		/* Disconnect all priority peers except peer 0 which should be
+		/* Disconnect all priority peers except peer 0-1 which should be
 		 * localhost to avoid inducing latency at their end in case they
 		 * ask for more information from ckp2p.*/
-		if (i && i < ckpool.prioclients) {
+		if (i > 1 && i <= ckpool.prioclients) {
 			disconnect_conn(conn);
 			add_connector(conn);
 		}
@@ -2506,7 +2508,9 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport, int sou
 		conn->netname = netdefs[0].name;
 	}
 
-	if (source < ckpool.prioclients)
+	if (!source)
+		LOGWARNING("ckp2p set up submission peer %d - %s:%s", source, host, charport);
+	else if (source <= ckpool.prioclients)
 		LOGWARNING("ckp2p set up prio peer %d - %s:%s", source, host, charport);
 	else
 		LOGNOTICE("ckp2p set up config peer %d - %s:%s", source, host, charport);

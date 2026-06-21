@@ -1286,15 +1286,18 @@ static void parse_btcds(const json_t *arr_val, const int arr_size)
 static void parse_p2purls(const json_t *arr_val, const int arr_size)
 {
 	json_t *val;
-	int i;
+	int i, j;
 
-	ckpool.p2purls = arr_size;
-	ckpool.p2purl = ckzalloc(sizeof(char *) * arr_size);
-	for (i = 0; i < arr_size; i++) {
+	ckpool.p2purls = arr_size + 1;
+	ckpool.p2purl = ckzalloc(sizeof(char *) * ckpool.p2purls);
+	for (i = 0, j = 0; i < arr_size; i++, j++) {
 		val = json_array_get(arr_val, i);
 
-		if (!_json_get_string(&ckpool.p2purl[i], val, "p2purl"))
+		if (!_json_get_string(&ckpool.p2purl[j], val, "p2purl"))
 			LOGWARNING("Invalid p2purl entry number %d", i);
+		/* Peer 1 is a duplicate of peer 0 */
+		if (!i)
+			ckpool.p2purl[++j] = ckpool.p2purl[0];
 	}
 }
 
@@ -1804,9 +1807,9 @@ int main(int argc, char **argv)
 			ckpool.btcdpass[i] = strdup("pass");
 	}
 	if (!ckpool.p2purls) {
-		ckpool.p2purls = 1;
+		ckpool.p2purls = 2;
 		ckpool.p2purl = ckzalloc(sizeof(char *));
-		ckpool.p2purl[0] = strdup("localhost:8333");
+		ckpool.p2purl[0] = ckpool.p2purl[1] = strdup("localhost:8333");
 	}
 
 	ckpool.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
