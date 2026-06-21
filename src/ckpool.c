@@ -1935,14 +1935,18 @@ int main(int argc, char **argv)
 	open_process_sock(&ckp, &ckp.main, &ckp.main.us);
 
 	ret = sysconf(_SC_OPEN_MAX);
+#if CKP2P
+	if (!ckp.maxclients)
+		ckp.maxclients = 1024;
+#endif
 	if (ckp.maxclients > ret * 5 / 10) {
 		LOGWARNING("Cannot set maxclients to %d due to max open file limit of %d, reducing to %d",
 			   ckp.maxclients, ret, ret * 5 / 10);
 		ckp.maxclients = ret * 5 / 10;
 	} else if (!ckp.maxclients) {
 		LOGNOTICE("Setting maxclients to %d due to max open file limit of %d",
-			  ret * 5 / 10, ret);
-		ckp.maxclients = ret * 5 / 10;
+			  ret * 9 / 10, ret);
+		ckp.maxclients = ret * 9 / 10;
 	}
 
 	// ckp.ckpapi = create_ckmsgq(&ckp, "api", &ckpool_api);
