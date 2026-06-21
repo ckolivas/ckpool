@@ -2571,8 +2571,6 @@ static void *p2p_acceptor(void __maybe_unused *arg)
 		socklen_t clen = sizeof(client_addr);
 		int newsock;
 
-		while (client_watermarks())
-			sleep(KEEPALIVE_INTERVAL);
 		newsock = accept(listen_sock, (struct sockaddr *)&client_addr, &clen);
 		if (newsock < 0) {
 			if (errno != EINTR)
@@ -2721,7 +2719,7 @@ int prepare_ckp2p(void)
 
 	num_threads = sysconf(_SC_NPROCESSORS_ONLN);
 	p2p_readers = create_ckmsgqs("p2pread", &p2p_reader, num_threads);
-	p2p_connectors = create_ckmsgqs("p2pconnect", &p2p_connector, num_threads);
+	p2p_connectors = create_ckmsgqs("p2pconnect", &p2p_connector, num_threads * 16);
 
 	reader_epfd = epoll_create1(EPOLL_CLOEXEC);
 	if (reader_epfd < 0)
