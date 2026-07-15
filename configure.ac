@@ -96,11 +96,6 @@ if test x$sha2 = xsha2; then
 fi
 
 
-AC_CONFIG_SUBDIRS([src/jansson-2.14])
-JANSSON_LIBS="jansson-2.14/src/.libs/libjansson.a"
-
-AC_SUBST(JANSSON_LIBS)
-
 AC_SEARCH_LIBS(clock_nanosleep, rt, , echo "Error: Required library rt not found." && exit 1)
 AC_SEARCH_LIBS(exp, m, , echo "Error: Required library math not found." && exit 1)
 AC_SEARCH_LIBS(pthread_mutex_trylock, pthread, , echo "Error: Required library pthreads not found." && exit 1)
@@ -119,7 +114,7 @@ echo "  ZMQ..................: $ZMQ"
 echo "  CPPFLAGS.............: $CPPFLAGS"
 echo "  CFLAGS...............: $CFLAGS"
 echo "  LDFLAGS..............: $LDFLAGS"
-echo "  LDADD................: $LIBS $JANSSON_LIBS"
+echo "  LDADD................: $LIBS"
 echo "  ARCHITECTURE.........: $host_cpu $x86_shani$rorx$avx1$sse4$sha2"
 echo
 echo "Installation...........: make install (as root if needed, with 'su' or 'sudo')"
