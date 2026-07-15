@@ -1,5 +1,7 @@
 ACLOCAL_AMFLAGS = -I m4
-AM_CPPFLAGS =
+# Expose GNU extensions (asprintf/vasprintf etc.) on compilers that do not
+# default to a -std=gnu* mode which would define _GNU_SOURCE implicitly.
+AM_CPPFLAGS = -D_GNU_SOURCE
 
 native_objs :=
 

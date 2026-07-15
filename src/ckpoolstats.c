@@ -6,8 +6,6 @@
  * Software Foundation; either version 3 of the License, or (at your option)
  * any later version.  See COPYING for more details.
  */
-#define _GNU_SOURCE
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
