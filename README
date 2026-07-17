@@ -111,22 +111,26 @@ slow communicating clients from delaying low latency ones.
 BUILDING:
 
 Building ckpool requires no dependencies outside of the basic build tools and
-yasm on any linux installation. Recommended zmq notification support (ckpool
-only) requires the zmq devel library installed.
+yasm on any linux installation, but support features are recommended.
 
 
-Building with zmq (preferred build but not required for ckproxy):
+Minimal build:
 
-sudo apt-get install build-essential yasm libzmq3-dev
-
-./configure
-
-make
+sudo apt install build-essential yasm
 
 
-Basic build:
+Optional dependencies:
 
-sudo apt-get install build-essential yasm
+ZMQ: libzmq3-dev
+IPC: libcapnp-dev capnproto
+
+
+Full build:
+
+sudo apt install build-essential yasm libzmq3-dev libcapnp-dev capnproto
+
+
+Followed by:
 
 ./configure
 
@@ -135,7 +139,8 @@ make
 
 Building from git also requires autoconf, automake, and pkgconf:
 
-sudo apt-get install build-essential yasm autoconf automake libtool libzmq3-dev pkgconf
+sudo apt install build-essential yasm autoconf automake libtool pkgconf \
+	libzmq3-dev libcapnp-dev capnproto libsodium-dev
 
 ./autogen.sh
 
@@ -153,11 +158,12 @@ ckproxy - A link to ckpool that automatically starts it in proxy mode
 ckpmsg - An application for passing messages in libckpool format to ckpool
 
 notifier - An application designed to be run with bitcoind's -blocknotify to
-	notify ckpool of block changes.
+	notify ckpool of block changes. Using IPC or ZMQ is much preferred.
 
 
 Installation is NOT required and ckpool can be run directly from the directory
 it's built in but it can be installed with:
+
 sudo make install
 
 
