@@ -142,7 +142,7 @@ AC_SUBST(CAPNP_CFLAGS)
 AC_SUBST(CAPNP_LIBS)
 AM_CONDITIONAL([HAVE_CAPNP], [test x$CAPNP = xyes])
 
-AC_CONFIG_FILES([Makefile src/Makefile test/Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile])
 
 AC_OUTPUT
 
