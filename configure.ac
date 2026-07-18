@@ -105,13 +105,38 @@ AC_SEARCH_LIBS(pthread_mutex_trylock, pthread, , echo "Error: Required library p
 AC_SEARCH_LIBS(zmq_socket, zmq, ZMQ=yes, ZMQ=no)
 
 dnl Optional Cap'n Proto (capnp-rpc) for the Bitcoin Core mining IPC interface.
-dnl When present, ckpool builds the C++ IPC shim (ipc/mining) and prefers the
-dnl IPC interface for block notifications, falling back to ZMQ otherwise.
+dnl When present and matching the vendored stubs (Cap'n Proto 1.1.0 /
+dnl CAPNP_VERSION 1001000), ckpool builds the C++ IPC shim (ipc/mining).
+dnl Older distro packages (e.g. Ubuntu 20.04/22.04 ship 0.7.x) cannot compile
+dnl those stubs — disable cleanly so pool/SV1 still builds without IPC.
 CAPNP_CFLAGS=""
 CAPNP_LIBS=""
+CAPNP=no
 PKG_CHECK_MODULES([CAPNP], [capnp-rpc],
-  [CAPNP=yes
-   AC_DEFINE([HAVE_CAPNP], [1], [Have Cap'n Proto (capnp-rpc) for the mining IPC interface])],
+  [save_CPPFLAGS="$CPPFLAGS"
+   CPPFLAGS="$CPPFLAGS $CAPNP_CFLAGS"
+   AC_LANG_PUSH([C++])
+   AC_MSG_CHECKING([for Cap'n Proto 1.1.0 (required by vendored IPC stubs)])
+   AC_COMPILE_IFELSE(
+     [AC_LANG_PROGRAM([[
+#include <capnp/common.h>
+#if !defined(CAPNP_VERSION) || CAPNP_VERSION != 1001000
+#error "need Cap'n Proto 1.1.0"
+#endif
+#ifndef CAPNP_BEGIN_HEADER
+#error "need Cap'n Proto with CAPNP_BEGIN_HEADER"
+#endif
+     ]], [[]])],
+     [AC_MSG_RESULT([yes])
+      CAPNP=yes
+      AC_DEFINE([HAVE_CAPNP], [1],
+		[Have Cap'n Proto 1.1.0 (capnp-rpc) for the mining IPC interface])],
+     [AC_MSG_RESULT([no])
+      AC_MSG_WARN([capnp-rpc found but not Cap'n Proto 1.1.0; mining IPC disabled])
+      CAPNP_CFLAGS=""
+      CAPNP_LIBS=""])
+   AC_LANG_POP([C++])
+   CPPFLAGS="$save_CPPFLAGS"],
   [CAPNP=no])
 AC_SUBST(CAPNP_CFLAGS)
 AC_SUBST(CAPNP_LIBS)

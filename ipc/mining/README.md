@@ -11,8 +11,10 @@ The protocol is described in `../../ipc-protocol.md`.
   `rpc`) plus `mp/proxy.capnp` (the libmultiprocess proxy schema), vendored
   verbatim.
 - `*.capnp.h` / `*.capnp.c++` — the client stubs generated from the schemas with
-  `capnpc -o c++` (Cap'n Proto 1.1.0). Checked in so a `capnpc` is not required
-  at build time.
+  `capnpc -o c++` (Cap'n Proto **1.1.0 only**). Checked in so a `capnpc` is not
+  required at build time. `configure` enables `HAVE_CAPNP` only when the
+  installed `capnp-rpc` is 1.1.0; older distro packages (0.7.x on Ubuntu
+  20.04/22.04, etc.) build without the mining IPC shim.
 - `mining_ipc.h` — the pure C API exposed to ckpool.
 - `mining_ipc.cpp` — the C++ implementation.
 
@@ -31,10 +33,10 @@ connected and used entirely from one caller thread — in ckpool that is the
 
 ## Build
 
-The shim is compiled into `ckpool` only when `configure` detects `capnp-rpc`
-(`HAVE_CAPNP`). Everything in `mining_ipc.h`/`.cpp` and its callers in
+The shim is compiled into `ckpool` only when `configure` detects Cap'n Proto
+**1.1.0** (`HAVE_CAPNP`). Everything in `mining_ipc.h`/`.cpp` and its callers in
 `stratifier.c` is guarded by `#ifdef HAVE_CAPNP`, so ckpool still builds and
-runs as before when Cap'n Proto is absent.
+runs as before when Cap'n Proto is absent or the wrong version.
 
 ## Status — Phase 1
 
