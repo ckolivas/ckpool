@@ -321,7 +321,7 @@ for a client to alter and is expressed as an hex string. Eg "00fff000"
 Default is "1fffe000".
 
 "dropidle" : Drop clients which have been idle for this duration in seconds,
-use 0 to disable. Default 3600 (1 hour.)
+use 0 to disable. Default 0.
 
 "serverurl" : This is the IP(s) to try to bind ckpool uniquely to, otherwise it
 will attempt to bind to all interfaces in port 3333 by default in pool mode
@@ -347,3 +347,15 @@ accept before rejecting further clients.
 "zmqblock" : Optional interface to use for zmq blockhash notification - ckpool
 only. Requires use of matched bitcoind -zmqpubhashblock option.
 Default: tcp://127.0.0.1:28332
+
+"ipcmining" : Optional interface to use for IPC blockhash notification - ckpool
+only. This bypasses zmq notification if active.
+Example: "/tmp/btc-mining.sock"
+Requires use of matched bitcoind -ipcbind option such as:
+bitcoind -m node -ipcbind=unix:/tmp/btc-mining.sock
+No default.
+
+"ipctemplate" : Boolean to use IPC block template generation, requires a
+working ipcmining interface. This falls back to RPC getblocktemplate if
+disabled or inactive.
+Default: false.

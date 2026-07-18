@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2018,2023 Con Kolivas
+ * Copyright 2014-2018,2023,2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -46,14 +46,13 @@
 void __attribute__((weak)) logmsg(int __maybe_unused loglevel, const char *fmt, ...)
 {
 	va_list ap;
-	char *buf;
 
 	va_start(ap, fmt);
-	VASPRINTF(&buf, fmt, ap);
+	vprintf(fmt, ap);
 	va_end(ap);
 
-	printf("%s\n", buf);
-	free(buf);
+	printf("\n");
+	fflush(stdout);
 }
 
 void rename_proc(const char *name)
@@ -1292,50 +1291,6 @@ out:
 }
 
 
-void _json_check(json_t *val, json_error_t *err, const char *file, const char *func, const int line)
-{
-	if (likely(val))
-		return;
-
-	LOGERR("Invalid json line:%d col:%d pos:%d text: %s from %s %s:%d",
-	       err->line, err->column, err->position, err->text,
-	       file, func, line);
-}
-
-/* Extracts a string value from a json array with error checking. To be used
- * when the value of the string returned is only examined and not to be stored.
- * See json_array_string below */
-const char *__json_array_string(json_t *val, unsigned int entry)
-{
-	json_t *arr_entry;
-
-	if (json_is_null(val))
-		return NULL;
-	if (!json_is_array(val))
-		return NULL;
-	if (entry > json_array_size(val))
-		return NULL;
-	arr_entry = json_array_get(val, entry);
-	if (!json_is_string(arr_entry))
-		return NULL;
-
-	return json_string_value(arr_entry);
-}
-
-/* Creates a freshly malloced dup of __json_array_string */
-char *json_array_string(json_t *val, unsigned int entry)
-{
-	const char *buf = __json_array_string(val, entry);
-
-	if (buf)
-		return strdup(buf);
-	return NULL;
-}
-
-json_t *json_object_dup(json_t *val, const char *entry)
-{
-	return json_copy(json_object_get(val, entry));
-}
 
 char *rotating_filename(const char *path, time_t when)
 {
@@ -1391,6 +1346,24 @@ void align_len(size_t *len)
 		*len += 4 - (*len % 4);
 }
 
+void *_ckrealloc(void *ptr, size_t size, const char *file, const char *func, const int line)
+{
+	int backoff = 1;
+	void *new_ptr;
+
+	while (42) {
+		new_ptr = realloc(ptr, size);
+		if (likely(new_ptr))
+			break;
+		if (backoff == 1)
+			fprintf(stderr, "Failed to realloc %d, retrying from %s %s:%d\n",
+				(int)size, file, func, line);
+		cksleep_ms(backoff);
+		backoff <<= 1;
+	}
+	return new_ptr;
+}
+
 /* Malloc failure should be fatal but keep backing off and retrying as the OS
  * will kill us eventually if it can't recover. */
 void realloc_strcat(char **ptr, const char *s)
@@ -1420,7 +1393,7 @@ void realloc_strcat(char **ptr, const char *s)
 		if (likely(new_ptr))
 			break;
 		if (backoff == 1)
-			fprintf(stderr, "Failed to realloc %d, retrying\n", (int)len);
+			fprintf(stderr, "Failed to realloc_strcat %d, retrying\n", (int)len);
 		cksleep_ms(backoff);
 		backoff <<= 1;
 	}
@@ -1458,10 +1431,6 @@ void *_ckalloc(size_t len, const char *file, const char *func, const int line)
 	return ptr;
 }
 
-void *json_ckalloc(size_t size)
-{
-	return _ckalloc(size, __FILE__, __func__, __LINE__);
-}
 
 void *_ckzalloc(size_t len, const char *file, const char *func, const int line)
 {
@@ -1637,7 +1606,9 @@ void b58tobin(char *b58bin, const char *b58)
 	}
 	*(b58bin++) = bin32[0] & 0xff;
 	for (i = 1; i < 7; i++) {
-		*((uint32_t *)b58bin) = htobe32(bin32[i]);
+		uint32_t val = htobe32(bin32[i]);
+
+		memcpy(b58bin, &val, sizeof(uint32_t));
 		b58bin += sizeof(uint32_t);
 	}
 }
@@ -1832,7 +1803,7 @@ int address_to_txn(char *p2h, const char *addr, const bool script, const bool se
 /*  For encoding nHeight into coinbase, return how many bytes were used */
 int ser_number(uchar *s, int32_t val)
 {
-	int32_t *i32 = (int32_t *)&s[1];
+	uint32_t v;
 	int len;
 
 	if (val < 0x80)
@@ -1843,7 +1814,10 @@ int ser_number(uchar *s, int32_t val)
 		len = 3;
 	else
 		len = 4;
-	*i32 = htole32(val);
+
+	v = htole32(val);
+	memcpy(&s[1], &v, sizeof(uint32_t));
+
 	s[0] = len++;
 	return len;
 }
@@ -2041,7 +2015,7 @@ void decay_time(double *f, double fadd, double fsecs, double interval)
 	*f += (fadd / fsecs * fprop);
 	*f /= ftotal;
 	/* Sanity check to prevent meaningless super small numbers that
-	 * eventually underflow libjansson's real number interpretation. */
+	 * eventually underflow the json real number interpretation. */
 	if (unlikely(*f < 2E-16))
 		*f = 0;
 }

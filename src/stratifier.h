@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2017,2023 Con Kolivas
+ * Copyright 2014-2017,2023,2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -55,7 +55,7 @@ struct genwork {
 	int merkles;
 	char merklehash[16][68];
 	char merklebin[16][32];
-	json_t *merkle_array;
+	yyjson_mut_doc *yymerkle_doc;
 
 	/* Template variables, lengths are binary lengths! */
 	char *coinb1; // coinbase1
@@ -83,20 +83,26 @@ struct genwork {
 	ckpool_t *ckp;
 	bool proxy; /* This workbase is proxied work */
 
+	bool ipc; /* This workbase came from the mining IPC interface */
+	void *tmpl; /* mining_block_template* handle used to submit an IPC block */
+	uchar coinbase_witness[32]; /* coinbase witness reserved value for IPC submit */
+
 	bool incomplete; /* This is a remote workinfo without all the txn data */
 
-	json_t *json; /* getblocktemplate json */
+	yyjson_doc *gbtdoc; /* getblocktemplate json */
+	yyjson_val *gbtroot;
 };
 
-void parse_remote_txns(ckpool_t *ckp, const json_t *val);
-#define parse_upstream_txns(ckp, val) parse_remote_txns(ckp, val)
-void parse_upstream_auth(ckpool_t *ckp, json_t *val);
-void parse_upstream_workinfo(ckpool_t *ckp, json_t *val);
-void parse_upstream_block(ckpool_t *ckp, json_t *val);
-void parse_upstream_reqtxns(ckpool_t *ckp, json_t *val);
-char *stratifier_stats(ckpool_t *ckp, void *data);
-void _stratifier_add_recv(ckpool_t *ckp, json_t *val, const char *file, const char *func, const int line);
-#define stratifier_add_recv(ckp, val) _stratifier_add_recv(ckp, val, __FILE__, __func__, __LINE__)
+void parse_remote_txns(yyjson_mut_val *val);
+#define parse_upstream_txns(val) parse_remote_txns(val)
+void parse_upstream_auth(yyjson_mut_val *val);
+void parse_upstream_workinfo(yyjson_mut_val *val);
+void parse_upstream_block(yyjson_mut_doc *doc, yyjson_mut_val *val);
+void parse_upstream_reqtxns(yyjson_mut_val *val);
+char *stratifier_stats(void *data);
+void stratifier_shutdown_ipc(void);
+void _stratifier_add_yyrecv(yyjson_mut_doc *doc, const char *file, const char *func, const int line);
+#define stratifier_add_yyrecv(val) _stratifier_add_yyrecv(doc, __FILE__, __func__, __LINE__)
 void *stratifier(void *arg);
 
 #endif /* STRATIFIER_H */

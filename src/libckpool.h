@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2018,2023 Con Kolivas
+ * Copyright 2014-2018,2023,2026 Con Kolivas
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -14,8 +14,9 @@
 
 #include <errno.h>
 #include <inttypes.h>
-#include <jansson.h>
 #include <netdb.h>
+#include <stdarg.h>
+#include "yyjson.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -178,6 +179,7 @@ static inline void flip_80(void *dest_p, const void *src_p)
 
 #define ckalloc(len) _ckalloc(len, __FILE__, __func__, __LINE__)
 #define ckzalloc(len) _ckzalloc(len, __FILE__, __func__, __LINE__)
+#define ckrealloc(ptr, size) _ckrealloc(ptr, size, __FILE__, __func__, __LINE__);
 
 #define dealloc(ptr) do { \
 	free(ptr); \
@@ -196,6 +198,7 @@ static inline void flip_80(void *dest_p, const void *src_p)
 
 void logmsg(int loglevel, const char *fmt, ...);
 
+/* Truncates messages greater than DEFLOGBUFSIZ */
 #define DEFLOGBUFSIZ 512
 
 #define LOGMSGSIZ(__siz, __lvl, __fmt, ...) do { \
@@ -374,97 +377,81 @@ struct unixsock {
 
 typedef struct unixsock unixsock_t;
 
-void _json_check(json_t *val, json_error_t *err, const char *file, const char *func, const int line);
-#define json_check(VAL, ERR) _json_check(VAL, ERR,  __FILE__, __func__, __LINE__)
-
-/* Check and pack json */
-#define JSON_CPACK(VAL, ...) do { \
-	json_error_t ERR; \
-	VAL = json_pack_ex(&ERR, 0, ##__VA_ARGS__); \
-	json_check(VAL, &ERR); \
-} while (0)
-
-/* No error checking with these, make sure we know they're valid already! */
-static inline void json_strcpy(char *buf, json_t *val, const char *key)
+/* As the json_*cpy helpers above but for mutable yyjson objects, bounded to
+ * size bytes including the null terminator for copying into fixed sized
+ * buffers. */
+static inline void yyjson_mut_obj_strncpy(char *buf, yyjson_mut_val *val, const char *key,
+					  const size_t size)
 {
-	strcpy(buf, json_string_value(json_object_get(val, key)) ? : "");
+	const char *str = yyjson_mut_get_str(yyjson_mut_obj_get(val, key)) ? : "";
+
+	if (likely(size)) {
+		strncpy(buf, str, size - 1);
+		buf[size - 1] = '\0';
+	}
 }
 
-static inline void json_dblcpy(double *dbl, json_t *val, const char *key)
+static inline void yyjson_mut_obj_dblcpy(double *dbl, yyjson_mut_val *val, const char *key)
 {
-	*dbl = json_real_value(json_object_get(val, key));
+	*dbl = yyjson_mut_get_num(yyjson_mut_obj_get(val, key));
 }
 
-static inline void json_uintcpy(uint32_t *u32, json_t *val, const char *key)
+static inline void yyjson_mut_obj_uintcpy(uint32_t *u32, yyjson_mut_val *val, const char *key)
 {
-	*u32 = (uint32_t)json_integer_value(json_object_get(val, key));
+	*u32 = (uint32_t)yyjson_mut_get_uint(yyjson_mut_obj_get(val, key));
 }
 
-static inline void json_uint64cpy(uint64_t *u64, json_t *val, const char *key)
+static inline void yyjson_mut_obj_uint64cpy(uint64_t *u64, yyjson_mut_val *val, const char *key)
 {
-	*u64 = (uint64_t)json_integer_value(json_object_get(val, key));
+	*u64 = yyjson_mut_get_uint(yyjson_mut_obj_get(val, key));
 }
 
-static inline void json_int64cpy(int64_t *i64, json_t *val, const char *key)
+static inline void yyjson_mut_obj_int64cpy(int64_t *i64, yyjson_mut_val *val, const char *key)
 {
-	*i64 = (int64_t)json_integer_value(json_object_get(val, key));
+	*i64 = yyjson_mut_get_sint(yyjson_mut_obj_get(val, key));
 }
 
-static inline void json_intcpy(int *i, json_t *val, const char *key)
+static inline void yyjson_mut_obj_intcpy(int *i, yyjson_mut_val *val, const char *key)
 {
-	*i = json_integer_value(json_object_get(val, key));
+	*i = yyjson_mut_get_sint(yyjson_mut_obj_get(val, key));
 }
 
-static inline void json_strdup(char **buf, json_t *val, const char *key)
+static inline void yyjson_mut_obj_strdup(char **buf, yyjson_mut_val *val, const char *key)
 {
-	*buf = strdup(json_string_value(json_object_get(val, key)) ? : "");
+	*buf = strdup(yyjson_mut_get_str(yyjson_mut_obj_get(val, key)) ? : "");
 }
 
-/* Helpers for setting a field will check for valid entry and print an error
- * if it is unsuccessfully set. */
-static inline void _json_set_string(json_t *val, const char *key, const char *str,
-				    const char *file, const char *func, const int line)
+/* As above but for immutable yyjson objects */
+static inline void yyjson_obj_strncpy(char *buf, yyjson_val *val, const char *key,
+				      const size_t size)
 {
-	if (unlikely(json_object_set_new(val, key, json_string(str))))
-		LOGERR("Failed to set json string from %s %s:%d", file, func, line);
-}
-#define json_set_string(val, key, str) _json_set_string(val, key, str, __FILE__, __func__, __LINE__)
+	const char *str = yyjson_get_str(yyjson_obj_get(val, key)) ? : "";
 
-/* Int is long long so will work for u32 and int64 */
-static inline void _json_set_int(json_t *val, const char *key, int64_t integer,
-				 const char *file, const char *func, const int line)
+	if (likely(size)) {
+		strncpy(buf, str, size - 1);
+		buf[size - 1] = '\0';
+	}
+}
+
+static inline void yyjson_obj_dblcpy(double *dbl, yyjson_val *val, const char *key)
 {
-	if (unlikely(json_object_set_new_nocheck(val, key, json_integer(integer))))
-		LOGERR("Failed to set json int from %s %s:%d", file, func, line);
+	*dbl = yyjson_get_num(yyjson_obj_get(val, key));
 }
-#define json_set_int(val, key, integer) _json_set_int(val, key, integer, __FILE__, __func__, __LINE__)
-#define json_set_uint32(val, key, u32) _json_set_int(val, key, u32, __FILE__, __func__, __LINE__)
-#define json_set_int64(val, key, i64) _json_set_int(val, key, i64, __FILE__, __func__, __LINE__)
 
-static inline void _json_set_double(json_t *val, const char *key, double real,
-				    const char *file, const char *func, const int line)
+static inline void yyjson_obj_int64cpy(int64_t *i64, yyjson_val *val, const char *key)
 {
-	if (unlikely(json_object_set_new_nocheck(val, key, json_real(real))))
-		LOGERR("Failed to set json double from %s %s:%d", file, func, line);
+	*i64 = yyjson_get_sint(yyjson_obj_get(val, key));
 }
-#define json_set_double(val, key, real) _json_set_double(val, key, real, __FILE__, __func__, __LINE__)
 
-static inline void _json_set_bool(json_t *val, const char *key, bool boolean,
-				  const char *file, const char *func, const int line)
+static inline void yyjson_obj_intcpy(int *i, yyjson_val *val, const char *key)
 {
-	if (unlikely(json_object_set_new_nocheck(val, key, json_boolean(boolean))))
-		LOGERR("Failed to set json bool from %s %s:%d", file, func, line);
+	*i = yyjson_get_sint(yyjson_obj_get(val, key));
 }
-#define json_set_bool(val, key, boolean) _json_set_bool(val, key, boolean, __FILE__, __func__, __LINE__)
 
-
-static inline void _json_set_object(json_t *val, const char *key, json_t *object,
-				  const char *file, const char *func, const int line)
+static inline void yyjson_obj_strdup(char **buf, yyjson_val *val, const char *key)
 {
-	if (unlikely(json_object_set_new_nocheck(val, key, object)))
-		LOGERR("Failed to set json object from %s %s:%d", file, func, line);
+	*buf = strdup(yyjson_get_str(yyjson_obj_get(val, key)) ? : "");
 }
-#define json_set_object(val, key, object) _json_set_object(val, key, object, __FILE__, __func__, __LINE__)
 
 void rename_proc(const char *name);
 void create_pthread(pthread_t *thread, void *(*start_routine)(void *), void *arg);
@@ -581,9 +568,6 @@ bool _send_fd(int fd, int sockd, const char *file, const char *func, const int l
 int _get_fd(int sockd, const char *file, const char *func, const int line);
 #define get_fd(sockd) _get_fd(sockd, __FILE__, __func__, __LINE__)
 
-const char *__json_array_string(json_t *val, unsigned int entry);
-char *json_array_string(json_t *val, unsigned int entry);
-json_t *json_object_dup(json_t *val, const char *entry);
 
 char *rotating_filename(const char *path, time_t when);
 bool rotating_log(const char *path, const char *msg);
@@ -591,8 +575,8 @@ bool rotating_log(const char *path, const char *msg);
 void align_len(size_t *len);
 void realloc_strcat(char **ptr, const char *s);
 void trail_slash(char **buf);
+void *_ckrealloc(void *ptr, size_t size, const char *file, const char *func, const int line);
 void *_ckalloc(size_t len, const char *file, const char *func, const int line);
-void *json_ckalloc(size_t size);
 void *_ckzalloc(size_t len, const char *file, const char *func, const int line);
 size_t round_up_page(size_t len);
 

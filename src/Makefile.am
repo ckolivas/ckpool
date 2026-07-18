@@ -1,8 +1,10 @@
-SUBDIRS	= jansson-2.14
 
 ACLOCAL_AMFLAGS = -I m4
-AM_CPPFLAGS =  -I$(top_srcdir)/src/jansson-2.14/src
-AM_CPPFLAGS += -D_GNU_SOURCE
+AM_CPPFLAGS = -D_GNU_SOURCE
+
+if HAVE_CAPNP
+AM_CPPFLAGS += @CAPNP_CFLAGS@ -I$(top_srcdir)/ipc/mining
+endif
 
 native_objs :=
 
@@ -26,20 +28,29 @@ endif
 	yasm -f x64 -f elf64 -X gnu -g dwarf2 -D LINUX -o $@ $<
 
 noinst_LIBRARIES = libckpool.a
-libckpool_a_SOURCES = libckpool.c libckpool.h sha2.c sha2.h sha256_arm_shani.c sha256_code_release
+libckpool_a_SOURCES = libckpool.c sha2.c sha256_arm_shani.c sha256_code_release
 libckpool_a_LIBADD = $(native_objs)
 
 bin_PROGRAMS = ckpool ckpmsg notifier
-ckpool_SOURCES = ckpool.c ckpool.h generator.c generator.h bitcoin.c bitcoin.h \
-		 stratifier.c stratifier.h connector.c connector.h uthash.h \
-		 utlist.h
-ckpool_LDADD = libckpool.a @JANSSON_LIBS@ @LIBS@
+ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
+		 yyjson.c yyjson_util.c
+ckpool_LDADD = libckpool.a @LIBS@ @CAPNP_LIBS@
+
+if HAVE_CAPNP
+ckpool_SOURCES += $(top_srcdir)/ipc/mining/mining_ipc.cpp \
+	$(top_srcdir)/ipc/mining/init.capnp.c++ \
+	$(top_srcdir)/ipc/mining/mining.capnp.c++ \
+	$(top_srcdir)/ipc/mining/common.capnp.c++ \
+	$(top_srcdir)/ipc/mining/echo.capnp.c++ \
+	$(top_srcdir)/ipc/mining/rpc.capnp.c++ \
+	$(top_srcdir)/ipc/mining/mp/proxy.capnp.c++
+endif
 
 ckpmsg_SOURCES = ckpmsg.c
-ckpmsg_LDADD = libckpool.a @JANSSON_LIBS@
+ckpmsg_LDADD = libckpool.a
 
 notifier_SOURCES = notifier.c
-notifier_LDADD = libckpool.a @JANSSON_LIBS@
+notifier_LDADD = libckpool.a
 
 install-exec-hook:
 	setcap CAP_NET_BIND_SERVICE=+eip $(bindir)/ckpool
