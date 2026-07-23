@@ -82,6 +82,21 @@
 #define __maybe_unused		__attribute__((unused))
 #define uninitialised_var(x) x = x
 
+/* Portable case fallthrough marker: C23 [[fallthrough]] where available,
+ * GCC/Clang attribute on older compilers, and a no-op on anything else. */
+#if defined(__has_c_attribute)
+#  if __has_c_attribute(fallthrough)
+#    define fallthrough [[fallthrough]]
+#  endif
+#endif
+#ifndef fallthrough
+#  if defined(__GNUC__) && __GNUC__ >= 7
+#    define fallthrough __attribute__((fallthrough))
+#  else
+#    define fallthrough ((void)0)
+#  endif
+#endif
+
 #ifndef MAX
 #define MAX(a,b) \
 	({ __typeof__ (a) _a = (a); \
