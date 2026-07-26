@@ -1906,10 +1906,10 @@ int main(int argc, char **argv)
 		if (send_recv_path(path, "ping")) {
 			for (i = 0; i < ckpool.serverurls; i++) {
 				char oldurl[INET6_ADDRSTRLEN], oldport[8];
-				char getfd[16];
+				char getfd[24];
 				int sockd;
 
-				snprintf(getfd, 15, "getxfd%d", i);
+				snprintf(getfd, sizeof(getfd), "getxfd%d", i);
 				sockd = open_unix_client(path);
 				if (sockd < 1)
 					break;
