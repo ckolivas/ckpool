@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <math.h>
 #include <unistd.h>
 
 #include "libckpool.h"
@@ -70,6 +71,40 @@ typedef struct {
 pstats_t allpstats;
 dsps_t alldsps;
 sps_t allsps;
+
+/* Our own persistent state, stored separately from the pool.status we
+ * generate since the accepted/rejected counts we accumulate no longer match
+ * the sum of the pools we read from once any of them has solved a block. */
+#define STATE_VERSION 1
+
+/* An accepted count dropping to less than this fraction of its previous value
+ * is treated as a counter reset from a solved block rather than a pool that
+ * has simply gone backwards. */
+#define RESET_DIVISOR 10
+
+typedef struct {
+	UT_hash_handle hh;
+
+	char *dir;
+	/* Values stored by the last run */
+	int64_t accepted;
+	int64_t rejected;
+	int64_t lastupdate;
+	/* Values read this run */
+	int64_t curaccepted;
+	int64_t currejected;
+	int64_t curlastupdate;
+	double curdiff;
+	bool known;	/* Was in the state file */
+	bool present;	/* Is in the current config */
+} pool_t;
+
+pool_t *pools;
+
+const char *statefile = "ckpoolstats.state";
+int64_t total_accepted, total_rejected;
+double networkdiff;
+bool firstrun = true;
 
 typedef struct {
 	UT_hash_handle hh;
@@ -214,7 +249,236 @@ double dsps_from_key(yyjson_mut_val *sval, const char *key)
 	return ret;
 }
 
-void read_poolstats(FILE *fp)
+pool_t *get_pool(const char *dir)
+{
+	pool_t *pool = NULL;
+
+	HASH_FIND_STR(pools, dir, pool);
+	if (!pool) {
+		pool = ckzalloc(sizeof(pool_t));
+		pool->dir = strdup(dir);
+		HASH_ADD_KEYPTR(hh, pools, pool->dir, strlen(pool->dir), pool);
+	}
+	return pool;
+}
+
+/* Read our own accumulated state from the last run, if any. Leaves firstrun
+ * set if there is no usable state file, in which case we simply summate all
+ * the configs we load. */
+static void read_state(void)
+{
+	yyjson_mut_val *root, *parr, *pval;
+	int64_t version = 0;
+	yyjson_mut_doc *doc;
+	size_t index, max;
+
+	doc = read_json_file(statefile);
+	if (!doc) {
+		log("No state file %s found, summating all configs", statefile);
+		return;
+	}
+	root = yyjson_mut_doc_get_root(doc);
+	json_get_int64(&version, root, "version");
+	if (version != STATE_VERSION) {
+		logerr("State file %s is version %"PRId64" instead of %d, discarding",
+		       statefile, version, STATE_VERSION);
+		goto out;
+	}
+	firstrun = false;
+	json_get_int64(&total_accepted, root, "accepted");
+	json_get_int64(&total_rejected, root, "rejected");
+	json_get_double(&networkdiff, root, "networkdiff");
+	log("Loaded state accepted %"PRId64" rejected %"PRId64" networkdiff %.1f",
+	    total_accepted, total_rejected, networkdiff);
+
+	parr = yyjson_mut_obj_get(root, "pools");
+	if (!parr || !yyjson_mut_is_arr(parr)) {
+		/* Without the per pool baselines we would add every pool's
+		 * entire count to the totals so start over instead. */
+		logerr("No pools array found in state file %s, discarding", statefile);
+		total_accepted = total_rejected = 0;
+		firstrun = true;
+		goto out;
+	}
+	yyjson_mut_arr_foreach(parr, index, max, pval) {
+		yyjson_mut_val *dval = yyjson_mut_obj_get(pval, "dir");
+		const char *dir = yyjson_mut_get_str(dval);
+		pool_t *pool;
+
+		if (!dir) {
+			logerr("No dir entry found in state file pool entry");
+			continue;
+		}
+		pool = get_pool(dir);
+		pool->known = true;
+		json_get_int64(&pool->accepted, pval, "accepted");
+		json_get_int64(&pool->rejected, pval, "rejected");
+		json_get_int64(&pool->lastupdate, pval, "lastupdate");
+		log("Loaded state for pool %s accepted %"PRId64" rejected %"PRId64,
+		    pool->dir, pool->accepted, pool->rejected);
+	}
+out:
+	yyjson_mut_doc_free(doc);
+}
+
+/* Write the state out via a temporary file and rename so an interrupted run
+ * can never leave a truncated state behind. */
+static void write_state(void)
+{
+	yyjson_mut_val *root, *parr;
+	yyjson_mut_doc *doc;
+	pool_t *pool, *tmp;
+	char *tmpfile;
+	tv_t now;
+
+	tv_time(&now);
+	doc = yyjson_mut_pack("{si,sI,sI,sI,sf}",
+		     "version", STATE_VERSION,
+		  "lastupdate", (int64_t)now.tv_sec,
+		    "accepted", total_accepted,
+		    "rejected", total_rejected,
+		 "networkdiff", networkdiff);
+	if (unlikely(!doc))
+		fail("Failed to create state document");
+	root = yyjson_mut_doc_get_root(doc);
+	parr = yyjson_mut_arr(doc);
+	yyjson_mut_obj_add_val(doc, root, "pools", parr);
+
+	HASH_ITER(hh, pools, pool, tmp) {
+		yyjson_mut_val *pval;
+
+		/* Drop any pool no longer in the config from the state */
+		if (!pool->present)
+			continue;
+		pval = yyjson_mut_pack_val(doc, "{ss,sI,sI,sI}",
+			       "dir", pool->dir,
+			  "accepted", pool->accepted,
+			  "rejected", pool->rejected,
+			"lastupdate", pool->lastupdate);
+		if (unlikely(!pval))
+			fail("Failed to create state entry for pool %s", pool->dir);
+		yyjson_mut_arr_add_val(parr, pval);
+	}
+
+	ASPRINTF(&tmpfile, "%s.tmp", statefile);
+	if (!yyjson_mut_write_file(tmpfile, doc, YYJSON_WRITE_PRETTY_TWO_SPACES, NULL, NULL))
+		fail("Failed to write state file %s", tmpfile);
+	if (rename(tmpfile, statefile))
+		fail("Failed to rename %s to %s", tmpfile, statefile);
+	log("Wrote state file %s accepted %"PRId64" rejected %"PRId64,
+	    statefile, total_accepted, total_rejected);
+	free(tmpfile);
+	yyjson_mut_doc_free(doc);
+}
+
+/* A pool zeroes its accepted and rejected counts when it solves a block so a
+ * drop to zero, or close enough to it, tells us a block was found. */
+static bool solved_block(const pool_t *pool)
+{
+	return (pool->curaccepted < pool->accepted &&
+		pool->curaccepted * RESET_DIVISOR < pool->accepted);
+}
+
+/* Accumulate our own running totals from the difference in each pool's counts
+ * since the last run, resetting the totals if any pool solved a block. */
+static void update_totals(void)
+{
+	int64_t deltaacc = 0, deltarej = 0, prevacc = 0, prevrej = 0;
+	bool blocksolved = false;
+	pool_t *pool, *tmp;
+
+	HASH_ITER(hh, pools, pool, tmp) {
+		int64_t dacc, drej;
+
+		if (!pool->present)
+			continue;
+		if (!pool->known) {
+			/* A config we've not seen before contributes all of
+			 * its counts and is tracked from here on. */
+			if (!firstrun) {
+				log("New pool %s adding accepted %"PRId64" rejected %"PRId64,
+				    pool->dir, pool->curaccepted, pool->currejected);
+			}
+			deltaacc += pool->curaccepted;
+			deltarej += pool->currejected;
+			continue;
+		}
+		prevacc += pool->accepted;
+		prevrej += pool->rejected;
+		if (solved_block(pool)) {
+			log("Pool %s accepted dropped from %"PRId64" to %"PRId64", block solved",
+			    pool->dir, pool->accepted, pool->curaccepted);
+			blocksolved = true;
+			/* Everything it has now is since the block */
+			dacc = pool->curaccepted;
+			drej = pool->currejected;
+		} else {
+			dacc = pool->curaccepted - pool->accepted;
+			drej = pool->currejected - pool->rejected;
+			/* Counts should never go backwards otherwise but
+			 * never subtract from our totals if they do. */
+			if (dacc < 0)
+				dacc = 0;
+			if (drej < 0)
+				drej = 0;
+		}
+		deltaacc += dacc;
+		deltarej += drej;
+	}
+
+	if (blocksolved) {
+		/* Discard everything accounted for by the solved block and
+		 * start a new baseline from this run's differences alone. */
+		total_accepted -= prevacc;
+		total_rejected -= prevrej;
+		if (total_accepted < 0)
+			total_accepted = 0;
+		if (total_rejected < 0)
+			total_rejected = 0;
+	}
+	total_accepted += deltaacc;
+	total_rejected += deltarej;
+
+	/* Store this run's counts as the baseline for the next run */
+	HASH_ITER(hh, pools, pool, tmp) {
+		if (!pool->present)
+			continue;
+		pool->accepted = pool->curaccepted;
+		pool->rejected = pool->currejected;
+		pool->lastupdate = pool->curlastupdate;
+	}
+
+	allsps.accepted = total_accepted;
+	allsps.rejected = total_rejected;
+}
+
+/* Each pool stores the proportion of the network difficulty it has found as a
+ * percentage so we can recover the network difficulty it is working on from
+ * its own accepted count, using the pool with the largest percentage for the
+ * best precision, and keeping the last known value if none can be derived. */
+static void update_networkdiff(void)
+{
+	double bestpct = 0, ndiff = 0;
+	pool_t *pool, *tmp;
+
+	HASH_ITER(hh, pools, pool, tmp) {
+		if (!pool->present || pool->curdiff <= 0 || pool->curaccepted < 1)
+			continue;
+		if (pool->curdiff > bestpct) {
+			bestpct = pool->curdiff;
+			ndiff = (double)pool->curaccepted * 100 / pool->curdiff;
+		}
+	}
+	if (ndiff > 0)
+		networkdiff = ndiff;
+	if (networkdiff > 0) {
+		/* Round to 4 significant digits as the pools do */
+		allsps.diff = round(total_accepted * 10000 / networkdiff) / 100;
+	} else
+		logerr("Unable to determine network difficulty from any pool");
+}
+
+void read_poolstats(pool_t *pool, FILE *fp)
 {
 	char *s = alloca(4096), *pstats, *dsps, *sps;
 	pstats_t poolpstats = {};
@@ -239,7 +503,7 @@ void read_poolstats(FILE *fp)
 		fail("Failed to json decode pstats line from pool logfile: %s", pstats);
 	val = yyjson_mut_doc_get_root(doc);
 	json_get_int64(&poolpstats.runtime, val, "runtime");
-	json_get_int64(&poolpstats.lastupdate, val, "lastupdate");
+	pool->curlastupdate = json_get_int64(&poolpstats.lastupdate, val, "lastupdate");
 	allpstats.users += json_get_int64(&poolpstats.users, val, "Users");
 	allpstats.workers += json_get_int64(&poolpstats.workers, val, "Workers");
 	allpstats.idle += json_get_int64(&poolpstats.idle, val, "Idle");
@@ -269,15 +533,17 @@ void read_poolstats(FILE *fp)
 	if (!doc)
 		fail("Failed to json decode sps line from pool logfile: %s", dsps);
 	val = yyjson_mut_doc_get_root(doc);
-	json_get_double(&poolsps.diff, val , "diff");
-	if (poolsps.diff > allsps.diff)
-		allsps.diff = poolsps.diff;
+	/* The pool's diff is the percentage of the network difficulty it has
+	 * found which we recalculate from our own accepted count. */
+	pool->curdiff = json_get_double(&poolsps.diff, val , "diff");
 	allsps.sps1m += json_get_double(&poolsps.sps1m, val, "SPS1m");
 	allsps.sps5m += json_get_double(&poolsps.sps5m, val, "SPS5m");
 	allsps.sps15m += json_get_double(&poolsps.sps15m, val, "SPS15m");
 	allsps.sps1h += json_get_double(&poolsps.sps1h, val, "SPS1h");
-	allsps.accepted += json_get_int64(&poolsps.accepted, val, "accepted");
-	allsps.rejected += json_get_int64(&poolsps.rejected, val, "rejected");
+	/* Accepted and rejected are accumulated in our own state instead of
+	 * being summated as the pools reset them on solving a block. */
+	pool->curaccepted = json_get_int64(&poolsps.accepted, val, "accepted");
+	pool->currejected = json_get_int64(&poolsps.rejected, val, "rejected");
 	json_get_int64(&poolsps.bestshare, val, "bestshare");
 	if (poolsps.bestshare > allsps.bestshare)
 		allsps.bestshare = poolsps.bestshare;
@@ -433,7 +699,7 @@ int main(int argc, char __maybe_unused **argv)
 	char suffix1[16], suffix5[16], suffix15[16], suffix60[16];
 	char suffix360[16], suffix1440[16], suffix10080[16];
 	yyjson_mut_doc *confdoc, *doc;
-	yyjson_mut_val *conf, *dirs, *val;
+	yyjson_mut_val *conf, *dirs, *val, *sval;
 	size_t index, max;
 	FILE *fp;
 	char *s;
@@ -458,23 +724,41 @@ int main(int argc, char __maybe_unused **argv)
 	if (parse_workers)
 		goto workers_only;
 
-	umask(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+	/* umask takes the permission bits to remove so mask off only write
+	 * for other, creating our files 0664. */
+	umask(S_IWOTH);
+
+	sval = yyjson_mut_obj_get(conf, "statefile");
+	if (sval && yyjson_mut_is_str(sval))
+		statefile = yyjson_mut_get_str(sval);
+
+	/* Load our own accumulated stats from the last run, if any */
+	read_state();
 
 	/* Read pool stats from each entry and create allstats */
 	yyjson_mut_arr_foreach(dirs, index, max, val) {
 		const char *dir = yyjson_mut_get_str(val);
+		pool_t *pool;
 
 		log("Found dir entry %s", dir);
+		pool = get_pool(dir);
+		pool->present = true;
 		ASPRINTF(&s, "%s/pool/pool.status", dir);
 		fp = fopen(s, "re");
 		if (fp)
 			log("Opened %s", s);
 		else
 			fail("Failed to open %s", s);
-		read_poolstats(fp);
+		read_poolstats(pool, fp);
 		fclose(fp);
 		free(s);
 	}
+
+	/* Accumulate our own accepted/rejected totals and derive the network
+	 * difficulty percentage from them before writing anything out. */
+	update_totals();
+	update_networkdiff();
+	write_state();
 
 	/* Write pool.status for allstats */
 	if (mkdir("pool", 0750) && errno != EEXIST)
