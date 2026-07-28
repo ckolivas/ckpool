@@ -1,4 +1,4 @@
-AC_INIT([ckpool],[1.1.1],[kernel@kolivas.org])
+AC_INIT([ckpool],[1.2.0],[kernel@kolivas.org])
 
 dnl Must come before anything that expands AC_PROG_CC/AC_PROG_CXX, which is as
 dnl early as AC_USE_SYSTEM_EXTENSIONS below. Autoconf fills in a bare "-g -O2"
