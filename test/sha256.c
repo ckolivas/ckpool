@@ -31,7 +31,7 @@ void test(const unsigned char *input,unsigned int len,const unsigned char *expec
 	}
 }
 
-int main(int, char **)
+int main(void)
 {
 	// Perform a simple test first
 	{

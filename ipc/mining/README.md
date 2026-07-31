@@ -36,13 +36,34 @@ The shim is compiled into `ckpool` only when `configure` detects `capnp-rpc`
 `stratifier.c` is guarded by `#ifdef HAVE_CAPNP`, so ckpool still builds and
 runs as before when Cap'n Proto is absent.
 
-## Status — Phase 1
+## Status
 
-Chain-tip notification only. `mining_ipc.h` exposes `connect`, `disconnect`,
-`get_tip`, `wait_tip_changed`, and `try_obtain_mining`. When the `btcmining`
-config option points at an existing socket, the stratifier drives block updates
-from `Mining.waitTipChanged` instead of ZMQ (with the block-poll thread still
-acting as a backstop). Work is still generated via `getblocktemplate`.
+### Tip notification
 
-Block template generation over IPC (`createNewBlock` / `BlockTemplate` /
-`submitSolution`, replacing the RPC path) is a later phase.
+`mining_ipc.h` exposes `connect`, `disconnect`, `get_tip`, `wait_tip_changed`,
+and `try_obtain_mining`. When the `btcmining` config option points at an
+existing socket, the stratifier drives block updates from
+`Mining.waitTipChanged` instead of ZMQ (with the block-poll thread still
+acting as a backstop).
+
+### Template service (workgen / submit)
+
+`mining_ipc_service_connect` opens a second connection with its own service
+thread. Callers may invoke `create_new_block`, template getters, and
+`submit_solution` from any thread; calls are marshalled onto that thread.
+ckpool stores this as `btc_template_svc` when `ipctemplate` is enabled.
+
+### Phase 2 start — `checkBlock` (SV2 Job Declaration validation)
+
+`mining_ipc_check_block` binds Cap'n Proto `Mining.checkBlock` with
+`BlockCheckOptions` (`check_merkle_root`, `check_pow`). This is the normative
+primitive for validating a fully serialised candidate block before accepting
+custom work (not `testmempoolaccept`).
+
+For JD, ckpool opens a **third** connection (`btc_validation_svc`) so a slow
+`checkBlock` cannot head-of-line-block workgen/submit marshalling. Use
+`mining_check_opts_template()` (PoW off, merkle on) for unpaid templates.
+
+Next Phase 2 steps: assemble candidate blocks from `DeclareMiningJob`, call
+`mining_ipc_check_block` on `btc_validation_svc`, then
+`SetCustomMiningJob` / pool-first switch.

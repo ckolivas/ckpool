@@ -19,7 +19,8 @@
  * tip-notification surface; wider cross-thread use (block template generation)
  * will route calls through the event loop in a later phase.
  *
- * Phase 1 scope: connect, getTip, waitTipChanged, and reconnection.
+ * Scope: tip notification; template service (createNewBlock / submitSolution);
+ * and Mining.checkBlock for SV2 JD candidate-block validation.
  */
 
 #include "mining_ipc.h"
@@ -36,6 +37,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -61,7 +63,10 @@ public:
 
 	kj::Promise<void> getName(GetNameContext context) override
 	{
-		context.getResults().setResult(name_);
+		/* Concrete MessageSize (not empty Maybe/nullptr): GCC -Wmaybe-uninitialized
+		 * false-positives on kj::Maybe copy of an unset MessageSize in getResults. */
+		capnp::MessageSize hint{1, 32};
+		context.getResults(hint).setResult(name_);
 		return kj::READY_NOW;
 	}
 
@@ -74,7 +79,9 @@ public:
 	kj::Promise<void> makeThread(MakeThreadContext context) override
 	{
 		auto name = context.getParams().getName();
-		context.getResults().setResult(mp::Thread::Client(kj::heap<ThreadServer>(name)));
+		/* Concrete MessageSize: see ThreadServer::getName. */
+		capnp::MessageSize hint{1, 64};
+		context.getResults(hint).setResult(mp::Thread::Client(kj::heap<ThreadServer>(name)));
 		return kj::READY_NOW;
 	}
 };
@@ -344,13 +351,16 @@ public:
 		 * attempt this while connected: if the service thread is looping in
 		 * reconnect (not in the event loop) executeSync would block until it
 		 * returned, potentially forever if bitcoind is down. */
+		/* Before reset_caps(), so the keepalive loop this is about to
+		 * unpark sees the stop and returns rather than reconnecting into a
+		 * service that is being destroyed. */
+		stop_.store(true);
 		if (executor_ && connected_.load()) {
 			try {
 				executor_->executeSync([this]() { reset_caps(); });
 			} catch (...) {
 			}
 		}
-		stop_.store(true);
 		/* The service thread runs a kj loop for the process lifetime; detach
 		 * rather than join to avoid blocking on the cross-thread wakeup. */
 		if (thread_.joinable())
@@ -446,6 +456,25 @@ private:
 				auto &timer = io.provider->getTimer();
 				while (!stop_.load()) {
 					timer.afterDelay(5 * kj::SECONDS).wait(ws);
+					/* The wait runs the event loop, so a cross thread
+					 * reset_caps() (destructor) can have landed while we
+					 * were parked. Re-test before touching any cap. */
+					if (stop_.load())
+						break;
+					/*
+					 * Without the Mining capability there is nothing to
+					 * probe with — handshake() leaves mining_ null when
+					 * the node took our connection but was not yet
+					 * serving Mining — so retry obtaining it instead of
+					 * calling through a null cap. This is the "retry on
+					 * the next call" that handshake() promises, and it is
+					 * the same live round trip, so the disconnect
+					 * detection below is not weakened.
+					 */
+					if (!have_mining_.load()) {
+						obtain_mining(ws, init);
+						continue;
+					}
 					/* A live round-trip: returns on success (even during
 					 * IBD), throws if the connection has dropped, which
 					 * unwinds to the reconnect path below. */
@@ -487,8 +516,24 @@ private:
 			exec_thread_ = mk.send().wait(ws).getResult();
 		}
 
-		/* Obtaining Mining may fail while the node is still starting up;
-		 * that is not fatal, we just retry on the next call. */
+		obtain_mining(ws, init);
+	}
+
+	/*
+	 * Obtain the Mining capability, the one part of the handshake that may
+	 * legitimately fail against a node that has accepted our connection but is
+	 * still starting up. That is not fatal: mining_ is left null and
+	 * have_mining_ false, ready() reports not ready so callers fall back, and
+	 * the keepalive loop retries this on its next pass.
+	 *
+	 * A dropped connection is different, and must not be mistaken for a node
+	 * that is merely not ready yet, or the loop would retry forever against a
+	 * dead transport and a restarted bitcoind would go unnoticed. capnp reports
+	 * that as DISCONNECTED, which is rethrown so the caller unwinds to its
+	 * reconnect path.
+	 */
+	void obtain_mining(kj::WaitScope &ws, Init::Client &init)
+	{
 		try {
 			auto req = init.makeMiningRequest();
 			fill_context(req.initContext());
@@ -499,8 +544,14 @@ private:
 			probe.send().wait(ws);
 
 			have_mining_.store(true);
-		} catch (const kj::Exception &) {
+		} catch (const kj::Exception &e) {
+			/* Never leave a half obtained cap behind: the keepalive loop
+			 * decides what to call by have_mining_, and a non-null mining_
+			 * with have_mining_ false would be a cap we never validated. */
+			mining_ = Mining::Client(nullptr);
 			have_mining_.store(false);
+			if (e.getType() == kj::Exception::Type::DISCONNECTED)
+				throw;
 		}
 	}
 
@@ -509,6 +560,17 @@ private:
 	 * the later destruction of a cap dereferences a freed RpcSystem. */
 	void reset_caps()
 	{
+		/*
+		 * Clear the flag before the cap it advertises, and never leave the
+		 * two disagreeing: have_mining_ is what every caller — including
+		 * this thread's own keepalive probe — tests before calling through
+		 * mining_, so a true flag over a null cap is a null dereference.
+		 * The destructor runs this via executeSync on the service thread,
+		 * which can only be inside the event loop, i.e. parked in the
+		 * keepalive wait that is about to probe.
+		 */
+		have_mining_.store(false);
+		connected_.store(false);
 		mining_ = Mining::Client(nullptr);
 		exec_thread_ = mp::Thread::Client(nullptr);
 		callback_thread_ = mp::Thread::Client(nullptr);
@@ -763,6 +825,53 @@ int mining_ipc_template_merkle_path(mining_block_template *t,
 	}
 }
 
+int mining_ipc_template_block(mining_block_template *t, unsigned char **out,
+			      size_t *out_len)
+{
+	if (!t || !out || !out_len)
+		return -1;
+	*out = nullptr;
+	*out_len = 0;
+	auto *h = reinterpret_cast<BlockTemplateHolder *>(t);
+	try {
+		/* The response data is only valid inside the continuation, so copy
+		 * it there — into malloc'd memory, which is not thread affine and
+		 * so may be handed straight back to the (non-kj) caller. */
+		struct BlockBuf {
+			unsigned char *data;
+			size_t len;
+		};
+
+		BlockBuf b = h->svc->run([h]() -> kj::Promise<BlockBuf> {
+			auto req = h->client.getBlockRequest();
+			h->svc->fill_context(req.initContext());
+			return req.send().then([](auto resp) -> BlockBuf {
+				auto data = resp.getResult();
+
+				KJ_REQUIRE(data.size() > 80, "block shorter than a header");
+				KJ_REQUIRE(data.size() <= MINING_MAX_BLOCK_BYTES,
+					   "block exceeds MINING_MAX_BLOCK_BYTES");
+				auto *buf = static_cast<unsigned char *>(malloc(data.size()));
+				KJ_REQUIRE(buf != nullptr, "block allocation failed");
+				memcpy(buf, data.begin(), data.size());
+				return BlockBuf{ buf, data.size() };
+			});
+		});
+		if (!b.data)
+			return -1;
+		*out = b.data;
+		*out_len = b.len;
+		return 0;
+	} catch (...) {
+		return -1;
+	}
+}
+
+void mining_ipc_block_free(unsigned char *block)
+{
+	free(block);
+}
+
 int mining_ipc_submit_solution(mining_block_template *t, uint32_t version,
 			       uint32_t timestamp, uint32_t nonce,
 			       const unsigned char *coinbase, size_t coinbase_len, int *accepted)
@@ -805,6 +914,81 @@ void mining_block_template_destroy(mining_block_template *t)
 	} catch (...) {
 		/* If the service thread is gone we cannot free it cleanly; leak
 		 * rather than risk touching capnp state off-thread. */
+	}
+}
+
+/* --- Phase 2: Mining.checkBlock (JD candidate-block validation) --- */
+
+int mining_ipc_check_block(mining_ipc_service *svc,
+			   const unsigned char *block, size_t block_len,
+			   const mining_block_check_options *options,
+			   int *valid,
+			   char *reason, size_t reason_sz,
+			   char *debug, size_t debug_sz)
+{
+	if (!svc || !block || !block_len || !options || !valid)
+		return -1;
+
+	auto *service = reinterpret_cast<MiningService *>(svc);
+	if (!service->ready())
+		return -1;
+
+	/* Snapshot options for the marshalled lambda (caller may free after return). */
+	const bool check_merkle = options->check_merkle_root != 0;
+	const bool check_pow = options->check_pow != 0;
+
+	try {
+		struct CheckResult {
+			bool ok;
+			std::string reason;
+			std::string debug;
+		};
+
+		/* Copy block bytes before executeSync so the caller's buffer may
+		 * be stack-local and reused; the promise captures the copy. */
+		std::string block_copy(reinterpret_cast<const char *>(block), block_len);
+
+		CheckResult r = service->run([service, block_copy, check_merkle, check_pow]()
+					     -> kj::Promise<CheckResult> {
+			auto req = service->mining().checkBlockRequest();
+			service->fill_context(req.initContext());
+			req.setBlock(kj::arrayPtr(
+				reinterpret_cast<const capnp::byte *>(block_copy.data()),
+				block_copy.size()));
+			auto opts = req.initOptions();
+			opts.setCheckMerkleRoot(check_merkle);
+			opts.setCheckPow(check_pow);
+			return req.send().then([](auto resp) -> CheckResult {
+				CheckResult out;
+				out.ok = resp.getResult();
+				auto reason_t = resp.getReason();
+				auto debug_t = resp.getDebug();
+				out.reason = std::string(reason_t.cStr(), reason_t.size());
+				out.debug = std::string(debug_t.cStr(), debug_t.size());
+				return out;
+			});
+		});
+
+		*valid = r.ok ? 1 : 0;
+		if (reason && reason_sz) {
+			if (r.reason.empty())
+				reason[0] = '\0';
+			else {
+				std::snprintf(reason, reason_sz, "%s", r.reason.c_str());
+				reason[reason_sz - 1] = '\0';
+			}
+		}
+		if (debug && debug_sz) {
+			if (r.debug.empty())
+				debug[0] = '\0';
+			else {
+				std::snprintf(debug, debug_sz, "%s", r.debug.c_str());
+				debug[debug_sz - 1] = '\0';
+			}
+		}
+		return 0;
+	} catch (...) {
+		return -1;
 	}
 }
 

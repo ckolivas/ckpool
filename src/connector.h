@@ -10,6 +10,8 @@
 #ifndef CONNECTOR_H
 #define CONNECTOR_H
 
+#include "config.h"
+
 int64_t connector_newclientid(void);
 void connector_upstream_msg(char *msg);
 void _connector_add_yymessage(yyjson_mut_doc *doc, const char *file,
@@ -19,5 +21,11 @@ void _connector_add_yymessage(yyjson_mut_doc *doc, const char *file,
 char *connector_stats(void *data, const int runtime);
 void connector_send_fd(const int fdno, const int sockd);
 void *connector(void *arg);
+
+#ifdef HAVE_SV2
+/* Queue a plaintext SV2 frame (header+payload) to client_id. Noise encrypt
+ * runs on the connector sender-shard thread only. Takes ownership of plain. */
+void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen);
+#endif
 
 #endif /* CONNECTOR_H */

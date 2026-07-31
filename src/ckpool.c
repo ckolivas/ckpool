@@ -30,6 +30,9 @@
 #include "generator.h"
 #include "stratifier.h"
 #include "connector.h"
+#ifdef HAVE_SV2
+#include "sv2_jdc.h"
+#endif
 
 ckpool_t ckpool;
 static volatile sig_atomic_t ckpool_shutdown;
@@ -223,8 +226,10 @@ ckmsgq_t *create_ckmsgqs(const char *name, const void *func, const int count)
 }
 
 /* Generic function for adding messages to a ckmsgq linked list and signal the
- * ckmsgq parsing thread(s) to wake up and process it. */
-bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, const char *file, const char *func, const int line)
+ * ckmsgq parsing thread(s) to wake up and process it. head adds to the head
+ * of the queue for high priority work. */
+bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, bool head, const char *file, const char *func,
+		 const int line)
 {
 	ckmsg_t *msg;
 
@@ -243,7 +248,10 @@ bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, const char *file, const char *fun
 
 	mutex_lock(ckmsgq->lock);
 	ckmsgq->messages++;
-	DL_APPEND(ckmsgq->msgs, msg);
+	if (head)
+		DL_PREPEND(ckmsgq->msgs, msg);
+	else
+		DL_APPEND(ckmsgq->msgs, msg);
 	pthread_cond_broadcast(ckmsgq->cond);
 	mutex_unlock(ckmsgq->lock);
 
@@ -794,8 +802,9 @@ static yyjson_doc *_yyjson_rpc_call(connsock_t *cs, const char *rpc_req, const b
 		ASPRINTF(&warning, "Zero length rpc_req passed to %s", __func__);
 		goto out;
 	}
-	http_req = ckalloc(len + 256); // Leave room for headers
-	sprintf(http_req,
+	/* ASPRINTF sizes for auth/url/port of any length; avoids fixed
+	 * ckalloc+sprintf and the null-destination format-overflow warning. */
+	ASPRINTF(&http_req,
 		 "POST / HTTP/1.1\r\n"
 		 "Authorization: Basic %s\r\n"
 		 "Host: %s:%s\r\n"
@@ -1360,12 +1369,14 @@ static void parse_proxies(yyjson_val *arr_val, const int arr_size)
 	ckpool.proxyurl = ckzalloc(sizeof(char *) * arr_size);
 	ckpool.proxyauth = ckzalloc(sizeof(char *) * arr_size);
 	ckpool.proxypass = ckzalloc(sizeof(char *) * arr_size);
+	ckpool.proxyjds = ckzalloc(sizeof(char *) * arr_size);
 	for (i = 0; i < arr_size; i++) {
 		val = yyjson_arr_get(arr_val, i);
 		json_get_configstring(&ckpool.proxyurl[i], val, "url");
 		json_get_configstring(&ckpool.proxyauth[i], val, "auth");
 		if (!yyjson_obj_get_string(&ckpool.proxypass[i], val, "pass"))
 			ckpool.proxypass[i] = strdup("");
+		yyjson_obj_get_string(&ckpool.proxyjds[i], val, "jds");
 	}
 }
 
@@ -1390,6 +1401,10 @@ static bool parse_serverurls(yyjson_val *arr_val)
 	ckpool.server_highdiff = ckzalloc(sizeof(bool) * arr_size);
 	ckpool.nodeserver = ckzalloc(sizeof(bool) * arr_size);
 	ckpool.trusted = ckzalloc(sizeof(bool) * arr_size);
+#ifdef HAVE_SV2
+	ckpool.server_sv2 = ckzalloc(sizeof(bool) * arr_size);
+	ckpool.server_sv2_jd = ckzalloc(sizeof(bool) * arr_size);
+#endif
 	for (i = 0; i < arr_size; i++) {
 		yyjson_val *val = yyjson_arr_get(arr_val, i);
 
@@ -1400,6 +1415,188 @@ static bool parse_serverurls(yyjson_val *arr_val)
 out:
 	return ret;
 }
+
+#ifdef HAVE_SV2
+/* Parse an array of URL strings into *urls / *nurls (like serverurl). */
+static bool parse_sv2_urllist(yyjson_val *arr_val, char ***urls, int *nurls,
+			     const char *name)
+{
+	int arr_size, i;
+
+	if (!arr_val)
+		return false;
+	if (!yyjson_is_arr(arr_val)) {
+		LOGINFO("Unable to parse %s entries as an array", name);
+		return false;
+	}
+	arr_size = yyjson_arr_size(arr_val);
+	if (!arr_size) {
+		LOGWARNING("%s array empty", name);
+		return false;
+	}
+	*nurls = arr_size;
+	*urls = ckalloc(sizeof(char *) * arr_size);
+	for (i = 0; i < arr_size; i++) {
+		yyjson_val *val = yyjson_arr_get(arr_val, i);
+
+		if (!_yyjson_get_string(&(*urls)[i], val, name))
+			LOGWARNING("Invalid %s entry number %d", name, i);
+	}
+	return true;
+}
+
+static void free_sv2_urllist(char ***urls, int *nurls)
+{
+	int i;
+
+	if (*urls) {
+		for (i = 0; i < *nurls; i++)
+			dealloc((*urls)[i]);
+		dealloc(*urls);
+	}
+	*nurls = 0;
+}
+
+/* Grow bool parallel arrays to new_n, zero-filling any new slots. */
+static bool *grow_bools(bool *old, int old_n, int new_n)
+{
+	bool *p = ckzalloc(sizeof(bool) * new_n);
+
+	if (old && old_n > 0)
+		memcpy(p, old, sizeof(bool) * ((old_n < new_n) ? old_n : new_n));
+	free(old);
+	return p;
+}
+
+#ifdef HAVE_SV2
+/*
+ * SV2 mining/JD *server* binds are allowed only in normal pool mode or
+ * btcsolo. All proxy-family modes set ckpool.proxy (proxy, userproxy,
+ * passthrough, node, redirector). Upstream SV2 as a *client* (ckproxy) is
+ * independent of this.
+ */
+static bool sv2_server_listen_allowed(void)
+{
+	return !ckpool.proxy;
+}
+#endif
+
+/* True if host means "all interfaces" for clash purposes. */
+static bool listen_host_is_wildcard(const char *host)
+{
+	if (!host || !host[0])
+		return true;
+	if (!strcmp(host, "0.0.0.0") || !strcmp(host, "*") || !strcmp(host, "::") ||
+	    !strcmp(host, "[::]"))
+		return true;
+	return false;
+}
+
+/*
+ * Ensure no two serverurl[] entries fight for the same listen port on
+ * overlapping hosts (exact host match, or either side is 0.0.0.0/::).
+ * Call after SV1 + SV2/JD urls are merged. Aborts on clash.
+ */
+static void check_listen_port_clashes(void)
+{
+	int i, j;
+
+	for (i = 0; i < ckpool.serverurls; i++) {
+		char *host_i = NULL, *port_i = NULL;
+		int p_i;
+
+		if (!ckpool.serverurl[i] || !ckpool.serverurl[i][0])
+			continue;
+		if (!extract_sockaddr(ckpool.serverurl[i], &host_i, &port_i)) {
+			LOGWARNING("Cannot parse listen URL for clash check: %s",
+				   ckpool.serverurl[i]);
+			continue;
+		}
+		p_i = atoi(port_i);
+		for (j = i + 1; j < ckpool.serverurls; j++) {
+			char *host_j = NULL, *port_j = NULL;
+			int p_j;
+			bool clash;
+
+			if (!ckpool.serverurl[j] || !ckpool.serverurl[j][0])
+				continue;
+			if (!extract_sockaddr(ckpool.serverurl[j], &host_j, &port_j)) {
+				LOGWARNING("Cannot parse listen URL for clash check: %s",
+					   ckpool.serverurl[j]);
+				continue;
+			}
+			p_j = atoi(port_j);
+			clash = false;
+			if (p_i > 0 && p_i == p_j) {
+				if (listen_host_is_wildcard(host_i) ||
+				    listen_host_is_wildcard(host_j) ||
+				    !strcasecmp(host_i, host_j))
+					clash = true;
+			}
+			if (clash) {
+				quit(0, "Listen port clash: \"%s\" and \"%s\" both "
+				     "use port %d (use distinct ports for SV1 "
+				     "serverurl / SV2 sv2url / SV2 sv2jdurl, "
+				     "defaults 3333 / 3336 / 3337)",
+				     ckpool.serverurl[i], ckpool.serverurl[j], p_i);
+			}
+			dealloc(host_j);
+			dealloc(port_j);
+		}
+		dealloc(host_i);
+		dealloc(port_i);
+	}
+}
+
+/* Append SV2 mining (jd=false) or JD (jd=true) binds onto serverurl[]. */
+static void append_sv2_serverurls(char **urls, int nurl, bool jd, int defport)
+{
+	int i, n, total, added = 0;
+
+	if (!urls || nurl <= 0)
+		return;
+	if (!sv2_server_listen_allowed()) {
+		LOGWARNING("Not binding SV2 %s: server listen is pool/solo only",
+			   jd ? "Job Declaration" : "mining");
+		return;
+	}
+
+	n = ckpool.serverurls;
+	total = n + nurl;
+	ckpool.serverurl = realloc(ckpool.serverurl, sizeof(char *) * total);
+	ckpool.server_highdiff = grow_bools(ckpool.server_highdiff, n, total);
+	ckpool.nodeserver = grow_bools(ckpool.nodeserver, n, total);
+	ckpool.trusted = grow_bools(ckpool.trusted, n, total);
+	ckpool.server_sv2 = grow_bools(ckpool.server_sv2, n, total);
+	ckpool.server_sv2_jd = grow_bools(ckpool.server_sv2_jd, n, total);
+
+	for (i = 0; i < nurl; i++) {
+		char *url;
+		int idx;
+
+		if (!urls[i] || !urls[i][0]) {
+			LOGWARNING("Empty SV2 %s entry %d, skipping",
+				   jd ? "jdurl" : "url", i);
+			continue;
+		}
+		if (!strchr(urls[i], ':'))
+			ASPRINTF(&url, "%s:%d", urls[i], defport);
+		else
+			url = strdup(urls[i]);
+		idx = n + added;
+		ckpool.serverurl[idx] = url;
+		ckpool.server_highdiff[idx] = false;
+		ckpool.nodeserver[idx] = false;
+		ckpool.trusted[idx] = false;
+		ckpool.server_sv2[idx] = true;
+		ckpool.server_sv2_jd[idx] = jd;
+		added++;
+		LOGWARNING("SV2 %s listen enabled on %s",
+			   jd ? "Job Declaration" : "mining", url);
+	}
+	ckpool.serverurls = n + added;
+}
+#endif
 
 static void parse_nodeservers(yyjson_val *arr_val)
 {
@@ -1545,6 +1742,13 @@ static void parse_config(void)
 			ckpool.serverurl = ckalloc(sizeof(char *));
 			ckpool.serverurl[0] = url;
 			ckpool.serverurls = 1;
+			ckpool.server_highdiff = ckzalloc(sizeof(bool));
+			ckpool.nodeserver = ckzalloc(sizeof(bool));
+			ckpool.trusted = ckzalloc(sizeof(bool));
+#ifdef HAVE_SV2
+			ckpool.server_sv2 = ckzalloc(sizeof(bool));
+			ckpool.server_sv2_jd = ckzalloc(sizeof(bool));
+#endif
 		}
 	}
 	arr_val = yyjson_obj_get(json_conf, "nodeserver");
@@ -1576,6 +1780,44 @@ static void parse_config(void)
 	yyjson_obj_get_string(&ckpool.zmqblock, json_conf, "zmqblock");
 	yyjson_obj_get_string(&ckpool.ipcmining, json_conf, "ipcmining");
 	yyjson_obj_get_bool(&ckpool.ipctemplate, json_conf, "ipctemplate");
+#ifdef HAVE_SV2
+	/* Prefer array form (like serverurl); fall back to a single string. */
+	arr_val = yyjson_obj_get(json_conf, "sv2url");
+	if (!parse_sv2_urllist(arr_val, &ckpool.sv2url, &ckpool.sv2urls, "sv2url")) {
+		if (yyjson_obj_get_string(&url, json_conf, "sv2url")) {
+			ckpool.sv2url = ckalloc(sizeof(char *));
+			ckpool.sv2url[0] = url;
+			ckpool.sv2urls = 1;
+		}
+	}
+	arr_val = yyjson_obj_get(json_conf, "sv2jdurl");
+	if (!parse_sv2_urllist(arr_val, &ckpool.sv2jdurl, &ckpool.sv2jdurls, "sv2jdurl")) {
+		if (yyjson_obj_get_string(&url, json_conf, "sv2jdurl")) {
+			ckpool.sv2jdurl = ckalloc(sizeof(char *));
+			ckpool.sv2jdurl[0] = url;
+			ckpool.sv2jdurls = 1;
+		}
+	}
+	yyjson_obj_get_string(&ckpool.sv2_authority_key, json_conf, "sv2_authority_key");
+	yyjson_obj_get_string(&ckpool.sv2_static_key, json_conf, "sv2_static_key");
+	/*
+	 * SV2 *server* listen (sv2url / sv2jdurl) is pool or btcsolo only.
+	 * Proxy, userproxy, passthrough, node, and redirector all set
+	 * ckpool.proxy — drop SV2 binds there (upstream SV2 client is separate).
+	 */
+	if (!sv2_server_listen_allowed()) {
+		if (ckpool.sv2urls) {
+			LOGWARNING("Ignoring sv2url: SV2 server listen is pool/solo only "
+				   "(not proxy/passthrough/node/redirector/userproxy)");
+			free_sv2_urllist(&ckpool.sv2url, &ckpool.sv2urls);
+		}
+		if (ckpool.sv2jdurls) {
+			LOGWARNING("Ignoring sv2jdurl: SV2 server listen is pool/solo only "
+				   "(not proxy/passthrough/node/redirector/userproxy)");
+			free_sv2_urllist(&ckpool.sv2jdurl, &ckpool.sv2jdurls);
+		}
+	}
+#endif
 
 	yyjson_doc_free(doc);
 }
@@ -1634,6 +1876,7 @@ static struct option long_options[] = {
 	{"quiet",	no_argument,		0,	'q'},
 	{"redirector",	no_argument,		0,	'R'},
 	{"sockdir",	required_argument,	0,	's'},
+	{"testconfig",	no_argument,		0,	'T'},
 	{"trusted",	no_argument,		0,	't'},
 	{"userproxy",	no_argument,		0,	'u'},
 	{0, 0, 0, 0}
@@ -1655,6 +1898,169 @@ static bool send_recv_path(const char *path, const char *msg)
 		LOGWARNING("Received no response to %s request", msg);
 	Close(sockd);
 	return ret;
+}
+
+/*
+ * Port from a "host:port" serverurl, taken lexically so no name resolution is
+ * needed. Handles the bracketed [::1]:port ipv6 form as well. 0 if unparseable.
+ */
+static int port_from_serverurl(const char *serverurl)
+{
+	const char *colon;
+
+	if (!serverurl)
+		return 0;
+	colon = strrchr(serverurl, ':');
+	if (!colon)
+		return 0;
+	return atoi(colon + 1);
+}
+
+/*
+ * Report every setting that has been resolved from the config file, the
+ * command line and the built in defaults. Printed to stdout rather than the
+ * log since the point is to diff two binaries' interpretation of the same
+ * config file, so the format is one stable "key = value" line per setting.
+ */
+/*
+ * Job Declaration client config sanity. A "jds" entry
+ * needs an SV2 mining URL on the same entry, a mining IPC socket for local
+ * templates, and an IPC-capable build. Fail here rather than discovering it
+ * as a dead JD path at runtime.
+ *
+ * Whether the mining URL really is SV2 (valid base58check authority key) is
+ * settled by the generator's proxy_parse_sv2_url(); only an explicitly SV1
+ * scheme can be rejected this early.
+ */
+static void validate_jd_config(void)
+{
+	int i;
+
+	if (!ckpool.proxyjds)
+		return;
+	for (i = 0; i < ckpool.proxies; i++) {
+		const char *url = ckpool.proxyurl[i];
+
+		if (!ckpool.proxyjds[i])
+			continue;
+		if (!ckpool.proxy) {
+			quit(1, "proxy[%d] has a jds entry but %s is not running as a proxy",
+			     i, ckpool.name);
+		}
+#ifndef HAVE_CAPNP
+		quit(1, "proxy[%d] has a jds entry but this build has no mining IPC support "
+		     "(configure could not find capnp-rpc)", i);
+#endif
+		if (!url)
+			quit(1, "proxy[%d] has a jds entry but no url", i);
+		if (!strncasecmp(url, "stratum+tcp://", 14) || !strncasecmp(url, "stratum://", 10)) {
+			quit(1, "proxy[%d] jds requires an SV2 (stratum2+tcp://) url, not %s",
+			     i, url);
+		}
+		if (!ckpool.ipcmining) {
+			quit(1, "proxy[%d] has a jds entry but no ipcmining socket is configured; "
+			     "job declaration builds templates from the Bitcoin Core mining IPC",
+			     i);
+		}
+	}
+}
+
+static void report_config(void)
+{
+	int i;
+
+	printf("mode = %s\n", ckpool.proxy ? (ckpool.userproxy ? "userproxy" :
+		ckpool.passthrough ? (ckpool.node ? "node" : "passthrough") :
+		ckpool.redirector ? "redirector" : "proxy") :
+		ckpool.btcsolo ? "btcsolo" : "pool");
+	printf("name = %s\n", ckpool.name);
+	printf("config = %s\n", ckpool.config ? ckpool.config : "(none)");
+	printf("trusted_remote = %d\n", ckpool.remote);
+	printf("sv2_compiled = %d\n",
+#ifdef HAVE_SV2
+	       1
+#else
+	       0
+#endif
+	       );
+
+	printf("btcaddress = %s\n", ckpool.btcaddress ? ckpool.btcaddress : "(none)");
+	printf("btcsig = %s\n", ckpool.btcsig ? ckpool.btcsig : "(none)");
+	printf("donation = %.2f\n", ckpool.donation);
+
+	printf("mindiff = %"PRId64"\n", ckpool.mindiff);
+	printf("startdiff = %"PRId64"\n", ckpool.startdiff);
+	printf("highdiff = %"PRId64"\n", ckpool.highdiff);
+	printf("maxdiff = %"PRId64"\n", ckpool.maxdiff);
+	printf("nonce1length = %d\n", ckpool.nonce1length);
+	printf("nonce2length = %d\n", ckpool.nonce2length);
+	printf("update_interval = %d\n", ckpool.update_interval);
+	printf("blockpoll = %d\n", ckpool.blockpoll);
+	printf("dropidle = %d\n", ckpool.dropidle);
+	/* Resolved against the open file limit after this point, 0 = automatic. */
+	printf("maxclients = %d\n", ckpool.maxclients);
+
+	printf("logdir = %s\n", ckpool.logdir);
+	printf("socket_dir = %s\n", ckpool.socket_dir);
+	printf("loglevel = %d\n", ckpool.loglevel);
+	printf("logshares = %d\n", ckpool.logshares);
+	printf("zmqblock = %s\n", ckpool.zmqblock);
+
+	printf("btcds = %d\n", ckpool.btcds);
+	for (i = 0; i < ckpool.btcds; i++) {
+		printf("btcdurl[%d] = %s notify=%d\n", i,
+		       ckpool.btcdurl[i] ? ckpool.btcdurl[i] : "(null)",
+		       ckpool.btcdnotify ? ckpool.btcdnotify[i] : 0);
+	}
+
+	printf("serverurls = %d\n", ckpool.serverurls);
+	for (i = 0; i < ckpool.serverurls; i++) {
+		const char *kind = "sv1";
+		bool highdiff;
+
+#ifdef HAVE_SV2
+		if (ckpool.server_sv2 && ckpool.server_sv2[i]) {
+			if (ckpool.server_sv2_jd && ckpool.server_sv2_jd[i])
+				kind = "sv2jd";
+			else
+				kind = "sv2";
+		}
+#endif
+		/*
+		 * server_highdiff[] is not populated until the connector binds
+		 * its listening sockets, which a config test never reaches, so
+		 * apply the same rule it does rather than report the zeroed
+		 * array. Keep the two in step: see connector().
+		 */
+		highdiff = ckpool.server_highdiff && ckpool.server_highdiff[i];
+		if (port_from_serverurl(ckpool.serverurl[i]) > 4000)
+			highdiff = true;
+		printf("serverurl[%d] = %s type=%s highdiff=%d node=%d trusted=%d\n", i,
+		       ckpool.serverurl[i] ? ckpool.serverurl[i] : "(null)", kind,
+		       highdiff,
+		       ckpool.nodeserver ? ckpool.nodeserver[i] : 0,
+		       ckpool.trusted ? ckpool.trusted[i] : 0);
+	}
+#ifdef HAVE_SV2
+	printf("sv2urls = %d\n", ckpool.sv2urls);
+	printf("sv2jdurls = %d\n", ckpool.sv2jdurls);
+	if (ckpool.sv2urls || ckpool.sv2jdurls) {
+		printf("sv2_authority_key = %s\n", ckpool.sv2_authority_key);
+		printf("sv2_static_key = %s\n", ckpool.sv2_static_key);
+	}
+#endif
+	printf("upstream = %s\n", ckpool.upstream ? ckpool.upstream : "(none)");
+	printf("ipcmining = %s\n", ckpool.ipcmining ? ckpool.ipcmining : "(none)");
+	printf("ipctemplate = %d\n", ckpool.ipctemplate);
+	printf("proxies = %d\n", ckpool.proxies);
+	for (i = 0; i < ckpool.proxies; i++) {
+		printf("proxyurl[%d] = %s jds=%s\n", i, ckpool.proxyurl[i],
+		       ckpool.proxyjds && ckpool.proxyjds[i] ? ckpool.proxyjds[i] : "(none)");
+	}
+	printf("redirecturls = %d\n", ckpool.redirecturls);
+	for (i = 0; i < ckpool.redirecturls; i++)
+		printf("redirecturl[%d] = %s:%s\n", i, ckpool.redirecturl[i],
+		       ckpool.redirectport[i]);
 }
 
 int main(int argc, char **argv)
@@ -1679,7 +2085,7 @@ int main(int argc, char **argv)
 	if (!strcmp(appname, "ckproxy"))
 		ckpool.proxy = true;
 
-	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRS:s:tu", long_options, &i)) != -1) {
+	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRS:s:Ttu", long_options, &i)) != -1) {
 		switch (c) {
 			case 'B':
 				if (ckpool.proxy)
@@ -1758,6 +2164,11 @@ int main(int argc, char **argv)
 			case 's':
 				ckpool.socket_dir = strdup(optarg);
 				break;
+			case 'T':
+				ckpool.testconfig = true;
+				/* Make the config aborts that pass status 0 fail */
+				quit_zero_is_failure = true;
+				break;
 			case 't':
 				if (ckpool.proxy)
 					quit(1, "Cannot set a proxy type and trusted remote mode");
@@ -1809,9 +2220,12 @@ int main(int argc, char **argv)
 	/* Ignore sigpipe */
 	signal(SIGPIPE, SIG_IGN);
 
-	ret = mkdir(ckpool.socket_dir, 0750);
-	if (ret && errno != EEXIST)
-		quit(1, "Failed to make directory %s", ckpool.socket_dir);
+	/* A config test must not leave anything behind on the filesystem. */
+	if (!ckpool.testconfig) {
+		ret = mkdir(ckpool.socket_dir, 0750);
+		if (ret && errno != EEXIST)
+			quit(1, "Failed to make directory %s", ckpool.socket_dir);
+	}
 
 	parse_config();
 	/* Set defaults if not found in config file */
@@ -1856,20 +2270,118 @@ int main(int argc, char **argv)
 		ckpool.update_interval = 30;
 	if (!ckpool.mindiff)
 		ckpool.mindiff = 1;
+	/* Modern default; match shipped example confs. Override with "startdiff". */
 	if (!ckpool.startdiff)
-		ckpool.startdiff = 42;
+		ckpool.startdiff = 10000;
 	if (!ckpool.highdiff)
 		ckpool.highdiff = 1000000;
 	if (!ckpool.logdir)
 		ckpool.logdir = strdup("logs");
-	if (!ckpool.serverurls)
-		ckpool.serverurl = ckzalloc(sizeof(char *));
+#ifdef HAVE_SV2
+	/* Append each SV2 mining / JD bind onto serverurl[] (default ports
+	 * 3336 / 3337 — must not collide with serverurl SV1 ports).
+	 * SV2-only configs need no serverurl (SV1) entries. */
+	append_sv2_serverurls(ckpool.sv2url, ckpool.sv2urls, false, 3336);
+	append_sv2_serverurls(ckpool.sv2jdurl, ckpool.sv2jdurls, true, 3337);
+	/*
+	 * SV2 has no version-mask advertisement: NewExtendedMiningJob's
+	 * version_rolling_allowed grants every BIP320 general-purpose bit
+	 * (0x1fffe000), and clients cannot be told about a narrower policy the
+	 * way SV1 mining.configure does. Shares rolling bits outside the mask
+	 * are rejected invalid-share, so a narrowed mask silently costs SV2
+	 * miners work. Warn loudly; version_mask == 0 refuses
+	 * REQUIRES_VERSION_ROLLING clients outright at SetupConnection instead.
+	 */
+	if ((ckpool.sv2urls || ckpool.sv2jdurls) && ckpool.version_mask &&
+	    ckpool.version_mask != 0x1fffe000) {
+		LOGWARNING("version_mask 0x%08x is narrower than BIP320 0x1fffe000: "
+			   "SV2 clients are granted all BIP320 bits by version_rolling_allowed "
+			   "and cannot learn the narrower mask — shares rolling excluded bits "
+			   "will be rejected", ckpool.version_mask);
+	}
+	/*
+	 * Default Noise key paths when not set in the conf file.
+	 * socket_dir is /tmp/<name>/ (name from -n, else "ckpool") unless -s
+	 * overrides it — so keys land at e.g. /tmp/ckpool/sv2_authority.key.
+	 */
+	if (ckpool.sv2urls || ckpool.sv2jdurls) {
+		if (!ckpool.sv2_authority_key || !ckpool.sv2_authority_key[0]) {
+			dealloc(ckpool.sv2_authority_key);
+			ASPRINTF(&ckpool.sv2_authority_key, "%ssv2_authority.key",
+				 ckpool.socket_dir);
+			LOGNOTICE("SV2 authority key defaulting to %s",
+				  ckpool.sv2_authority_key);
+		}
+		if (!ckpool.sv2_static_key || !ckpool.sv2_static_key[0]) {
+			dealloc(ckpool.sv2_static_key);
+			ASPRINTF(&ckpool.sv2_static_key, "%ssv2_static.key",
+				 ckpool.socket_dir);
+			LOGNOTICE("SV2 static key defaulting to %s",
+				  ckpool.sv2_static_key);
+		}
+	}
+#endif
+	/*
+	 * Listen endpoints: serverurl (SV1) and/or sv2url/sv2jdurl (SV2).
+	 * Either family alone is enough. Only when nothing is configured do
+	 * we default to a single SV1 bind on 0.0.0.0:3333 (3334 in proxy).
+	 */
+	if (!ckpool.serverurls) {
+		int port = ckpool.proxy ? 3334 : 3333;
+
+		ckpool.serverurl = ckalloc(sizeof(char *));
+		ASPRINTF(&ckpool.serverurl[0], "0.0.0.0:%d", port);
+		ckpool.serverurls = 1;
+		ckpool.server_highdiff = ckzalloc(sizeof(bool));
+		ckpool.nodeserver = ckzalloc(sizeof(bool));
+		ckpool.trusted = ckzalloc(sizeof(bool));
+#ifdef HAVE_SV2
+		ckpool.server_sv2 = ckzalloc(sizeof(bool));
+		ckpool.server_sv2_jd = ckzalloc(sizeof(bool));
+#endif
+		LOGWARNING("No serverurl/sv2url configured, defaulting SV1 listen to %s",
+			   ckpool.serverurl[0]);
+	}
+	/*
+	 * Fail early if two listens would bind the same host:port (or the same
+	 * port with a wildcard 0.0.0.0/:: host). Covers SV1 vs SV2 vs JD and
+	 * duplicate entries within one family.
+	 */
+	check_listen_port_clashes();
+	for (i = 0; i < ckpool.serverurls; i++) {
+		const char *kind = "SV1";
+
+#ifdef HAVE_SV2
+		if (ckpool.server_sv2 && ckpool.server_sv2[i]) {
+			if (ckpool.server_sv2_jd && ckpool.server_sv2_jd[i])
+				kind = "SV2 Job Declaration";
+			else
+				kind = "SV2 mining";
+		}
+#endif
+		LOGWARNING("Configured serverurl[%d]: %s (%s)",
+			   i, ckpool.serverurl[i] ? ckpool.serverurl[i] : "(null)",
+			   kind);
+	}
 	if (ckpool.proxy && !ckpool.proxies)
 		quit(0, "No proxy entries found in config file %s", ckpool.config);
+	validate_jd_config();
 	if (ckpool.redirector && !ckpool.redirecturls)
 		quit(0, "No redirect entries found in config file %s", ckpool.config);
 	if (!ckpool.zmqblock)
 		ckpool.zmqblock = "tcp://127.0.0.1:28332";
+
+	/*
+	 * Everything reachable without touching the filesystem, the network or
+	 * an already running instance has now been parsed, defaulted and
+	 * validated, so this is as far as a config test can go.
+	 */
+	if (ckpool.testconfig) {
+		report_config();
+		LOGWARNING("Configuration check of %s passed",
+			   ckpool.config ? ckpool.config : "defaults");
+		exit(0);
+	}
 
 	/* Create the log directory */
 	trail_slash(&ckpool.logdir);
@@ -1989,6 +2501,9 @@ int main(int argc, char **argv)
 	 * request. */
 	ckpool.shutdown = true;
 	stratifier_shutdown_ipc();
+#ifdef HAVE_SV2
+	sv2_jdc_stop();
+#endif
 
 	clean_up();
 

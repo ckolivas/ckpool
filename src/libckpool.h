@@ -115,54 +115,71 @@ typedef unsigned char uchar;
 typedef struct timeval tv_t;
 typedef struct timespec ts_t;
 
+/* memcpy-based so buffers need not be naturally aligned (SV2 frames, etc.) */
+static inline uint32_t read_u32(const void *p)
+{
+	uint32_t v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline void write_u32(void *p, uint32_t v)
+{
+	memcpy(p, &v, sizeof(v));
+}
+
+static inline uint64_t read_u64(const void *p)
+{
+	uint64_t v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline void write_u64(void *p, uint64_t v)
+{
+	memcpy(p, &v, sizeof(v));
+}
+
 static inline void swap_256(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
+	int i;
 
-	dest[0] = src[7];
-	dest[1] = src[6];
-	dest[2] = src[5];
-	dest[3] = src[4];
-	dest[4] = src[3];
-	dest[5] = src[2];
-	dest[6] = src[1];
-	dest[7] = src[0];
+	for (i = 0; i < 8; i++)
+		write_u32(dest + i * 4, read_u32(src + (7 - i) * 4));
 }
 
 static inline void bswap_256(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
+	int i;
 
-	dest[0] = bswap_32(src[7]);
-	dest[1] = bswap_32(src[6]);
-	dest[2] = bswap_32(src[5]);
-	dest[3] = bswap_32(src[4]);
-	dest[4] = bswap_32(src[3]);
-	dest[5] = bswap_32(src[2]);
-	dest[6] = bswap_32(src[1]);
-	dest[7] = bswap_32(src[0]);
+	for (i = 0; i < 8; i++)
+		write_u32(dest + i * 4, bswap_32(read_u32(src + (7 - i) * 4)));
 }
 
 static inline void flip_32(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
 	int i;
 
 	for (i = 0; i < 8; i++)
-		dest[i] = bswap_32(src[i]);
+		write_u32(dest + i * 4, bswap_32(read_u32(src + i * 4)));
 }
 
 static inline void flip_80(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
 	int i;
 
 	for (i = 0; i < 20; i++)
-		dest[i] = bswap_32(src[i]);
+		write_u32(dest + i * 4, bswap_32(read_u32(src + i * 4)));
 }
 
 #define cond_wait(_cond, _lock) _cond_wait(_cond, _lock, __FILE__, __func__, __LINE__)
@@ -254,13 +271,18 @@ void logmsg(int loglevel, const char *fmt, ...);
 	exit(status); \
 } while (0)
 
+/* Many configuration aborts pass status 0. Set this for a config test run so
+ * they exit non zero instead and the check can be used from a script. It is
+ * false everywhere else, leaving every existing exit status untouched. */
+extern bool quit_zero_is_failure;
+
 #define quit(status, fmt, ...) do { \
 	if (fmt) { \
 		fprintf(stderr, fmt, ##__VA_ARGS__); \
 		fprintf(stderr, "\n"); \
 		fflush(stderr); \
 	} \
-	exit(status); \
+	exit((status) ? (status) : (quit_zero_is_failure ? 1 : 0)); \
 } while (0)
 
 #define PAGESIZE (4096)
@@ -608,6 +630,11 @@ int safecmp(const char *a, const char *b);
 bool cmdmatch(const char *buf, const char *cmd);
 
 int address_to_txn(char *p2h, const char *addr, const bool script, const bool segwit);
+bool txn_to_address(char *addr, const size_t alen, const uchar *script, const int slen,
+		    const char *ref);
+int coinbase_payout_script(uchar *script, int *slen, int64_t *value, const uchar *cb1,
+			   const int cb1len, const int holelen, const uchar *cb2,
+			   const int cb2len);
 int ser_number(uchar *s, int32_t val);
 int get_sernumber(uchar *s);
 bool fulltest(const uchar *hash, const uchar *target);

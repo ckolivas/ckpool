@@ -105,4 +105,13 @@ void _stratifier_add_yyrecv(yyjson_mut_doc *doc, const char *file, const char *f
 #define stratifier_add_yyrecv(val) _stratifier_add_yyrecv(doc, __FILE__, __func__, __LINE__)
 void *stratifier(void *arg);
 
+/*
+ * Enqueue work onto the shared share processor (sshareq).
+ * is_sv2 false: payload is json_params_t * (SV1 mining.submit).
+ * is_sv2 true:  payload is opaque SV2 share job (sv2_strat owns layout);
+ *               processed via sv2_strat_process_share_job.
+ * Takes ownership of payload on success; caller frees payload if false.
+ */
+bool stratifier_queue_share_work(bool is_sv2, void *payload);
+
 #endif /* STRATIFIER_H */

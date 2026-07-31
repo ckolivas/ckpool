@@ -41,6 +41,9 @@
 #define UNIX_PATH_MAX 108
 #endif
 
+/* Only ever set by ckpool's --testconfig; see the quit() macro. */
+bool quit_zero_is_failure;
+
 /* We use a weak function as a simple printf within the library that can be
  * overridden by however the outside executable wishes to do its logging. */
 void __attribute__((weak)) logmsg(int __maybe_unused loglevel, const char *fmt, ...)
@@ -1800,6 +1803,343 @@ int address_to_txn(char *p2h, const char *addr, const bool script, const bool se
 	return address_to_pubkeytxn(p2h, addr);
 }
 
+static const char b58_charset[] =
+	"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/* base58check(ver || hash20) — the inverse of the b58tobin() the *_to_txn()
+ * functions above rely on. */
+static bool b58check_encode(char *out, const size_t outsz, const uint8_t ver,
+			    const uchar *hash20)
+{
+	uchar payload[25], check[32], digits[40] = {};
+	int digitslen = 1, zeros = 0, i, j;
+	char *p = out;
+
+	payload[0] = ver;
+	memcpy(&payload[1], hash20, 20);
+	gen_hash(payload, check, 21);
+	memcpy(&payload[21], check, 4);
+
+	while (zeros < 25 && !payload[zeros])
+		zeros++;
+	for (i = zeros; i < 25; i++) {
+		unsigned int carry = payload[i];
+
+		for (j = 0; j < digitslen; j++) {
+			carry += (unsigned int)digits[j] << 8;
+			digits[j] = carry % 58;
+			carry /= 58;
+		}
+		while (carry) {
+			digits[digitslen++] = carry % 58;
+			carry /= 58;
+		}
+	}
+	while (digitslen > 0 && !digits[digitslen - 1])
+		digitslen--;
+	if ((size_t)(zeros + digitslen) >= outsz)
+		return false;
+	for (i = 0; i < zeros; i++)
+		*p++ = '1';
+	for (j = digitslen; j > 0; j--)
+		*p++ = b58_charset[digits[j - 1]];
+	*p = '\0';
+	return true;
+}
+
+/*
+ * Version byte of a base58check address, or -1 if s is not one. The charset,
+ * length and checksum are all verified here because b58tobin() assumes a string
+ * that has already been checked, and because the whole point of asking is that
+ * s may be an arbitrary worker name.
+ */
+static int b58check_version(const char *s)
+{
+	uchar bin[25], check[32];
+	int len, i;
+
+	if (!s)
+		return -1;
+	len = strlen(s);
+	/*
+	 * 25 bytes is at most 35 base58 digits - which is what a 0xc4 version
+	 * (testnet P2SH) takes - and fewer as the leading byte shrinks. Anything
+	 * longer cannot be a 25 byte payload, and b58tobin() has nowhere to put it.
+	 */
+	if (len < 26 || len > 35)
+		return -1;
+	for (i = 0; i < len; i++) {
+		if (!memchr(b58_charset, s[i], sizeof(b58_charset) - 1))
+			return -1;
+	}
+	b58tobin((char *)bin, s);
+	gen_hash(bin, check, 21);
+	if (memcmp(check, &bin[21], 4))
+		return -1;
+	return bin[0];
+}
+
+static const char bech32_charset[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+static uint32_t bech32_polymod_step(const uint32_t pre)
+{
+	uint8_t b = pre >> 25;
+
+	return ((pre & 0x1ffffff) << 5) ^
+		(-((b >> 0) & 1) & 0x3b6a57b2UL) ^
+		(-((b >> 1) & 1) & 0x26508e6dUL) ^
+		(-((b >> 2) & 1) & 0x1ea119faUL) ^
+		(-((b >> 3) & 1) & 0x3d4233ddUL) ^
+		(-((b >> 4) & 1) & 0x2a1462b3UL);
+}
+
+/*
+ * Whether s is a bech32 or bech32m string under hrp. The prefix alone cannot
+ * tell an address from a worker name that happens to begin with it, so the
+ * checksum decides.
+ */
+static bool bech32_hrp_is(const char *s, const char *hrp)
+{
+	size_t hrplen = strlen(hrp), len, i;
+	uint32_t chk = 1;
+
+	if (!s)
+		return false;
+	len = strlen(s);
+	/* hrp, separator, at least a version char, and the 6 checksum chars. */
+	if (len < hrplen + 8 || len > 90)
+		return false;
+	if (strncasecmp(s, hrp, hrplen) || s[hrplen] != '1')
+		return false;
+	for (i = 0; i < hrplen; i++)
+		chk = bech32_polymod_step(chk) ^ (hrp[i] >> 5);
+	chk = bech32_polymod_step(chk);
+	for (i = 0; i < hrplen; i++)
+		chk = bech32_polymod_step(chk) ^ (hrp[i] & 0x1f);
+	for (i = hrplen + 1; i < len; i++) {
+		char c = s[i] >= 'A' && s[i] <= 'Z' ? s[i] + ('a' - 'A') : s[i];
+		const char *pos = memchr(bech32_charset, c, sizeof(bech32_charset) - 1);
+
+		if (!pos)
+			return false;
+		chk = bech32_polymod_step(chk) ^ (uint32_t)(pos - bech32_charset);
+	}
+	/* bech32 (witness v0) and bech32m (v1+) differ only in the constant. */
+	return chk == 1 || chk == 0x2bc830a3;
+}
+
+/* Inverse of the convert_bits() above: 8 bit groups to 5. */
+static int convert_bits_to5(uint8_t *out, const uchar *in, int inlen)
+{
+	uint32_t val = 0;
+	int bits = 0, outlen = 0;
+
+	while (inlen--) {
+		val = (val << 8) | *(in++);
+		bits += 8;
+		while (bits >= 5) {
+			bits -= 5;
+			out[outlen++] = (val >> bits) & 0x1f;
+		}
+	}
+	if (bits)
+		out[outlen++] = (val << (5 - bits)) & 0x1f;
+	return outlen;
+}
+
+/* xorval is 1 for bech32 (witness v0) and 0x2bc830a3 for bech32m (v1+). */
+static bool bech32_encode(char *out, const size_t outsz, const char *hrp,
+			  const uint8_t *data, const int datalen, const uint32_t xorval)
+{
+	size_t hrplen = strlen(hrp), i;
+	uint32_t chk = 1;
+	char *p = out;
+
+	if (hrplen + 1 + datalen + 6 >= outsz)
+		return false;
+	for (i = 0; i < hrplen; i++)
+		chk = bech32_polymod_step(chk) ^ (hrp[i] >> 5);
+	chk = bech32_polymod_step(chk);
+	for (i = 0; i < hrplen; i++)
+		chk = bech32_polymod_step(chk) ^ (hrp[i] & 0x1f);
+	memcpy(p, hrp, hrplen);
+	p += hrplen;
+	*p++ = '1';
+	for (i = 0; i < (size_t)datalen; i++) {
+		chk = bech32_polymod_step(chk) ^ data[i];
+		*p++ = bech32_charset[data[i]];
+	}
+	for (i = 0; i < 6; i++)
+		chk = bech32_polymod_step(chk);
+	chk ^= xorval;
+	for (i = 0; i < 6; i++)
+		*p++ = bech32_charset[(chk >> ((5 - i) * 5)) & 0x1f];
+	*p = '\0';
+	return true;
+}
+
+/* Convert a standard scriptPubKey back to the address that it pays, the inverse
+ * of address_to_txn(). A script does not say which chain it belongs to, so the
+ * chain is taken from ref, an address we already know (typically our own payout
+ * address); mainnet is assumed if ref is not an address, or is one on mainnet.
+ * Returns false, and leaves addr untouched, for anything that is not P2PKH,
+ * P2SH or a witness program - only ever used for logging, so callers can fall
+ * back to the hex. */
+bool txn_to_address(char *addr, const size_t alen, const uchar *script, const int slen,
+		    const char *ref)
+{
+	/* A witness program is at most a 40 byte push, which is 64 groups of 5
+	 * bits, plus the version. */
+	uint8_t p2pkh = 0x00, p2sh = 0x05, data[72];
+	const char *hrp = "bc";
+	int datalen, plen, ver;
+
+	/*
+	 * Which chain ref names, but only once ref is known to be an address at
+	 * all: it is whatever we authorise as, which is a payout address only
+	 * against a solo pool and a worker name against any other. A name that
+	 * merely begins with m, n, 2 or "tb1" must not be read as testnet, or the
+	 * very log line this exists to let an operator check would name an address
+	 * on the wrong chain. Base58 does not distinguish testnet from regtest, so
+	 * only a bech32 ref can select the latter.
+	 */
+	if (ref && *ref) {
+		int refver = b58check_version(ref);
+
+		if (bech32_hrp_is(ref, "bcrt")) {
+			hrp = "bcrt";
+			p2pkh = 0x6f;
+			p2sh = 0xc4;
+		} else if (bech32_hrp_is(ref, "tb") || refver == 0x6f || refver == 0xc4) {
+			/* Testnet and signet share their prefixes. */
+			hrp = "tb";
+			p2pkh = 0x6f;
+			p2sh = 0xc4;
+		}
+	}
+	if (slen == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 &&
+	    script[23] == 0x88 && script[24] == 0xac)
+		return b58check_encode(addr, alen, p2pkh, script + 3);
+	if (slen == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87)
+		return b58check_encode(addr, alen, p2sh, script + 2);
+
+	/* Witness program: version opcode, then a single 2-40 byte push. */
+	if (slen < 4)
+		return false;
+	if (script[0] && (script[0] < 0x51 || script[0] > 0x60))
+		return false;
+	ver = script[0] ? script[0] - 0x50 : 0;
+	plen = script[1];
+	if (plen < 2 || plen > 40 || plen != slen - 2)
+		return false;
+	/* v0 is only defined for P2WPKH and P2WSH. */
+	if (!ver && plen != 20 && plen != 32)
+		return false;
+	data[0] = ver;
+	datalen = 1 + convert_bits_to5(&data[1], script + 2, plen);
+	return bech32_encode(addr, alen, hrp, data, datalen, ver ? 0x2bc830a3 : 1);
+}
+
+/* Read a bitcoin varint, advancing *p, refusing to read past end. */
+static bool read_varint(uint64_t *val, const uchar **p, const uchar *end)
+{
+	const uchar *s = *p;
+	int i;
+
+	if (s >= end)
+		return false;
+	switch (*s) {
+		case 0xfd:
+			if (end - s < 3)
+				return false;
+			*val = (uint64_t)s[1] | ((uint64_t)s[2] << 8);
+			*p = s + 3;
+			return true;
+		case 0xfe:
+			if (end - s < 5)
+				return false;
+			*val = 0;
+			for (i = 0; i < 4; i++)
+				*val |= (uint64_t)s[1 + i] << (8 * i);
+			*p = s + 5;
+			return true;
+		case 0xff:
+			if (end - s < 9)
+				return false;
+			*val = 0;
+			for (i = 0; i < 8; i++)
+				*val |= (uint64_t)s[1 + i] << (8 * i);
+			*p = s + 9;
+			return true;
+		default:
+			*val = *s;
+			*p = s + 1;
+			return true;
+	}
+}
+
+/* Find the output being paid in a coinbase that arrives split either side of the
+ * extranonce hole, which is how both an SV1 mining.notify and an SV2 extended
+ * job deliver one. holelen is the total number of bytes that go in the hole
+ * (enonce1 + enonce2), needed because the scriptSig may continue into cb2 past
+ * it. The largest value output is taken as the payout; its scriptPubKey is
+ * copied to script and *slen updated, its value to value. Returns the number of
+ * outputs, or -1 if the coinbase does not parse or the payout does not fit in
+ * *slen bytes - callers get either the real payout or nothing. */
+int coinbase_payout_script(uchar *script, int *slen, int64_t *value, const uchar *cb1,
+			   const int cb1len, const int holelen, const uchar *cb2,
+			   const int cb2len)
+{
+	const uchar *p = cb1, *end = cb1 + cb1len, *best = NULL;
+	uint64_t siglen, count, olen, bestlen = 0;
+	int64_t bestval = -1;
+	int sigleft, i, j;
+
+	/* cb1: nVersion, exactly one input, its null outpoint, then the scriptSig
+	 * length and however much of the scriptSig precedes the hole. */
+	if (cb1len < 42 || cb2len < 5 || holelen < 0)
+		return -1;
+	p += 4;
+	if (*p++ != 1)
+		return -1;
+	p += 36;
+	if (!read_varint(&siglen, &p, end) || siglen > (uint64_t)0x100)
+		return -1;
+	sigleft = (int)siglen - (int)(end - p) - holelen;
+	if (sigleft < 0 || sigleft + 4 > cb2len)
+		return -1;
+
+	/* cb2: the rest of the scriptSig, nSequence, the outputs, nLockTime. */
+	p = cb2 + sigleft + 4;
+	end = cb2 + cb2len;
+	if (!read_varint(&count, &p, end) || !count || count > 0x100)
+		return -1;
+	for (i = 0; i < (int)count; i++) {
+		int64_t val = 0;
+
+		if (end - p < 8)
+			return -1;
+		for (j = 0; j < 8; j++)
+			val |= (int64_t)p[j] << (8 * j);
+		p += 8;
+		if (!read_varint(&olen, &p, end) || (uint64_t)(end - p) < olen)
+			return -1;
+		if (val > bestval) {
+			bestval = val;
+			bestlen = olen;
+			best = p;
+		}
+		p += olen;
+	}
+	/* nLockTime, and nothing after it. */
+	if (end - p != 4 || !best || !bestlen || bestlen > (uint64_t)*slen)
+		return -1;
+	memcpy(script, best, bestlen);
+	*slen = bestlen;
+	*value = bestval;
+	return (int)count;
+}
+
 /*  For encoding nHeight into coinbase, return how many bytes were used */
 int ser_number(uchar *s, int32_t val)
 {
@@ -1837,14 +2177,12 @@ int get_sernumber(uchar *s)
 /* For testing a le encoded 256 byte hash against a target */
 bool fulltest(const uchar *hash, const uchar *target)
 {
-	uint32_t *hash32 = (uint32_t *)hash;
-	uint32_t *target32 = (uint32_t *)target;
 	bool ret = true;
 	int i;
 
 	for (i = 28 / 4; i >= 0; i--) {
-		uint32_t h32tmp = le32toh(hash32[i]);
-		uint32_t t32tmp = le32toh(target32[i]);
+		uint32_t h32tmp = le32toh(read_u32(hash + i * 4));
+		uint32_t t32tmp = le32toh(read_u32(target + i * 4));
 
 		if (h32tmp > t32tmp) {
 			ret = false;
@@ -2097,20 +2435,12 @@ static const double bits64 = 18446744073709551616.0;
 /* Converts a little endian 256 bit value to a double */
 double le256todouble(const uchar *target)
 {
-	uint64_t *data64;
 	double dcut64;
 
-	data64 = (uint64_t *)(target + 24);
-	dcut64 = le64toh(*data64) * bits192;
-
-	data64 = (uint64_t *)(target + 16);
-	dcut64 += le64toh(*data64) * bits128;
-
-	data64 = (uint64_t *)(target + 8);
-	dcut64 += le64toh(*data64) * bits64;
-
-	data64 = (uint64_t *)(target);
-	dcut64 += le64toh(*data64);
+	dcut64 = le64toh(read_u64(target + 24)) * bits192;
+	dcut64 += le64toh(read_u64(target + 16)) * bits128;
+	dcut64 += le64toh(read_u64(target + 8)) * bits64;
+	dcut64 += le64toh(read_u64(target));
 
 	return dcut64;
 }
@@ -2118,20 +2448,12 @@ double le256todouble(const uchar *target)
 /* Converts a big endian 256 bit value to a double */
 double be256todouble(const uchar *target)
 {
-	uint64_t *data64;
 	double dcut64;
 
-	data64 = (uint64_t *)(target);
-	dcut64 = be64toh(*data64) * bits192;
-
-	data64 = (uint64_t *)(target + 8);
-	dcut64 += be64toh(*data64) * bits128;
-
-	data64 = (uint64_t *)(target + 16);
-	dcut64 += be64toh(*data64) * bits64;
-
-	data64 = (uint64_t *)(target + 24);
-	dcut64 += be64toh(*data64);
+	dcut64 = be64toh(read_u64(target)) * bits192;
+	dcut64 += be64toh(read_u64(target + 8)) * bits128;
+	dcut64 += be64toh(read_u64(target + 16)) * bits64;
+	dcut64 += be64toh(read_u64(target + 24));
 
 	return dcut64;
 }
@@ -2182,7 +2504,7 @@ double diff_from_nbits(char *nbits)
 
 void target_from_diff(uchar *target, double diff)
 {
-	uint64_t *data64, h64;
+	uint64_t h64;
 	double d64, dcut64;
 
 	if (unlikely(diff == 0.0)) {
@@ -2196,31 +2518,27 @@ void target_from_diff(uchar *target, double diff)
 
 	dcut64 = d64 / bits192;
 	h64 = dcut64;
-	data64 = (uint64_t *)(target + 24);
-	*data64 = htole64(h64);
+	write_u64(target + 24, htole64(h64));
 	dcut64 = h64;
 	dcut64 *= bits192;
 	d64 -= dcut64;
 
 	dcut64 = d64 / bits128;
 	h64 = dcut64;
-	data64 = (uint64_t *)(target + 16);
-	*data64 = htole64(h64);
+	write_u64(target + 16, htole64(h64));
 	dcut64 = h64;
 	dcut64 *= bits128;
 	d64 -= dcut64;
 
 	dcut64 = d64 / bits64;
 	h64 = dcut64;
-	data64 = (uint64_t *)(target + 8);
-	*data64 = htole64(h64);
+	write_u64(target + 8, htole64(h64));
 	dcut64 = h64;
 	dcut64 *= bits64;
 	d64 -= dcut64;
 
 	h64 = d64;
-	data64 = (uint64_t *)(target);
-	*data64 = htole64(h64);
+	write_u64(target, htole64(h64));
 }
 
 void gen_hash(uchar *data, uchar *hash, int len)
