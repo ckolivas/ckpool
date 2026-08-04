@@ -82,6 +82,11 @@ sps_t allsps;
  * has simply gone backwards. */
 #define RESET_DIVISOR 10
 
+/* Time in seconds since a worker's last share after which the stratifier
+ * stops decaying its stats and drops it from the user file. Workers older
+ * than this have frozen stats so we discard them as well. */
+#define WORKER_EXPIRY 600000
+
 typedef struct {
 	UT_hash_handle hh;
 
@@ -629,21 +634,47 @@ user_t *get_user(const char *username, bool *new)
 	return user;
 }
 
+/* Current time, sampled once at startup as the reference for expiry. */
+static int64_t now_t;
+
+/* Workers whose last share is older than WORKER_EXPIRY have had their stats
+ * frozen by the stratifier so must not be collated. */
+static bool worker_expired(yyjson_mut_val *wval)
+{
+	int64_t lastshare;
+
+	/* Without a lastshare we have no way of telling, so keep it */
+	if (!yyjson_mut_obj_get(wval, "lastshare"))
+		return false;
+	json_get_int64(&lastshare, wval, "lastshare");
+	return (now_t - lastshare > WORKER_EXPIRY);
+}
+
 static void init_worker_hash(user_t *user)
 {
 	yyjson_mut_val *warray = yyjson_mut_obj_get(user->json, "worker");
 	worker_t *worker = NULL;
 	yyjson_mut_val *w;
-	size_t index, max;
+	size_t index = 0;
 
 	if (!warray || !yyjson_mut_is_arr(warray))
 		return;
 
-	yyjson_mut_arr_foreach(warray, index, max, w) {
-		yyjson_mut_val *wn_val = yyjson_mut_obj_get(w, "workername");
-		const char *workername = yyjson_mut_get_str(wn_val);
-		if (!workername)
+	while (index < yyjson_mut_arr_size(warray)) {
+		yyjson_mut_val *wn_val;
+		const char *workername;
+
+		w = yyjson_mut_arr_get(warray, index);
+		if (worker_expired(w)) {
+			yyjson_mut_arr_remove(warray, index);
 			continue;
+		}
+		wn_val = yyjson_mut_obj_get(w, "workername");
+		workername = yyjson_mut_get_str(wn_val);
+		if (!workername) {
+			index++;
+			continue;
+		}
 
 		HASH_FIND_STR(user->workers, workername, worker);
 		if (!worker) {
@@ -652,6 +683,7 @@ static void init_worker_hash(user_t *user)
 			HASH_ADD_STR(user->workers, workername, worker);
 			worker->json = w;   /* points to existing object inside the array */
 		}
+		index++;
 	}
 }
 
@@ -675,6 +707,10 @@ void append_workers(user_t *user, yyjson_mut_val *sval)
 
 		if (!workername)
 			continue;
+		if (worker_expired(val)) {
+			LOGDEBUG("Skipping inactive worker %s", workername);
+			continue;
+		}
 		HASH_FIND_STR(user->workers, workername, worker);
 		if (!worker) {
 			/* Copy the worker into this user's document so it
@@ -704,6 +740,8 @@ int main(int argc, char __maybe_unused **argv)
 	FILE *fp;
 	char *s;
 	int opt;
+
+	now_t = time(NULL);
 
 	while ((opt = getopt(argc, argv, "w")) != -1) {
 		switch (opt) {
