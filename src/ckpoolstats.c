@@ -605,13 +605,22 @@ static void set_maxdouble(yyjson_mut_doc *doc, yyjson_mut_val *sval, yyjson_mut_
 		yyjson_mut_obj_put(sval, yyjson_mut_strcpy(doc, key), yyjson_mut_real(doc, newdval));
 }
 
+static const char *hashrate_keys[] = {
+	"hashrate1m", "hashrate5m", "hashrate1hr", "hashrate1d", "hashrate7d", NULL
+};
+
+static void combine_hashrates(yyjson_mut_doc *doc, yyjson_mut_val *val, yyjson_mut_val *newval)
+{
+	int i;
+
+	for (i = 0; hashrate_keys[i]; i++)
+		add_hashrates(doc, val, newval, hashrate_keys[i]);
+}
+
+/* Hashrates are handled separately since a user's are accumulated from only
+ * those of its workers we keep. */
 static void combine_stats(yyjson_mut_doc *doc, yyjson_mut_val *val, yyjson_mut_val *newval)
 {
-	add_hashrates(doc, val, newval, "hashrate1m");
-	add_hashrates(doc, val, newval, "hashrate5m");
-	add_hashrates(doc, val, newval, "hashrate1hr");
-	add_hashrates(doc, val, newval, "hashrate1d");
-	add_hashrates(doc, val, newval, "hashrate7d");
 	set_maxint(doc, val, newval, "lastshare");
 	add_int(doc, val, newval, "workers");
 	add_int(doc, val, newval, "shares");
@@ -650,6 +659,18 @@ static bool worker_expired(yyjson_mut_val *wval)
 	return (now_t - lastshare > WORKER_EXPIRY);
 }
 
+/* Discard the hashrates from the source file, which include those of the
+ * workers we're dropping, ready to be accumulated from the workers we keep. */
+static void zero_hashrates(user_t *user)
+{
+	int i;
+
+	for (i = 0; hashrate_keys[i]; i++) {
+		yyjson_mut_obj_put(user->json, yyjson_mut_strcpy(user->doc, hashrate_keys[i]),
+				   yyjson_mut_strcpy(user->doc, "0"));
+	}
+}
+
 static void init_worker_hash(user_t *user)
 {
 	yyjson_mut_val *warray = yyjson_mut_obj_get(user->json, "worker");
@@ -660,6 +681,8 @@ static void init_worker_hash(user_t *user)
 	if (!warray || !yyjson_mut_is_arr(warray))
 		return;
 
+	zero_hashrates(user);
+
 	while (index < yyjson_mut_arr_size(warray)) {
 		yyjson_mut_val *wn_val;
 		const char *workername;
@@ -669,6 +692,7 @@ static void init_worker_hash(user_t *user)
 			yyjson_mut_arr_remove(warray, index);
 			continue;
 		}
+		combine_hashrates(user->doc, user->json, w);
 		wn_val = yyjson_mut_obj_get(w, "workername");
 		workername = yyjson_mut_get_str(wn_val);
 		if (!workername) {
@@ -711,6 +735,7 @@ void append_workers(user_t *user, yyjson_mut_val *sval)
 			LOGDEBUG("Skipping inactive worker %s", workername);
 			continue;
 		}
+		combine_hashrates(user->doc, user->json, val);
 		HASH_FIND_STR(user->workers, workername, worker);
 		if (!worker) {
 			/* Copy the worker into this user's document so it
@@ -722,8 +747,10 @@ void append_workers(user_t *user, yyjson_mut_val *sval)
 			HASH_ADD_STR(user->workers, workername, worker);
 			worker->json = copy;
 			yyjson_mut_arr_add_val(vals, copy);
-		} else
+		} else {
+			combine_hashrates(user->doc, worker->json, val);
 			combine_stats(user->doc, worker->json, val);
+		}
 	}
 }
 
