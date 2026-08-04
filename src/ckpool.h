@@ -170,6 +170,11 @@ struct ckpool_instance {
 	int maxclients;
 	/* Drop clients that have been idle for this many seconds, 0 to disable */
 	int dropidle;
+	/* Maximum bytes queued but unsent to one client before dropping it, 0
+	 * to use the per client derived default */
+	int64_t maxsendqueue;
+	/* Maximum distinct users to create from authorisations, 0 to disable */
+	int maxusers;
 
 	/* API message queue */
 	ckmsgq_t *ckpapi;

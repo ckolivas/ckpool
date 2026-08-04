@@ -521,6 +521,12 @@ retry:
 		char blockmsg[80];
 		bool ret;
 
+		/* cmdmatch only checks the prefix, so a short message would
+		 * over-read and write the memset below out of bounds. */
+		if (unlikely(strlen(buf) < 12 + 64 + 1)) {
+			LOGWARNING("Got too short submitblock message");
+			goto retry;
+		}
 		LOGNOTICE("Submitting block data!");
 		ret = submit_block(cs, buf + 12 + 64 + 1);
 		memset(buf + 12 + 64, 0, 1);
@@ -5424,6 +5430,12 @@ retry:
 		char blockmsg[80];
 		bool ret;
 
+		/* cmdmatch only checks the prefix, so a short message would
+		 * over-read and write the memset below out of bounds. */
+		if (unlikely(strlen(buf) < 12 + 64 + 1)) {
+			LOGWARNING("Got too short submitblock message");
+			goto retry;
+		}
 		LOGNOTICE("Submitting likely block solve share from upstream pool");
 		ret = submit_block(cs, buf + 12 + 64 + 1);
 		memset(buf + 12 + 64, 0, 1);

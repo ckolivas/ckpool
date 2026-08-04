@@ -244,7 +244,7 @@ void logmsg(int loglevel, const char *fmt, ...);
 		memcpy(tmp42, BUF + OFFSET, CPY); \
 		logmsg(__lvl, "%s", tmp42);\
 		OFFSET += CPY; \
-		LEN -= OFFSET; \
+		LEN -= CPY; \
 	} \
 	free(BUF); \
 } while(0)
@@ -585,6 +585,10 @@ int _open_unix_client(const char *server_path, const char *file, const char *fun
 int wait_close(int sockd, int timeout);
 int wait_read_select(int sockd, float timeout);
 int read_length(int sockd, void *buf, int len);
+/* Largest message accepted over the unix socket IPC. Control plane messages
+ * are tiny; a block submission carries the full block as hex and is the
+ * largest, at roughly 8MB for a full mainnet block, so leave ample headroom. */
+#define MAX_UNIX_MSGSIZE (64 * 1024 * 1024)
 char *_recv_unix_msg(int sockd, int timeout1, int timeout2, const char *file, const char *func, const int line);
 #define RECV_UNIX_TIMEOUT1 30
 #define RECV_UNIX_TIMEOUT2 5

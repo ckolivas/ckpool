@@ -326,7 +326,13 @@ bool get_blockhash(connsock_t *cs, int height, char *hash)
 		LOGWARNING("Got null string in result to getblockhash");
 		goto out;
 	}
-	strncpy(hash, res_ret, 65);
+	/* Must be an exact length hash or the fixed copy below would leave the
+	 * destination unterminated and later reads would run off the end. */
+	if (unlikely(strlen(res_ret) != 64)) {
+		LOGWARNING("Got invalid length hash %s in result to getblockhash", res_ret);
+		goto out;
+	}
+	strcpy(hash, res_ret);
 	ret = true;
 out:
 	yyjson_doc_free(doc);
@@ -363,7 +369,13 @@ bool get_bestblockhash(connsock_t *cs, char *hash)
 		LOGWARNING("Got null string in result to getbestblockhash");
 		goto out;
 	}
-	strncpy(hash, res_ret, 65);
+	/* Must be an exact length hash or the fixed copy below would leave the
+	 * destination unterminated and later reads would run off the end. */
+	if (unlikely(strlen(res_ret) != 64)) {
+		LOGWARNING("Got invalid length hash %s in result to getbestblockhash", res_ret);
+		goto out;
+	}
+	strcpy(hash, res_ret);
 	ret = true;
 out:
 	yyjson_doc_free(doc);

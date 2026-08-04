@@ -88,8 +88,21 @@ struct client_instance {
 	/* Time this client started blocking, 0 when not blocked */
 	time_t blocked_time;
 
+	/* Time this client was accepted, and whether it has ever delivered a
+	 * complete message. A stratum_instance_t is only created once a whole
+	 * message reaches the stratifier, so a socket that connects and stays
+	 * silent is invisible to the stratifier's unauthorised client reaper
+	 * while still occupying an fd and a maxclients slot. Only the connector
+	 * can see these, so they are reaped here. */
+	time_t accept_time;
+	bool got_msg;
+
 	/* The size of the socket send buffer */
 	int sendbufsize;
+
+	/* Bytes currently queued but not yet written to this client. Only
+	 * modified under the owning csender's lock. */
+	int64_t queued_bytes;
 
 #ifdef HAVE_SV2
 	/* True if accepted on an SV2 listen socket (binary Noise stream). */
@@ -109,6 +122,10 @@ struct sender_send {
 	char *buf;
 	int len;
 	int ofs;
+	/* Length accounted against the client's queued_bytes at queue time.
+	 * len is consumed by partial writes and rewritten by SV2 encryption so
+	 * it cannot be used to reverse the accounting. */
+	int qlen;
 #ifdef HAVE_SV2
 	/* If true, buf is a plaintext SV2 frame; encrypt once on the owning
 	 * sender-shard thread before the first write. */
@@ -323,12 +340,34 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	no_clients = HASH_COUNT(cdata->clients);
 	ck_runlock(&cdata->lock);
 
+	sockd = cdata->serverfd[server];
+
 	if (unlikely(ckpool.maxclients && no_clients >= ckpool.maxclients)) {
-		LOGWARNING("Server full with %d clients", no_clients);
+		static time_t last_full_warn = 0;
+		static int full_suppressed = 0;
+		time_t now_t = time(NULL);
+
+		/* The listen socket is level triggered so leaving the pending
+		 * connection unaccepted makes epoll_wait return immediately
+		 * forever, spinning a core and flooding the log. Accept and
+		 * close it instead so the backlog drains, and rate limit the
+		 * warning. */
+		fd = accept(sockd, NULL, NULL);
+		if (likely(fd >= 0))
+			Close(fd);
+		if (now_t - last_full_warn >= 60) {
+			if (full_suppressed) {
+				LOGWARNING("Server full with %d clients (%d further connections dropped)",
+					   no_clients, full_suppressed);
+			} else
+				LOGWARNING("Server full with %d clients", no_clients);
+			last_full_warn = now_t;
+			full_suppressed = 0;
+		} else
+			full_suppressed++;
 		return 0;
 	}
 
-	sockd = cdata->serverfd[server];
 	client = recruit_client(cdata);
 	client->server = server;
 	client->address = (struct sockaddr *)&client->address_storage;
@@ -339,6 +378,7 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 		 * socket */
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
 			LOGNOTICE("Recoverable error on accept in accept_client");
+			recycle_client(cdata, client);
 			return 0;
 		}
 		LOGERR("Failed to accept on socket %d in acceptor", sockd);
@@ -442,6 +482,7 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	 * removes it automatically from the epoll list. */
 	__inc_instance_ref(client);
 	client->fd = fd;
+	client->accept_time = time(NULL);
 	optlen = sizeof(client->sendbufsize);
 	getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &client->sendbufsize, &optlen);
 	LOGDEBUG("Client sendbufsize detected as %d", client->sendbufsize);
@@ -636,9 +677,25 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yy
 	ck_wunlock(&cdata->lock);
 }
 
+/* The stratifier trusts client_id, address and server as connector generated.
+ * yyjson permits duplicate keys and returns the first match, so a key supplied
+ * by the remote end would shadow the one we append. Remove any existing copies
+ * before adding ours; yyjson_mut_obj_remove_key strips all duplicates of a
+ * name, so one call each is enough. Passthrough messages legitimately carry
+ * the subclient's address from the downstream connector so we only strip that
+ * on the direct client path where we generate it ourselves; srecv_process
+ * validates it in either case. */
+static void strip_reserved_keys(yyjson_mut_val *root, const bool strip_address)
+{
+	yyjson_mut_obj_remove_key(root, "client_id");
+	yyjson_mut_obj_remove_key(root, "server");
+	if (strip_address)
+		yyjson_mut_obj_remove_key(root, "address");
+}
+
 #ifdef HAVE_SV2
 /* Forward decls — defined later in this file. */
-static void queue_sender_send(cdata_t *cdata, const client_instance_t *client,
+static void queue_sender_send(cdata_t *cdata, client_instance_t *client,
 			      sender_send_t *sender_send);
 static void send_client_bin(cdata_t *cdata, client_instance_t *client,
 			    uint8_t *buf, int len);
@@ -674,6 +731,12 @@ static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
 		dealloc(frame_lens);
 		return false;
 	}
+	/* A cleared inflight flag means the Noise handshake completed, so this
+	 * peer has proven it speaks SV2 and is no longer reapable as idle. A
+	 * peer that connects and never completes the handshake keeps its slot
+	 * in the global inflight limit, so it must be reaped. */
+	if (likely(!client->sv2c->hs_inflight))
+		client->got_msg = true;
 	/* Handshake ciphertext — already Noise-framed; do not re-encrypt. */
 	if (reply && reply_len) {
 		sender_send_t *ss = ckzalloc(sizeof(sender_send_t));
@@ -844,15 +907,22 @@ reparse:
 			if (unlikely(!(subclient_id >= 0 && subclient_id < 4294967296.0)))
 				subclient_id = 0;
 			passthrough_id = (client->id << 32) | (int64_t)subclient_id;
-			yyjson_mut_obj_remove_key(root, "client_id");
+			/* Strip only after reading the remotely supplied subclient
+			 * id above, which is a legitimate input on this path. */
+			strip_reserved_keys(root, false);
 			yyjson_mut_obj_add_sint(doc, root, "client_id", passthrough_id);
 		} else {
 			if (ckpool.redirector && !client->redirected && strstr(client->buf, "mining.submit"))
 				parse_redirector_share(cdata, client, root);
+			strip_reserved_keys(root, true);
 			yyjson_mut_obj_add_sint(doc, root, "client_id", client->id);
 			yyjson_mut_obj_add_str(doc, root, "address", client->address_name);
 		}
 		yyjson_mut_obj_add_sint(doc, root, "server", client->server);
+
+		/* This peer has delivered a complete, parseable message so it
+		 * is speaking the protocol and is no longer reapable as idle. */
+		client->got_msg = true;
 
 		/* Do not send messages of clients we've already dropped. We
 		 * do this unlocked as the occasional false negative can be
@@ -892,6 +962,18 @@ static client_instance_t *ref_client_by_id(cdata_t *cdata, int64_t id)
 	ck_wunlock(&cdata->lock);
 
 	return client;
+}
+
+/* Safely drop a client from a context that does not already hold a reference
+ * to it, taking one for the duration. */
+static void drop_client_by_id(cdata_t *cdata, const int64_t id)
+{
+	client_instance_t *client = ref_client_by_id(cdata, id);
+
+	if (unlikely(!client))
+		return;
+	invalidate_client(cdata, client);
+	dec_instance_ref(cdata, client);
 }
 
 static void add_remote_client(cdata_t *cdata, int64_t id)
@@ -990,10 +1072,55 @@ outnoclient:
 	free(event);
 }
 
+/* Seconds a connected socket may go without delivering a single complete
+ * protocol message before it is reaped, matching the stratifier's existing
+ * policy for clients that connect but never authorise. */
+#define IDLE_ACCEPT_TIMEOUT 60
+/* Maximum clients reaped per sweep. Any remainder is caught on the next pass,
+ * which keeps the instance lock held briefly and avoids allocating under it. */
+#define IDLE_REAP_BATCH 128
+
+/* Reap sockets that connected but have never delivered a complete message.
+ * A stratum_instance_t is only created once a whole message reaches the
+ * stratifier, so these are invisible to the stratifier's unauthorised client
+ * reaper while still holding an fd and a maxclients slot - and for SV2, a slot
+ * in the global handshake inflight limit, which dropping the client releases
+ * via sv2_conn_free. */
+static void reap_idle_clients(cdata_t *cdata)
+{
+	int64_t ids[IDLE_REAP_BATCH];
+	client_instance_t *client, *tmp;
+	time_t now_t = time(NULL);
+	int nids = 0, i;
+
+	ck_rlock(&cdata->lock);
+	HASH_ITER(hh, cdata->clients, client, tmp) {
+		if (likely(client->got_msg) || client->invalid)
+			continue;
+		if (likely(now_t - client->accept_time <= IDLE_ACCEPT_TIMEOUT))
+			continue;
+		ids[nids++] = client->id;
+		if (unlikely(nids >= IDLE_REAP_BATCH))
+			break;
+	}
+	ck_runlock(&cdata->lock);
+
+	for (i = 0; i < nids; i++) {
+		client = ref_client_by_id(cdata, ids[i]);
+		if (unlikely(!client))
+			continue;
+		LOGNOTICE("Reaping client id %"PRId64" %s idle without a message for %d seconds",
+			  client->id, client->address_name, IDLE_ACCEPT_TIMEOUT);
+		invalidate_client(cdata, client);
+		dec_instance_ref(cdata, client);
+	}
+}
+
 /* Waits on fds ready to read on from the list stored in conn_instance and
  * handles the incoming messages */
 static void *receiver(void *arg)
 {
+	time_t last_reap = time(NULL);
 	cdata_t *cdata = (cdata_t *)arg;
 	struct epoll_event *event = ckzalloc(sizeof(struct epoll_event));
 	uint64_t serverfds, i;
@@ -1025,10 +1152,19 @@ static void *receiver(void *arg)
 
 	while (42) {
 		uint64_t edu64;
+		time_t now_t;
 
 		while (unlikely(!cdata->accept))
 			cksleep_ms(10);
 		ret = epoll_wait(epfd, event, 1, 1000);
+		/* The epoll timeout gives us a roughly once per second tick to
+		 * sweep idle sockets on without a dedicated thread. Rate limit
+		 * it since a busy pool returns from epoll_wait immediately. */
+		now_t = time(NULL);
+		if (now_t != last_reap) {
+			last_reap = now_t;
+			reap_idle_clients(cdata);
+		}
 		if (unlikely(ret < 1)) {
 			if (unlikely(ret == -1)) {
 				LOGEMERG("FATAL: Failed to epoll_wait in receiver");
@@ -1135,7 +1271,18 @@ out_true:
 
 static void clear_sender_send(sender_send_t *sender_send, cdata_t *cdata)
 {
-	dec_instance_ref(cdata, sender_send->client);
+	client_instance_t *client = sender_send->client;
+	csender_t *cs = &cdata->csenders[(uint64_t)client->id % cdata->nsenders];
+
+	/* Reverse the accounting taken in queue_sender_send under the same
+	 * lock that applied it. */
+	mutex_lock(&cs->lock);
+	client->queued_bytes -= sender_send->qlen;
+	if (unlikely(client->queued_bytes < 0))
+		client->queued_bytes = 0;
+	mutex_unlock(&cs->lock);
+
+	dec_instance_ref(cdata, client);
 	free(sender_send->buf);
 	free(sender_send);
 }
@@ -1194,16 +1341,55 @@ static void *sender(void *arg)
 /* Append a pending send to the shard owning this client (client id modulo
  * nsenders) and wake that sender thread. A given client always maps to the
  * same shard, keeping its send state single-writer. */
-static void queue_sender_send(cdata_t *cdata, const client_instance_t *client,
+/* Bytes queued but unsent to one client before it is considered unable to keep
+ * up and dropped. Node and trusted remote peers legitimately receive far larger
+ * messages than a miner so they get a higher ceiling. Both are overridden by
+ * the maxsendqueue config option. */
+#define DEFAULT_SENDQUEUE_LIMIT (1024 * 1024)
+#define REMOTE_SENDQUEUE_LIMIT (64 * 1024 * 1024)
+
+static int64_t client_sendqueue_limit(const client_instance_t *client)
+{
+	int64_t limit;
+
+	if (ckpool.maxsendqueue > 0)
+		return ckpool.maxsendqueue;
+	if (client->remote || client->passthrough)
+		return REMOTE_SENDQUEUE_LIMIT;
+	/* Scale with the socket send buffer so clients on fat links are not
+	 * penalised, with a floor for the common case. */
+	limit = (int64_t)client->sendbufsize * 4;
+	if (limit < DEFAULT_SENDQUEUE_LIMIT)
+		limit = DEFAULT_SENDQUEUE_LIMIT;
+	return limit;
+}
+
+static void queue_sender_send(cdata_t *cdata, client_instance_t *client,
 			      sender_send_t *sender_send)
 {
 	csender_t *cs = &cdata->csenders[(uint64_t)client->id % cdata->nsenders];
+	int64_t queued;
+
+	sender_send->qlen = sender_send->len;
 
 	mutex_lock(&cs->lock);
 	cs->sends_generated++;
+	client->queued_bytes += sender_send->qlen;
+	queued = client->queued_bytes;
 	DL_APPEND(cs->sends, sender_send);
 	pthread_cond_signal(&cs->cond);
 	mutex_unlock(&cs->lock);
+
+	/* A client that reads just enough to keep resetting the blocked
+	 * timeout can otherwise accumulate queued messages without bound, so
+	 * cap the queue independently of blocked_time. Drop outside the send
+	 * lock as invalidate_client takes the instance lock. */
+	if (unlikely(queued > client_sendqueue_limit(client) && !client->invalid)) {
+		LOGNOTICE("Client id %"PRId64" fd %d %s exceeded send queue limit with %"PRId64
+			  " bytes queued, disconnecting", client->id, client->fd,
+			  client->address_name, queued);
+		drop_client_by_id(cdata, client->id);
+	}
 }
 
 static int add_redirect(cdata_t *cdata, client_instance_t *client)
@@ -1426,6 +1612,7 @@ _send_client_yyjson(cdata_t *cdata, int64_t client_id, yyjson_mut_doc *doc,
 		yyjson_mut_doc *tmp_doc = yyjson_mut_doc_mut_copy(doc, &ckyyalc);
 		yyjson_mut_val *root = yyjson_mut_doc_get_root(tmp_doc);
 
+		strip_reserved_keys(root, true);
 		yyjson_mut_obj_add_sint(tmp_doc, root, "client_id", client_id);
 		yyjson_mut_obj_add_str(tmp_doc, root, "address", client->address_name);
 		yyjson_mut_obj_add_sint(tmp_doc, root, "server", client->server);

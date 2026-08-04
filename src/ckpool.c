@@ -578,11 +578,25 @@ static void clear_bufline(connsock_t *cs)
 	}
 }
 
-static void add_buflen(connsock_t *cs, const char *readbuf, const int len)
+/* Maximum we will buffer from one socket before treating it as hostile or
+ * broken. Only bitcoind RPC and upstream pool connections use a connsock_t;
+ * miners are bounded separately at MAX_MSGSIZE by the connector. A full
+ * mainnet getblocktemplate response is the largest legitimate message here at
+ * roughly 10MB of JSON, so this is deliberately generous - a false positive
+ * costs a template outage while any finite ceiling stops the unbounded growth
+ * an upstream that never sends a newline would otherwise cause. */
+#define MAX_SOCKBUF (64 * 1024 * 1024)
+
+static bool add_buflen(connsock_t *cs, const char *readbuf, const int len)
 {
 	int backoff = 1;
 	int buflen;
 
+	if (unlikely(cs->bufofs + len + 1 > MAX_SOCKBUF)) {
+		LOGWARNING("Oversize message of %d bytes exceeds %d limit in add_buflen",
+			   cs->bufofs + len, MAX_SOCKBUF);
+		return false;
+	}
 	buflen = round_up_page(cs->bufofs + len + 1);
 	while (cs->bufsize < buflen) {
 		char *newbuf = realloc(cs->buf, buflen);
@@ -595,7 +609,11 @@ static void add_buflen(connsock_t *cs, const char *readbuf, const int len)
 		if (backoff == 1)
 			fprintf(stderr, "Failed to realloc %d in read_socket_line, retrying\n", (int)buflen);
 		cksleep_ms(backoff);
-		backoff <<= 1;
+		/* Cap the backoff. Doubling without bound is undefined once it
+		 * overflows and turns a transient allocation failure into
+		 * effectively permanent sleep. */
+		if (backoff < 1000)
+			backoff <<= 1;
 	}
 	/* Increase receive buffer if possible to larger than the largest
 	 * message we're likely to buffer */
@@ -605,6 +623,7 @@ static void add_buflen(connsock_t *cs, const char *readbuf, const int len)
 	memcpy(cs->buf + cs->bufofs, readbuf, len);
 	cs->bufofs += len;
 	cs->buf[cs->bufofs] = '\0';
+	return true;
 }
 
 /* Receive as much data is currently available without blocking into a connsock
@@ -617,7 +636,10 @@ static int recv_available(connsock_t *cs)
 	do {
 		ret = recv(cs->fd, readbuf, PAGESIZE - 4, MSG_DONTWAIT);
 		if (ret > 0) {
-			add_buflen(cs, readbuf, ret);
+			/* Stop as soon as the buffer ceiling is hit rather than
+			 * draining the socket into an ever growing buffer. */
+			if (unlikely(!add_buflen(cs, readbuf, ret)))
+				return -1;
 			len += ret;
 		}
 	} while (ret > 0);
@@ -639,7 +661,12 @@ int read_socket_line(connsock_t *cs, float *timeout)
 	int ret;
 
 	clear_bufline(cs);
-	recv_available(cs); // Intentionally ignore return value
+	/* Only a buffer overflow is fatal here; no data yet is normal and
+	 * returns zero. */
+	if (unlikely(recv_available(cs) < 0)) {
+		ret = -1;
+		goto out;
+	}
 	eom = memchr(cs->buf, '\n', cs->bufofs);
 
 	tv_time(&start);
@@ -1762,6 +1789,8 @@ static void parse_config(void)
 	yyjson_obj_get_int64(&ckpool.maxdiff, json_conf, "maxdiff");
 	yyjson_obj_get_string(&ckpool.logdir, json_conf, "logdir");
 	yyjson_obj_get_int(&ckpool.maxclients, json_conf, "maxclients");
+	yyjson_obj_get_int64(&ckpool.maxsendqueue, json_conf, "maxsendqueue");
+	yyjson_obj_get_int(&ckpool.maxusers, json_conf, "maxusers");
 	yyjson_obj_get_double(&ckpool.donation, json_conf, "donation");
 	/* Avoid dust-sized donations */
 	if (ckpool.donation < 0.1)
@@ -1999,6 +2028,8 @@ static void report_config(void)
 	printf("dropidle = %d\n", ckpool.dropidle);
 	/* Resolved against the open file limit after this point, 0 = automatic. */
 	printf("maxclients = %d\n", ckpool.maxclients);
+	printf("maxsendqueue = %"PRId64"\n", ckpool.maxsendqueue);
+	printf("maxusers = %d\n", ckpool.maxusers);
 
 	printf("logdir = %s\n", ckpool.logdir);
 	printf("socket_dir = %s\n", ckpool.socket_dir);

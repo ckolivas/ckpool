@@ -1060,7 +1060,12 @@ char *_recv_unix_msg(int sockd, int timeout1, int timeout2, const char *file, co
 		goto out;
 	}
 	msglen = le32toh(msglen);
-	if (unlikely(msglen < 1 || msglen > 0x80000000)) {
+	/* Cap the length rather than trusting it. The old 0x80000000 bound
+	 * both allowed a ~2GB allocation per connection and was itself
+	 * inclusive, at which point the (int)msglen comparison below could not
+	 * detect a failed read because read_length returns -1 and -1 < INT_MIN
+	 * is false, so 2GB of zeroes was returned as a valid message. */
+	if (unlikely(msglen < 1 || msglen > MAX_UNIX_MSGSIZE)) {
 		LOGWARNING("Invalid message length %u sent to recv_unix_msg", msglen);
 		goto out;
 	}
@@ -1070,9 +1075,19 @@ char *_recv_unix_msg(int sockd, int timeout1, int timeout2, const char *file, co
 		LOGERR("Select2 failed in recv_unix_msg (%d)", ern);
 		goto out;
 	}
+	/* Bound the body read. It is a blocking MSG_WAITALL loop issued from
+	 * the single threaded accept loops, so a peer that sends a length then
+	 * stalls would otherwise freeze all pool IPC indefinitely. */
+	{
+		struct timeval tv;
+
+		tv.tv_sec = timeout2 > 0 ? timeout2 : 60;
+		tv.tv_usec = 0;
+		setsockopt(sockd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	}
 	buf = ckzalloc(msglen + 1);
 	ret = read_length(sockd, buf, msglen);
-	if (unlikely(ret < (int)msglen)) {
+	if (unlikely(ret < 0 || (uint32_t)ret < msglen)) {
 		ern = errno;
 		LOGERR("Failed to read %u bytes in recv_unix_msg (%d?)", msglen, ern);
 		dealloc(buf);
@@ -1362,7 +1377,11 @@ void *_ckrealloc(void *ptr, size_t size, const char *file, const char *func, con
 			fprintf(stderr, "Failed to realloc %d, retrying from %s %s:%d\n",
 				(int)size, file, func, line);
 		cksleep_ms(backoff);
-		backoff <<= 1;
+		/* Cap the backoff. Doubling without bound is undefined once it
+		 * overflows and turns a transient allocation failure into
+		 * effectively permanent sleep. */
+		if (backoff < 1000)
+			backoff <<= 1;
 	}
 	return new_ptr;
 }
@@ -1398,7 +1417,11 @@ void realloc_strcat(char **ptr, const char *s)
 		if (backoff == 1)
 			fprintf(stderr, "Failed to realloc_strcat %d, retrying\n", (int)len);
 		cksleep_ms(backoff);
-		backoff <<= 1;
+		/* Cap the backoff. Doubling without bound is undefined once it
+		 * overflows and turns a transient allocation failure into
+		 * effectively permanent sleep. */
+		if (backoff < 1000)
+			backoff <<= 1;
 	}
 	*ptr = new_ptr;
 	ofs = *ptr + old;
@@ -1429,7 +1452,11 @@ void *_ckalloc(size_t len, const char *file, const char *func, const int line)
 				(int)len, file, func, line);
 		}
 		cksleep_ms(backoff);
-		backoff <<= 1;
+		/* Cap the backoff. Doubling without bound is undefined once it
+		 * overflows and turns a transient allocation failure into
+		 * effectively permanent sleep. */
+		if (backoff < 1000)
+			backoff <<= 1;
 	}
 	return ptr;
 }
@@ -1450,7 +1477,11 @@ void *_ckzalloc(size_t len, const char *file, const char *func, const int line)
 				(int)len, file, func, line);
 		}
 		cksleep_ms(backoff);
-		backoff <<= 1;
+		/* Cap the backoff. Doubling without bound is undefined once it
+		 * overflows and turns a transient allocation failure into
+		 * effectively permanent sleep. */
+		if (backoff < 1000)
+			backoff <<= 1;
 	}
 	return ptr;
 }
@@ -1599,8 +1630,14 @@ void b58tobin(char *b58bin, const char *b58)
 	memset(bin32, 0, 7 * sizeof(uint32_t));
 	len = strlen((const char *)b58);
 	for (i = 0; i < len; i++) {
-		c = b58[i];
-		c = b58tobin_tbl[c];
+		/* char may be signed and the table only covers up to 'z', so
+		 * bound the index rather than trusting the caller to have
+		 * validated the string. */
+		c = (uint8_t)b58[i];
+		if (unlikely(c >= sizeof(b58tobin_tbl) / sizeof(b58tobin_tbl[0])))
+			c = (uint32_t)-1;
+		else
+			c = b58tobin_tbl[c];
 		for (j = 6; j >= 0; j--) {
 			t = ((uint64_t)bin32[j]) * 58 + c;
 			c = (t & 0x3f00000000ull) >> 32;
@@ -1717,21 +1754,45 @@ static const int8_t charset_rev[128] = {
 
 /* It's assumed that there is no chance of sending invalid chars to these
  * functions as they should have been checked beforehand. */
-static void bech32_decode(uint8_t *data, int *data_len, const char *input)
+/* Decode the data part of a bech32 address into data, which must be at least
+ * data_size bytes. Returns false without writing anything if the input cannot
+ * be a valid bech32 string. Callers currently only reach this after bitcoind
+ * has validated the address, but this must not depend on that: without the
+ * length and separator checks a long input containing no '1' yields a negative
+ * hrp_len and writes far past the end of the caller's buffer. */
+static bool bech32_decode(uint8_t *data, const int data_size, int *data_len,
+			  const char *input)
 {
-	int input_len = strlen(input), hrp_len, i;
+	int input_len = strlen(input), hrp_len, dlen, i;
+	const char *sep;
 
 	*data_len = 0;
-	while (*data_len < input_len && input[(input_len - 1) - *data_len] != '1')
-		++(*data_len);
-	hrp_len = input_len - (1 + *data_len);
-	*(data_len) -= 6;
-	for (i = hrp_len + 1; i < input_len; i++) {
-		int v = (input[i] & 0x80) ? -1 : charset_rev[(int)input[i]];
+	/* BIP173 caps the whole string at 90 characters. */
+	if (unlikely(input_len < 8 || input_len > 90))
+		return false;
+	/* The separator is the last '1' in the string, and there must be one
+	 * with a human readable part before it and a checksum after it. */
+	sep = strrchr(input, '1');
+	if (unlikely(!sep))
+		return false;
+	hrp_len = sep - input;
+	dlen = input_len - (hrp_len + 1);
+	/* The data part carries a 6 character checksum we do not return. */
+	if (unlikely(hrp_len < 1 || dlen < 6))
+		return false;
+	dlen -= 6;
+	if (unlikely(dlen > data_size))
+		return false;
+	for (i = 0; i < dlen; i++) {
+		char c = input[hrp_len + 1 + i];
+		int v = (c & 0x80) ? -1 : charset_rev[(int)c];
 
-		if (i + 6 < input_len)
-			data[i - (1 + hrp_len)] = v;
+		if (unlikely(v < 0))
+			return false;
+		data[i] = v;
 	}
+	*data_len = dlen;
+	return true;
 }
 
 static void convert_bits(char *out, int *outlen, const uint8_t *in,
@@ -1783,7 +1844,10 @@ static int segaddress_to_txn(char *p2h, const char *addr)
 	char *witdata = &p2h[2];
 	uint8_t data[84];
 
-	bech32_decode(data, &data_len, addr);
+	if (unlikely(!bech32_decode(data, sizeof(data), &data_len, addr) || data_len < 1)) {
+		LOGWARNING("Failed to decode bech32 address %s in segaddress_to_txn", addr);
+		return 0;
+	}
 	p2h[0] = data[0];
 	/* Witness version is > 0 */
 	if (p2h[0])

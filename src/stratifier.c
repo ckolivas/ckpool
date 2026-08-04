@@ -3844,9 +3844,11 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 
 	client->id = id;
 	client->session_id = ++sdata->session_id;
-	strcpy(client->address, address);
-	/* Sanity check to not overflow lookup in ckpool.serverurl[] */
-	if (server >= ckpool.serverurls)
+	snprintf(client->address, sizeof(client->address), "%s", address);
+	/* Sanity check to not overflow lookup in ckpool.serverurl[]. A negative
+	 * index would read before the allocation in the trusted[]/nodeserver[]
+	 * checks as well, so bound both ends. */
+	if (server < 0 || server >= ckpool.serverurls)
 		server = 0;
 	client->server = server;
 	client->diff = client->old_diff = ckpool.startdiff;
@@ -5831,11 +5833,17 @@ static user_instance_t *__create_user(sdata_t *sdata, const char *username)
 }
 
 
-/* Find user by username or create one if it doesn't already exist */
-static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bool *new_user)
+/* Find user by username or create one if it doesn't already exist. When
+ * limited is set, refuse to create a new user once maxusers is reached and
+ * return NULL instead. Every new user is a permanent heap record plus a file
+ * under logs/users/, so paths driven by unauthenticated remote input must be
+ * limited or a client rotating usernames can exhaust memory and disk. */
+static user_instance_t *__get_create_user(sdata_t *sdata, const char *username,
+					  bool *new_user, const bool limited)
 {
 	char truncated[128];
 	user_instance_t *user;
+	bool full = false;
 
 	/* Usernames are stored in a fixed 128 byte array so truncate any that
 	 * are too long to fit, keeping lookup and creation consistent */
@@ -5848,12 +5856,26 @@ static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bo
 	ck_wlock(&sdata->instance_lock);
 	HASH_FIND_STR(sdata->user_instances, username, user);
 	if (unlikely(!user)) {
-		user = __create_user(sdata, username);
-		*new_user = true;
+		if (unlikely(limited && ckpool.maxusers &&
+			     HASH_COUNT(sdata->user_instances) >= (unsigned int)ckpool.maxusers))
+			full = true;
+		else {
+			user = __create_user(sdata, username);
+			*new_user = true;
+		}
 	}
 	ck_wunlock(&sdata->instance_lock);
 
+	if (unlikely(full)) {
+		LOGWARNING("Refusing to create user %s with maxusers %d reached",
+			   username, ckpool.maxusers);
+	}
 	return user;
+}
+
+static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bool *new_user)
+{
+	return __get_create_user(sdata, username, new_user, false);
 }
 
 static user_instance_t *get_user(sdata_t *sdata, const char *username)
@@ -5932,7 +5954,10 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 	if (unlikely(len > 127))
 		username[127] = '\0';
 
-	user = get_create_user(sdata, username, &new_user);
+	/* Limited: this is reached directly from mining.authorize. */
+	user = __get_create_user(sdata, username, &new_user, true);
+	if (unlikely(!user))
+		return NULL;
 	worker = get_create_worker(sdata, user, workername, &new_worker);
 
 	/* Create one worker instance for combined data from workers of the
@@ -6067,6 +6092,11 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 	}
 	pass = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 1));
 	user = generate_user(client, buf);
+	if (unlikely(!user)) {
+		*err_doc = yyjson_string("Pool user limit reached");
+		client->dropped = true;
+		goto out;
+	}
 	client->user_id = user->id;
 	ts_realtime(&now);
 	client->start_time = now.tv_sec;
@@ -6400,6 +6430,17 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	if (likely(diff < network_diff))
 		return;
 
+	/* Never submit a block whose miner supplied ntime is outside the window
+	 * bitcoind will accept - it would be rejected and the reward lost. The
+	 * callers range check ntime as well but only after this is reached, and
+	 * only to report the share level error, so gate it here where every
+	 * submission path converges. */
+	if (unlikely(ntime32 < wb->ntime32 || ntime32 > wb->ntime32 + 7000)) {
+		LOGWARNING("Not submitting block solve with out of range ntime %u vs workbase %u !",
+			   ntime32, wb->ntime32);
+		return;
+	}
+
 	LOGWARNING("Possible %sblock solve diff %lf !", stale ? "stale share " : "", diff);
 	/* Can't submit a block in proxy mode without the transactions */
 	if (!ckpool.node && wb->proxy)
@@ -6730,6 +6771,12 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 		 "sv2:%"PRId64":%u", connector_id, channel_id);
 
 	user = generate_user(client, user_identity);
+	if (unlikely(!user)) {
+		LOGNOTICE("SV2 reject user %s with maxusers reached", user_identity);
+		client->dropped = true;
+		dec_instance_ref(sdata, client);
+		return false;
+	}
 	client->user_id = user->id;
 	client->workername = strdup(user_identity);
 	client->password = strdup("x");
@@ -8872,7 +8919,20 @@ static void srecv_process(smsg_t *msg)
 		goto out;
 	}
 
-	msg->client_id = yyjson_mut_get_num(val);
+	/* These three keys are generated by the connector, which strips any
+	 * copy supplied by the remote end first. Validate them regardless:
+	 * passthrough and node peers also feed this path, and an unchecked
+	 * value here is a pre-auth crash. */
+	if (unlikely(!yyjson_mut_is_int(val))) {
+		buf = yyjson_mut_write(doc, 0, NULL);
+		LOGWARNING("Non integer client_id in connector json smsg %s", buf);
+		goto out;
+	}
+	msg->client_id = yyjson_mut_get_sint(val);
+	if (unlikely(msg->client_id < 0)) {
+		LOGWARNING("Negative client_id %"PRId64" in connector json smsg", msg->client_id);
+		goto out;
+	}
 	yyjson_mut_obj_clear(val);
 
 	val = yyjson_mut_obj_get(root, "address");
@@ -8881,7 +8941,17 @@ static void srecv_process(smsg_t *msg)
 		LOGWARNING("Failed to extract address from connector json smsg %s", buf);
 		goto out;
 	}
-	strcpy(address, yyjson_mut_get_str(val));
+	{
+		const char *addr = yyjson_mut_get_str(val);
+
+		if (unlikely(!addr || strlen(addr) >= sizeof(address))) {
+			LOGWARNING("Invalid address for client %"PRId64" in connector json smsg",
+				   msg->client_id);
+			connector_drop_client(msg->client_id);
+			goto out;
+		}
+		strcpy(address, addr);
+	}
 	yyjson_mut_obj_clear(val);
 
 	val = yyjson_mut_obj_get(root, "server");
@@ -8890,7 +8960,19 @@ static void srecv_process(smsg_t *msg)
 		LOGWARNING("Failed to extract server from connector json smsg %s", buf);
 		goto out;
 	}
-	server = yyjson_mut_get_num(val);
+	if (unlikely(!yyjson_mut_is_int(val))) {
+		LOGWARNING("Non integer server for client %"PRId64" in connector json smsg",
+			   msg->client_id);
+		connector_drop_client(msg->client_id);
+		goto out;
+	}
+	server = yyjson_mut_get_sint(val);
+	if (unlikely(server < 0 || server >= ckpool.serverurls)) {
+		LOGWARNING("Out of range server %d for client %"PRId64" in connector json smsg",
+			   server, msg->client_id);
+		connector_drop_client(msg->client_id);
+		goto out;
+	}
 	yyjson_mut_obj_clear(val);
 
 	/* Parse the message here */
