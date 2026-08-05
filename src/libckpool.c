@@ -1299,11 +1299,18 @@ int _get_fd(int sockd, const char *file, const char *func, const int line)
 	msg.msg_controllen = CONTROLLLEN;
 	if (!recv_unix_data(sockd, &msg)) {
 		LOGERR("Failed to recv_unix_data in get_fd from %s %s:%d", file, func, line);
+		/* cmptr was zeroed by ckzalloc; reading CMSG_DATA here would
+		 * return fd 0 (stdin) as if the transfer succeeded. */
 		goto out;
 	}
-out:
+	if (unlikely(msg.msg_controllen < sizeof(struct cmsghdr) ||
+		     cmptr->cmsg_len < CONTROLLLEN)) {
+		LOGERR("Missing fd control message in get_fd from %s %s:%d", file, func, line);
+		goto out;
+	}
 	cm = (int *)CMSG_DATA(cmptr);
 	newfd = *cm;
+out:
 	free(cmptr);
 	return newfd;
 }

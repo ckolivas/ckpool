@@ -29,6 +29,10 @@
 #endif
 
 #define MAX_MSGSIZE 1024
+/* Trusted remote / node peers may send larger JSON than a miner, but must
+ * still have a finite ceiling so a compromised peer cannot grow the recv
+ * buffer without bound. */
+#define MAX_REMOTE_MSGSIZE (16 * 1024 * 1024)
 
 typedef struct client_instance client_instance_t;
 typedef struct sender_send sender_send_t;
@@ -847,12 +851,17 @@ static bool parse_client_msg(cdata_t *cdata, client_instance_t *client)
 
 retry:
 	if (unlikely(client->bufofs > MAX_MSGSIZE)) {
-		if (!client->remote) {
+		/* Remote clients are allowed a larger but finite ceiling. */
+		if (unlikely(!client->remote || client->bufofs > MAX_REMOTE_MSGSIZE)) {
 			LOGNOTICE("Client id %"PRId64" fd %d overloaded buffer without EOL, disconnecting",
 				client->id, client->fd);
 			return false;
 		}
 		client->buf = realloc(client->buf, round_up_page(client->bufofs + MAX_MSGSIZE + 1));
+		if (unlikely(!client->buf)) {
+			LOGERR("Client id %"PRId64" failed to grow remote recv buffer", client->id);
+			return false;
+		}
 	}
 	/* This read call is non-blocking since the socket is set to O_NOBLOCK */
 	ret = read(client->fd, client->buf + client->bufofs, MAX_MSGSIZE);
@@ -876,7 +885,8 @@ reparse:
 
 	/* Do something useful with this message now */
 	buflen = eol - client->buf + 1;
-	if (unlikely(buflen > MAX_MSGSIZE && !client->remote)) {
+	if (unlikely(buflen > MAX_MSGSIZE &&
+		     (!client->remote || buflen > MAX_REMOTE_MSGSIZE))) {
 		LOGNOTICE("Client id %"PRId64" fd %d message oversize, disconnecting", client->id, client->fd);
 		return false;
 	}

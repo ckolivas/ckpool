@@ -2507,8 +2507,14 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		uchar hash1[32];
 
 		coinbase = alloca(cblen);
-		hex2bin(coinbase, coinbasehex, cblen);
-		hex2bin(swap, swaphex, 80);
+		/* Reject corrupt hex rather than hashing uninitialised
+		 * alloca tails into a submitted block. */
+		if (unlikely(!hex2bin(coinbase, coinbasehex, cblen) ||
+			     !hex2bin(swap, swaphex, 80))) {
+			LOGWARNING("Invalid hex in node method block for jobid %"PRId64, id);
+			put_workbase(sdata, wb);
+			goto out;
+		}
 		sha256(swap, 80, hash1);
 		sha256(hash1, 32, hash);
 	} else {
@@ -2516,7 +2522,11 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		 * the old format only */
 		enonce1len = wb->enonce1constlen + wb->enonce1varlen;
 		enonce1bin = alloca(enonce1len);
-		hex2bin(enonce1bin, enonce1, enonce1len);
+		if (unlikely(!hex2bin(enonce1bin, enonce1, enonce1len))) {
+			LOGWARNING("Invalid enonce1 hex in node method block for jobid %"PRId64, id);
+			put_workbase(sdata, wb);
+			goto out;
+		}
 		coinbase = alloca(wb->coinb1len + wb->enonce1constlen + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len);
 		/* Fill in the hashes */
 		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);
@@ -6161,22 +6171,30 @@ out:
 		sdata_t *sdata = ckpool.sdata;
 		workbase_t *wb;
 
-		/* To avoid grabbing recursive lock */
+		/* To avoid grabbing recursive lock. current_workbase is NULL
+		 * until the first template arrives (bitcoind startup/IBD); the
+		 * node path reaches here without the spin-wait that protects
+		 * parse_instance_msg, so the NULL check is required. */
 		ck_wlock(&sdata->workbase_lock);
 		wb = sdata->current_workbase;
-		wb->readcount++;
+		if (likely(wb))
+			wb->readcount++;
 		ck_wunlock(&sdata->workbase_lock);
 
-		ck_wlock(&sdata->instance_lock);
-		__generate_userwb(sdata, wb, user);
-		ck_wunlock(&sdata->instance_lock);
+		if (wb) {
+			ck_wlock(&sdata->instance_lock);
+			__generate_userwb(sdata, wb, user);
+			ck_wunlock(&sdata->instance_lock);
 
-		update_solo_client(sdata, wb, client->id, user);
+			update_solo_client(sdata, wb, client->id, user);
 
-		ck_wlock(&sdata->workbase_lock);
-		wb->readcount--;
-		ck_wunlock(&sdata->workbase_lock);
+			ck_wlock(&sdata->workbase_lock);
+			wb->readcount--;
+			ck_wunlock(&sdata->workbase_lock);
+		}
 
+		/* Authorised either way; solo work arrives with the first
+		 * template if none exists yet. */
 		stratum_send_diff(sdata, client);
 	}
 	return ret;
@@ -8550,8 +8568,14 @@ static void parse_remote_block(sdata_t *sdata, yyjson_mut_doc *doc, yyjson_mut_v
 		char blockhash[68];
 
 		LOGWARNING("Possible remote block solve diff %lf !", diff);
-		hex2bin(coinbase, coinbasehex, cblen);
-		hex2bin(swap, swaphex, 80);
+		/* Same as the node block path: refuse to assemble/submit on
+		 * corrupt hex so uninitialised alloca is never hashed in. */
+		if (unlikely(!hex2bin(coinbase, coinbasehex, cblen) ||
+			     !hex2bin(swap, swaphex, 80))) {
+			LOGWARNING("Invalid hex in remote block for workinfoid %"PRId64, id);
+			put_remote_workbase(sdata, wb);
+			goto out_add;
+		}
 		sha256(swap, 80, hash1);
 		sha256(hash1, 32, hash);
 		gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
