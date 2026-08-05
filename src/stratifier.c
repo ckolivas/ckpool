@@ -3260,6 +3260,20 @@ static void update_subscribe(const char *cmd)
 		proxy->enonce1varlen = 8;
 		proxy->enonce2varlen = proxy->nonce2len - proxy->enonce1varlen;
 	}
+	/* The combined const + var extranonce1 is written into a fixed 16 byte
+	 * enonce1bin buffer per client, so a hostile or buggy upstream that
+	 * grants a long const (up to 15) plus var could otherwise overflow it.
+	 * The generator caps const at 15 in isolation but nothing bounds the
+	 * sum. Give var only the room left after const, handing the remainder
+	 * to the miner facing enonce2. */
+	if (proxy->enonce1constlen + proxy->enonce1varlen > (int)sizeof(proxy->enonce1bin)) {
+		proxy->enonce1varlen = (int)sizeof(proxy->enonce1bin) - proxy->enonce1constlen;
+		if (proxy->enonce1varlen < 0)
+			proxy->enonce1varlen = 0;
+		proxy->enonce2varlen = proxy->nonce2len - proxy->enonce1varlen;
+		LOGWARNING("Clamped oversize extranonce1 from upstream proxy %d:%d to const %d var %d",
+			   id, subid, proxy->enonce1constlen, proxy->enonce1varlen);
+	}
 	if (proxy->enonce1varlen > 0 && proxy->enonce1varlen < 8)
 		proxy->max_clients = 1ll << (proxy->enonce1varlen * 8);
 	else if (proxy->enonce1varlen >= 8)
@@ -5246,13 +5260,25 @@ static void *blockupdate(void __maybe_unused *arg)
 /* Enter holding workbase_lock and client a ref count. */
 static void __fill_enonce1data(const workbase_t *wb, stratum_instance_t *client)
 {
-	if (wb->enonce1constlen)
-		memcpy(client->enonce1bin, wb->enonce1constbin, wb->enonce1constlen);
-	if (wb->enonce1varlen) {
-		memcpy(client->enonce1bin + wb->enonce1constlen, &client->enonce1_64, wb->enonce1varlen);
-		__bin2hex(client->enonce1var, &client->enonce1_64, wb->enonce1varlen);
+	int constlen = wb->enonce1constlen, varlen = wb->enonce1varlen;
+
+	/* Defence in depth against the fixed enonce1bin buffer overflowing
+	 * should the derived lengths ever be inconsistent. var also cannot
+	 * exceed the 8 bytes of enonce1_64 it is copied from. */
+	if (unlikely(constlen > (int)sizeof(client->enonce1bin)))
+		constlen = sizeof(client->enonce1bin);
+	if (unlikely(varlen > 8))
+		varlen = 8;
+	if (unlikely(constlen + varlen > (int)sizeof(client->enonce1bin)))
+		varlen = sizeof(client->enonce1bin) - constlen;
+
+	if (constlen)
+		memcpy(client->enonce1bin, wb->enonce1constbin, constlen);
+	if (varlen) {
+		memcpy(client->enonce1bin + constlen, &client->enonce1_64, varlen);
+		__bin2hex(client->enonce1var, &client->enonce1_64, varlen);
 	}
-	__bin2hex(client->enonce1, client->enonce1bin, wb->enonce1constlen + wb->enonce1varlen);
+	__bin2hex(client->enonce1, client->enonce1bin, constlen + varlen);
 }
 
 /* Create a new enonce1 from the 64 bit enonce1_64 value, using only the number

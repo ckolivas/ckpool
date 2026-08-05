@@ -1730,6 +1730,11 @@ static void parse_config(void)
 	yyjson_doc *doc;
 	int arr_size;
 
+	/* Defaults for options where the zeroed struct is not the wanted value.
+	 * yyjson_obj_get_bool only writes when the key is present, so this
+	 * survives unless the config overrides it. */
+	ckpool.reconnect = true;
+
 	doc = yyjson_read_file(ckpool.config, YYJSON_READ_STOP_WHEN_DONE, NULL, &err_val);
 	if (!doc) {
 		LOGWARNING("Json decode error for config file %s: (%zu): %s", ckpool.config,
@@ -1791,6 +1796,7 @@ static void parse_config(void)
 	yyjson_obj_get_int(&ckpool.maxclients, json_conf, "maxclients");
 	yyjson_obj_get_int64(&ckpool.maxsendqueue, json_conf, "maxsendqueue");
 	yyjson_obj_get_int(&ckpool.maxusers, json_conf, "maxusers");
+	yyjson_obj_get_bool(&ckpool.reconnect, json_conf, "reconnect");
 	yyjson_obj_get_double(&ckpool.donation, json_conf, "donation");
 	/* Avoid dust-sized donations */
 	if (ckpool.donation < 0.1)
@@ -2030,6 +2036,7 @@ static void report_config(void)
 	printf("maxclients = %d\n", ckpool.maxclients);
 	printf("maxsendqueue = %"PRId64"\n", ckpool.maxsendqueue);
 	printf("maxusers = %d\n", ckpool.maxusers);
+	printf("reconnect = %s\n", ckpool.reconnect ? "true" : "false");
 
 	printf("logdir = %s\n", ckpool.logdir);
 	printf("socket_dir = %s\n", ckpool.socket_dir);

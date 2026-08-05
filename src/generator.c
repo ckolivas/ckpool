@@ -1438,6 +1438,55 @@ static void disable_subproxy(gdata_t *gdata, proxy_instance_t *proxi, proxy_inst
 	}
 }
 
+/* Copy the host part of a "host:port" or bare "host" url into buf, dropping the
+ * port. Returns false if there is no host. */
+static bool url_host(char *buf, const size_t bufsize, const char *url)
+{
+	const char *colon;
+	size_t len;
+
+	if (!url || !url[0])
+		return false;
+	/* Rightmost colon so IPv6 literals are not truncated at the first
+	 * group separator; a bracketed [::1]:port keeps the bracket which is
+	 * fine for an exact comparison. */
+	colon = strrchr(url, ':');
+	len = colon ? (size_t)(colon - url) : strlen(url);
+	if (!len || len >= bufsize)
+		return false;
+	memcpy(buf, url, len);
+	buf[len] = '\0';
+	return true;
+}
+
+/* True if the reconnect target host is the same as, or a subdomain of, the
+ * configured pool host. The configured host must have at least two labels so a
+ * bare TLD cannot match every host under it, which was the original bug: a
+ * ".com" suffix compare accepted any *.com host. Comparison is case
+ * insensitive as DNS names are. Fails closed. */
+static bool reconnect_host_allowed(const char *pool_url, const char *new_host)
+{
+	char pool_host[256];
+	size_t plen, nlen;
+
+	if (!url_host(pool_host, sizeof(pool_host), pool_url))
+		return false;
+	/* Require the configured host to contain a dot, i.e. at least two
+	 * labels, otherwise "example" or a bare TLD would match too broadly. */
+	if (!strchr(pool_host, '.'))
+		return false;
+	/* Exact host match. */
+	if (!strcasecmp(pool_host, new_host))
+		return true;
+	/* Subdomain match: new_host must end with ".<pool_host>". */
+	plen = strlen(pool_host);
+	nlen = strlen(new_host);
+	if (nlen > plen + 1 && new_host[nlen - plen - 1] == '.' &&
+	    !strcasecmp(new_host + nlen - plen, pool_host))
+		return true;
+	return false;
+}
+
 static bool parse_reconnect(proxy_instance_t *proxy, yyjson_val *val)
 {
 	bool sameurl = false, ret = false;
@@ -1446,6 +1495,13 @@ static bool parse_reconnect(proxy_instance_t *proxy, yyjson_val *val)
 	const char *new_url;
 	int new_port;
 	char *url;
+
+	/* Operators can refuse all upstream redirects outright. */
+	if (!ckpool.reconnect) {
+		LOGWARNING("Denied stratum reconnect request from %s with reconnect disabled",
+			   proxy->url);
+		goto out;
+	}
 
 	new_url = yyjson_get_str(yyjson_arr_get(val, 0));
 	new_port = yyjson_get_sint(yyjson_arr_get(val, 1));
@@ -1458,25 +1514,15 @@ static bool parse_reconnect(proxy_instance_t *proxy, yyjson_val *val)
 			sscanf(newport_string, "%d", &new_port);
 	}
 	if (new_url && strlen(new_url) && new_port) {
-		const char *dot_reconnect;
-		char *dot_pool;
-		int len;
+		char new_host[256];
 
-		dot_pool = strchr(proxy->url, '.');
-		if (!dot_pool) {
-			LOGWARNING("Denied stratum reconnect request from server without domain %s",
-				   proxy->url);
-			goto out;
-		}
-		dot_reconnect = strchr(new_url, '.');
-		if (!dot_reconnect) {
-			LOGWARNING("Denied stratum reconnect request to url without domain %s",
+		if (!url_host(new_host, sizeof(new_host), new_url)) {
+			LOGWARNING("Denied stratum reconnect request to url without host %s",
 				   new_url);
 			goto out;
 		}
-		len = strlen(dot_reconnect);
-		if (strncmp(dot_pool, dot_reconnect, len)) {
-			LOGWARNING("Denied stratum reconnect request from %s to non-matching domain %s",
+		if (!reconnect_host_allowed(proxy->url, new_host)) {
+			LOGWARNING("Denied stratum reconnect request from %s to non-matching host %s",
 				   proxy->url, new_url);
 			goto out;
 		}
@@ -4463,7 +4509,11 @@ static void *proxy_recv(void *arg)
 		bool message = false, hup = false;
 		share_msg_t *share, *tmpshare;
 		notify_instance_t *ni, *tmp;
-		float timeout;
+		/* Initialised: the timeout/error branch below reaches the drain
+		 * loop's read_socket_line without otherwise setting it, and a
+		 * HUP arriving without EPOLLIN skips the assignment at EPOLLIN
+		 * too. */
+		float timeout = 0;
 		time_t now;
 		int ret;
 
@@ -4572,16 +4622,33 @@ static void *proxy_recv(void *arg)
 					  proxi->id, subproxy->subid, subproxy->url);
 				hup = true;
 			}
+		} else if (ret < 0 && errno == EINTR) {
+			/* Interrupted by a signal, not a stalled upstream, so
+			 * just go around again. */
+			continue;
 		} else {
-			LOGNOTICE("Proxy %d:%d %s failed to epoll in proxy_recv",
-				  proxi->id, subproxy->subid, subproxy->url);
+			/* Timeout (ret == 0) or epoll error. cs is still NULL
+			 * here, so the drain loop and the hangup handler below
+			 * would both be skipped and the parent would never
+			 * reconnect. Point cs at the parent and take its
+			 * semaphore so the hangup path stays balanced with the
+			 * cksem_post at the end of the loop. */
+			LOGNOTICE("Proxy %d:%s epoll timeout/error in proxy_recv, forcing reconnect",
+				  proxi->id, proxi->url);
+			subproxy = proxi;
+			cs = &proxi->cs;
+			cksem_wait(&cs->sem);
 			hup = true;
 		}
 
 		/* Parse any other messages already fully buffered with a zero
-		 * timeout. SV2 proxies are serviced above (binary transport). */
+		 * timeout. SV2 proxies are serviced above (binary transport).
+		 * cs is NULL on the timeout path only when we did not take the
+		 * semaphore, which cannot happen now, but guard it regardless. */
 #ifdef HAVE_SV2
-		if (!subproxy->sv2)
+		if (!subproxy->sv2 && cs)
+#else
+		if (cs)
 #endif
 		while (message || read_socket_line(cs, &timeout) > 0) {
 			message = false;
