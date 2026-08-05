@@ -1096,23 +1096,45 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 {
 	sdata_t *ckp_sdata = ckpool.sdata;
 	pool_stats_t *stats = &sdata->stats;
-	/* Compare to pool-wide value for logging: proxy mode has a separate
-	 * sdata/stats per subproxy (starts at 0), which would re-log the same
-	 * network diff on every failback or first notify. */
-	double old_diff = ckp_sdata->stats.network_diff;
+	/* Per-sdata last value: proxy mode has one sdata per subproxy. Comparing
+	 * against the pool-wide stat re-logged every notify when upstreams are
+	 * on different networks (mainnet + testnet thrashing the global). */
+	double old_diff = stats->network_diff;
 	workbase_t *tmp, *tmpa;
+	bool update_global;
 	int len, ret;
 
 	ts_realtime(&wb->gentime);
 	/* Stats network_diff is not protected by lock but is not a critical
-	 * value */
+	 * value. Share validation and block-solve checks always use
+	 * wb->network_diff / current_workbase->network_diff on the client's
+	 * bound sdata, so mixed-network proxies remain correct. */
 	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
 	if (wb->network_diff < 1)
 		wb->network_diff = 1;
 	stats->network_diff = wb->network_diff;
-	if (wb->network_diff != old_diff) {
+
+	/* Pool hashrate-%-of-network reporting: only the preferred parent
+	 * updates the shared copy so multi-network configs do not thrash it. */
+	update_global = !ckpool.proxy;
+	if (ckpool.proxy && sdata->subproxy) {
+		proxy_t *cur;
+
+		mutex_lock(&ckp_sdata->proxy_lock);
+		cur = ckp_sdata->proxy;
+		update_global = !cur || sdata->subproxy->parent == cur;
+		mutex_unlock(&ckp_sdata->proxy_lock);
+	}
+	if (update_global)
 		ckp_sdata->stats.network_diff = wb->network_diff;
-		LOGWARNING("Network diff set to %.1f", wb->network_diff);
+
+	if (wb->network_diff != old_diff) {
+		if (ckpool.proxy && sdata->subproxy)
+			LOGWARNING("Network diff set to %.1f (proxy %d:%d)",
+				   wb->network_diff, sdata->subproxy->id,
+				   sdata->subproxy->subid);
+		else
+			LOGWARNING("Network diff set to %.1f", wb->network_diff);
 	}
 	len = strlen(ckpool.logdir) + 8 + 1 + 16 + 1;
 	wb->logdir = ckzalloc(len);
