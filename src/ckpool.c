@@ -1814,7 +1814,6 @@ static void parse_config(void)
 		parse_redirecturls(arr_val);
 	yyjson_obj_get_string(&ckpool.zmqblock, json_conf, "zmqblock");
 	yyjson_obj_get_string(&ckpool.ipcmining, json_conf, "ipcmining");
-	yyjson_obj_get_bool(&ckpool.ipctemplate, json_conf, "ipctemplate");
 #ifdef HAVE_SV2
 	/* Prefer array form (like serverurl); fall back to a single string. */
 	arr_val = yyjson_obj_get(json_conf, "sv2url");
@@ -2089,7 +2088,6 @@ static void report_config(void)
 #endif
 	printf("upstream = %s\n", ckpool.upstream ? ckpool.upstream : "(none)");
 	printf("ipcmining = %s\n", ckpool.ipcmining ? ckpool.ipcmining : "(none)");
-	printf("ipctemplate = %d\n", ckpool.ipctemplate);
 	printf("proxies = %d\n", ckpool.proxies);
 	for (i = 0; i < ckpool.proxies; i++) {
 		printf("proxyurl[%d] = %s jds=%s\n", i, ckpool.proxyurl[i],

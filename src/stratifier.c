@@ -10340,19 +10340,17 @@ void *stratifier(void *arg)
 			create_pthread(&pth_zmqnotify, zmqnotify, NULL);
 
 #ifdef HAVE_CAPNP
-		/* Optionally generate block templates from the mining IPC
-		 * interface. The service connection runs its own thread; block
+		/* A valid ipcmining socket always implies IPC template
+		 * generation. The service connection runs its own thread; block
 		 * generation falls back to getblocktemplate when it is not
 		 * ready. */
 		if (ckpool.ipcmining && !access(ckpool.ipcmining, F_OK)) {
-			if (ckpool.ipctemplate) {
-				ckpool.btc_template_svc = mining_ipc_service_connect(ckpool.ipcmining);
-				if (ckpool.btc_template_svc)
-					LOGNOTICE("Started mining IPC block template service on %s",
-						  ckpool.ipcmining);
-				else
-					LOGWARNING("Failed to start mining IPC block template service");
-			}
+			ckpool.btc_template_svc = mining_ipc_service_connect(ckpool.ipcmining);
+			if (ckpool.btc_template_svc)
+				LOGNOTICE("Started mining IPC block template service on %s",
+					  ckpool.ipcmining);
+			else
+				LOGWARNING("Failed to start mining IPC block template service");
 #ifdef HAVE_SV2
 			/* Phase 2: dedicated validation connection for checkBlock,
 			 * only needed when SV2 is configured (JD uses checkBlock

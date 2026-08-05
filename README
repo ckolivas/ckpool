@@ -360,17 +360,13 @@ only. Requires use of matched bitcoind -zmqpubhashblock option.
 Default: tcp://127.0.0.1:28332
 
 "ipcmining" : Optional path to Bitcoin Core's mining IPC unix socket. In pool
-mode this provides block notifications (and templates when ipctemplate is set),
-bypassing zmq when active. In proxy mode it is required when any proxy entry
-has a "jds" Job Declaration client. Example: "/tmp/btc-mining.sock"
+mode this provides block notifications and template generation, bypassing zmq
+and getblocktemplate when active (falling back to RPC if the interface is
+unavailable). In proxy mode it is required when any proxy entry has a "jds"
+Job Declaration client. Example: "/tmp/btc-mining.sock"
 Requires bitcoind -ipcbind, e.g.:
 bitcoind -m node -ipcbind=unix:/tmp/btc-mining.sock
 No default.
-
-"ipctemplate" : Boolean to use IPC block template generation, requires a
-working ipcmining interface. This falls back to RPC getblocktemplate if
-disabled or inactive.
-Default: false.
 
 
 ---

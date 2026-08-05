@@ -51,7 +51,8 @@ acting as a backstop).
 `mining_ipc_service_connect` opens a second connection with its own service
 thread. Callers may invoke `create_new_block`, template getters, and
 `submit_solution` from any thread; calls are marshalled onto that thread.
-ckpool stores this as `btc_template_svc` when `ipctemplate` is enabled.
+ckpool stores this as `btc_template_svc` whenever a valid `ipcmining` socket
+is configured.
 
 ### Phase 2 start — `checkBlock` (SV2 Job Declaration validation)
 
