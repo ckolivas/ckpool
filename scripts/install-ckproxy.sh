@@ -160,9 +160,8 @@ make install
 echo
 echo "Enter the upstream pool(s) for ckproxy to connect to. Pools are tried in"
 echo "order with automatic failover. URL formats:"
-echo "  host:port                     Stratum V1 (e.g. solo.ckpool.org:3333)"
-echo "  stratum+tcp://host:port       Stratum V1 (explicit scheme)"
-echo "  host:port/AUTHORITYKEY        Stratum V2 (Noise-encrypted)"
+echo "  host:port                     Stratum V1 (e.g. stratum.ckpool.org:3333)"
+echo "  host:port/AUTHORITYKEY        Stratum V2 (e.g. stratum.ckpool.org:3336/9anrRNhBh7869XtNnFcCuGBRZP51E635qGbu457J5kHdszhfRc3)"
 proxy_entries=""
 pool_count=0
 while true; do
