@@ -4,6 +4,7 @@ Local solo mining.
 
 ALL-IN-ONE SOLO MINING QUICKSTART:
 
+wget https://api.bitbucket.org/2.0/repositories/ckolivas/ckpool/src/master/scripts/install-ckpool-solo.sh
 sudo scripts/install-ckpool-solo.sh
 
 This will download ckpool source code, v29.0 bitcoin daemon binary, check its

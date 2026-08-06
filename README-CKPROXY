@@ -4,6 +4,7 @@ Stratum proxy installation.
 
 ALL-IN-ONE PROXY QUICKSTART:
 
+wget https://api.bitbucket.org/2.0/repositories/ckolivas/ckpool/src/master/scripts/install-ckproxy.sh
 sudo scripts/install-ckproxy.sh
 
 This will download the latest ckpool source code, install the required build
