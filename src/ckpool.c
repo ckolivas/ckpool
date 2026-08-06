@@ -1495,7 +1495,6 @@ static bool *grow_bools(bool *old, int old_n, int new_n)
 	return p;
 }
 
-#ifdef HAVE_SV2
 /*
  * SV2 mining/JD *server* binds are allowed only in normal pool mode or
  * btcsolo. All proxy-family modes set ckpool.proxy (proxy, userproxy,
@@ -1506,7 +1505,6 @@ static bool sv2_server_listen_allowed(void)
 {
 	return !ckpool.proxy;
 }
-#endif
 
 /* True if host means "all interfaces" for clash purposes. */
 static bool listen_host_is_wildcard(const char *host)
@@ -2383,7 +2381,9 @@ int main(int argc, char **argv)
 	 * port with a wildcard 0.0.0.0/:: host). Covers SV1 vs SV2 vs JD and
 	 * duplicate entries within one family.
 	 */
+#ifdef HAVE_SV2
 	check_listen_port_clashes();
+#endif
 	for (i = 0; i < ckpool.serverurls; i++) {
 		const char *kind = "SV1";
 
