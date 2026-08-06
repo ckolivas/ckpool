@@ -2381,7 +2381,9 @@ int main(int argc, char **argv)
 	 * port with a wildcard 0.0.0.0/:: host). Covers SV1 vs SV2 vs JD and
 	 * duplicate entries within one family.
 	 */
+#ifdef HAVE_SV2
 	check_listen_port_clashes();
+#endif
 	for (i = 0; i < ckpool.serverurls; i++) {
 		const char *kind = "SV1";
 
