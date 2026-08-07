@@ -17,11 +17,15 @@ detect_distro() {
             PKG_MANAGER="apt"
             INSTALL_CMD="apt install -y"
             UPDATE_CMD="apt update"
+            # libcapnp-dev supplies the capnp-rpc pkg-config module the mining
+            # IPC shim links against; libsodium-dev is required by Stratum V2.
+            PACKAGES="build-essential git autoconf automake libtool pkg-config yasm libzmq3-dev curl screen libevent-dev libssl-dev bsdmainutils python3 gnupg jq libcapnp-dev libsodium-dev"
             ;;
         fedora|centos|rhel)
             PKG_MANAGER="dnf"  # or yum for older CentOS
             INSTALL_CMD="dnf install -y"
             UPDATE_CMD="dnf check-update"
+            PACKAGES="gcc gcc-c++ make git autoconf automake libtool pkgconf-pkg-config yasm zeromq-devel curl screen libevent-devel openssl-devel util-linux python3 gnupg2 jq capnproto-devel libsodium-devel"
             ;;
         *)
             echo "Unsupported distribution: $DISTRO. Exiting."
@@ -54,10 +58,19 @@ if $PREVIOUS_INSTALL; then
     systemctl stop bitcoind 2>/dev/null || true
     systemctl disable ckpool 2>/dev/null || true
     systemctl disable bitcoind 2>/dev/null || true
+    # Keep the SV2 Noise keys. They are the pool's permanent identity: miners
+    # pin the authority public key in their connection URL, so regenerating
+    # them would force every SV2 miner to be reconfigured.
+    SV2_KEY_BACKUP=""
+    if ls /etc/ckpool/sv2_*.key >/dev/null 2>&1; then
+        SV2_KEY_BACKUP=$(mktemp -d)
+        cp -a /etc/ckpool/sv2_*.key "$SV2_KEY_BACKUP"/
+        echo "Preserving existing SV2 keys so the pool keeps its authority public key."
+    fi
     # Remove old files
     rm -f /etc/systemd/system/ckpool.service /etc/systemd/system/bitcoind.service
     rm -rf /opt/ckpool /etc/ckpool /var/log/ckpool
-    rm -f /usr/local/bin/wait-for-bitcoind-sync.sh
+    rm -f /usr/local/bin/wait-for-bitcoind-sync.sh /usr/local/bin/ckpool-mining-urls.sh
     # Reload systemd
     systemctl daemon-reload
 fi
@@ -170,10 +183,12 @@ else
 fi
 
 detect_distro
-$UPDATE_CMD
+# dnf check-update exits 100 when updates are available, which would trip set -e.
+$UPDATE_CMD || true
 
-# Install dependencies (for Bitcoin Core, CKPool build, rpcauth.py, tarball verification, and jq for sync check)
-$INSTALL_CMD build-essential git autoconf automake libtool pkg-config yasm libzmq3-dev curl screen libevent-dev libssl-dev bsdmainutils python3 gnupg jq
+# Install dependencies (for Bitcoin Core, CKPool build including the mining IPC
+# and Stratum V2 support, rpcauth.py, tarball verification, and jq for sync check)
+$INSTALL_CMD $PACKAGES
 
 # Enable persistent journald storage
 echo "Enabling persistent journal storage for easier log access..."
@@ -231,6 +246,14 @@ fi
 
 # Set up Bitcoin Core config and datadir
 DATADIR="$HOME_DIR/.bitcoin"
+IPC_SOCKET="$DATADIR/node.sock"
+# Unix socket paths are limited to 107 characters by the kernel; bitcoin-node
+# refuses to start rather than truncating, so catch it before installing.
+if [ ${#IPC_SOCKET} -gt 107 ]; then
+    echo "IPC socket path $IPC_SOCKET exceeds the 107 character Unix socket limit."
+    echo "Choose a service user with a shorter home directory. Exiting."
+    exit 1
+fi
 mkdir -p "$DATADIR"
 chown -R $service_user:$service_user "$DATADIR"
 cat << EOF > "$DATADIR/bitcoin.conf"
@@ -240,6 +263,7 @@ $prune_line
 $assumevalid_line
 rpcallowip=127.0.0.1
 rpcbind=127.0.0.1
+ipcbind=unix:$IPC_SOCKET
 zmqpubhashblock=tcp://127.0.0.1:28332
 blockmaxweight=3900000
 checkblocks=6
@@ -253,13 +277,28 @@ EOF
 git clone https://bitbucket.org/ckolivas/ckpool.git /opt/ckpool
 chown -R $service_user:$service_user /opt/ckpool
 cd /opt/ckpool
+# autogen.sh fetches the bundled secp256k1 submodule, which SV2 needs for its
+# ellswift/schnorrsig support. --enable-sv2 makes configure fail loudly if the
+# SV2 dependencies are missing rather than silently building without it; the
+# mining IPC is enabled automatically when capnp-rpc is present.
 ./autogen.sh
-./configure
-make
+./configure --enable-sv2
+make -j$(nproc)
 make install
 
 # Set up CKPool config (minimal, per README-SOLOMINING)
 mkdir -p /etc/ckpool
+# Restore the SV2 keys kept from a previous install before ckpool can generate
+# new ones on first start.
+if [ -n "${SV2_KEY_BACKUP:-}" ]; then
+    cp -a "$SV2_KEY_BACKUP"/sv2_*.key /etc/ckpool/
+    rm -rf "$SV2_KEY_BACKUP"
+fi
+# btcd is still required alongside the IPC socket: ckpool uses JSON-RPC to
+# validate addresses and as the getblocktemplate fallback whenever the IPC
+# template service is not ready. A usable ipcmining socket is on its own enough
+# to drive templates and tip notifications. serverurl must be listed explicitly,
+# because configuring sv2url would otherwise suppress the default SV1 listener.
 cat << EOF > /etc/ckpool/ckpool.conf
 {
   $donation_line
@@ -272,6 +311,15 @@ cat << EOF > /etc/ckpool/ckpool.conf
       "notify" : true
     }
   ],
+  "ipcmining" : "$IPC_SOCKET",
+  "serverurl" : [
+    "0.0.0.0:3333"
+  ],
+  "sv2url" : [
+    "0.0.0.0:3336"
+  ],
+  "sv2_authority_key" : "/etc/ckpool/sv2_authority.key",
+  "sv2_static_key" : "/etc/ckpool/sv2_static.key",
   "startdiff" : 10000,
   "logdir" : "/var/log/ckpool"
 }
@@ -321,15 +369,44 @@ EOF
 chmod +x /usr/local/bin/wait-for-bitcoind-sync.sh
 chown $service_user:$service_user /usr/local/bin/wait-for-bitcoind-sync.sh
 
+# Create helper to print the miner-facing addresses. The SV2 authority public
+# key is only created when ckpool first starts, so this reads it back from the
+# log rather than being baked in at install time.
+cat << EOF > /usr/local/bin/ckpool-mining-urls.sh
+#!/bin/bash
+
+CKLOG=/var/log/ckpool/ckpool.log
+ip=\$(hostname -I 2>/dev/null | awk '{print \$1}')
+[ -n "\$ip" ] || ip="[machine IP]"
+
+echo "Stratum V1 mining address: stratum+tcp://\$ip:3333"
+echo "  Username: your Bitcoin address   Password: x"
+echo
+b58=\$(grep -h "SV2 authority URL path" "\$CKLOG" 2>/dev/null | tail -1 | sed 's|.*<host>:<port>/\\([^)]*\\)).*|\\1|')
+if [ -n "\$b58" ]; then
+    echo "Stratum V2 mining address: stratum2+tcp://\$ip:3336/\$b58"
+    echo "  Authority public key: \$b58"
+    echo "  Username: your Bitcoin address   Password: x"
+else
+    echo "Stratum V2 mining address: stratum2+tcp://\$ip:3336/<authority public key>"
+    echo "  The authority public key is generated the first time ckpool starts,"
+    echo "  which only happens once the blockchain has finished syncing."
+    echo "  Re-run ckpool-mining-urls.sh then, or search \$CKLOG for 'SV2 authority'."
+fi
+EOF
+chmod +x /usr/local/bin/ckpool-mining-urls.sh
+
 # Create systemd services
 cat << EOF > /etc/systemd/system/bitcoind.service
 [Unit]
-Description=Bitcoin Daemon
+Description=Bitcoin Core node (multiprocess, mining IPC)
 After=network.target
 
 [Service]
 User=$service_user
-ExecStart=/usr/local/bin/bitcoind -conf="$DATADIR/bitcoin.conf" -datadir="$DATADIR" -printtoconsole
+# bitcoin-node rather than bitcoind: only the multiprocess binary implements
+# -ipcbind and the Cap'n Proto mining interface ckpool builds templates from.
+ExecStart=/usr/local/libexec/bitcoin-node -conf="$DATADIR/bitcoin.conf" -datadir="$DATADIR" -printtoconsole
 Restart=always
 TimeoutSec=120
 RestartSec=30
@@ -358,14 +435,20 @@ systemctl daemon-reload
 systemctl enable bitcoind ckpool
 systemctl start bitcoind ckpool
 
-echo "Installation complete! CKPool-Solo is set to start on port 3333 after blockchain sync."
+echo "Installation complete! CKPool-Solo is set to start on ports 3333 (Stratum V1) and 3336 (Stratum V2) after blockchain sync."
+echo "Bitcoin Core runs as bitcoin-node with its mining IPC socket at $IPC_SOCKET, which CKPool uses for block templates and notifications."
 echo "Important: You cannot mine until the Bitcoin Core blockchain is fully synchronized, which may take days."
 echo "Check sync progress with:"
 echo "  - journalctl -u ckpool -f (block progress until CKPool starts)"
 echo "  - journalctl -u bitcoind -f (detailed sync logs)"
 echo "  - tail -f $DATADIR/debug.log (detailed sync logs)"
 echo "CKPool startup is delayed until sync completes (monitor with: journalctl -u ckpool -f)."
-echo "Connect miners using: stratum+tcp://[machine IP]:3333 with your Bitcoin address as username and 'x' as password. Replace [machine IP] with the IP address of this machine (use ifconfig or ip addr to find it)."
+echo
+echo "Mining addresses (replace [machine IP] with this machine's address if shown):"
+/usr/local/bin/ckpool-mining-urls.sh
+echo
+echo "Re-run ckpool-mining-urls.sh at any time to print these again."
+echo "SV2 miners must supply the authority public key, which is the base58 string at the end of the stratum2 URL. It is stored permanently in /etc/ckpool/sv2_authority.key and is preserved if you re-run this installer, so it does not change."
 echo "Monitor logs:"
 echo "  - CKPool: tail -f /var/log/ckpool/ckpool.log (full logs) or journalctl -u ckpool -f (block progress, then reduced CKPool logs)"
 echo "  - Bitcoin Core: tail -f $DATADIR/debug.log or journalctl -u bitcoind -f"

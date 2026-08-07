@@ -11,6 +11,13 @@ This will download ckpool source code, v31.1 bitcoin daemon binary, check its
 validity, install the daemon, build ckpool, and install it, configured for
 solo mining. Follow the prompts or simply press enter for the default settings.
 
+The node installed is bitcoin-node, the multiprocess build of Bitcoin Core,
+rather than bitcoind. Only bitcoin-node exposes the Cap'n Proto mining IPC
+interface, which ckpool uses in preference to getblocktemplate for building
+block templates and for learning about new blocks. JSON-RPC is still
+configured and used for address validation and as the fallback whenever the
+IPC interface is unavailable, so nothing breaks if the socket goes away.
+
 Should work on any .deb or .rpm based linux distribution (ubuntu, debian,
 fedora, centos, rhel) to download required packages. Installs both as systemd
 services as the current user but can configure a new ckpool user for both. It
@@ -30,10 +37,28 @@ speed up the initial blockchain download, or disable it for maximum paranoia.
 It will use any existing blockchain data in ~/.bitcoin if it exists for the
 chosen user.
 
-Bitcoind will be preconfigured with suitable mining defaults, and ckpool will
-be configured to start in solo mining mode on port 3333 on the current machine.
-You will be unable to mine to it until the bitcoin daemon has synced up the
-full blockchain.
+The node will be preconfigured with suitable mining defaults, and ckpool will
+be built with both Stratum V2 and mining IPC support and started in solo
+mining mode on the current machine. You will be unable to mine to it until the
+bitcoin daemon has synced up the full blockchain.
+
+Two mining ports are configured. Stratum V1 listens on 3333 as before, and
+Stratum V2 listens on 3336 alongside it, so existing V1 miners keep working
+unchanged. V2 miners connect to a URL of the form
+
+stratum2+tcp://[machine IP]:3336/[authority public key]
+
+where the authority public key is a base58 string identifying this pool. It is
+generated the first time ckpool starts and stored permanently in
+/etc/ckpool/sv2_authority.key, along with the server static key in
+/etc/ckpool/sv2_static.key. Both are kept if you re-run the installer, so the
+key your miners are configured with never changes. Run
+
+ckpool-mining-urls.sh
+
+at any time to print the V1 and V2 mining addresses, including the authority
+public key. Before the blockchain has finished syncing ckpool has not started
+yet and the key does not exist, so run it again once mining begins.
 
 You will be given the option to enable donation to the ckpool author, and a
 custom signature to be added to any solved blocks.
