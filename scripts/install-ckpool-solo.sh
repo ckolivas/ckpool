@@ -63,8 +63,8 @@ if $PREVIOUS_INSTALL; then
 fi
 
 # Main installation
-echo "Starting installation of Bitcoin Core v29.3 and CKPool-Solo. This requires sudo privileges."
-echo "Warning: Bitcoin Core will download up to ~675GB of blockchain data (or less if pruned). Ensure sufficient disk space."
+echo "Starting installation of Bitcoin Core v31.1 and CKPool-Solo. This requires sudo privileges."
+echo "Warning: Bitcoin Core downloads the whole ~810GB blockchain while syncing no matter what; pruning only limits how much is kept on disk (~15GB by default here). Ensure sufficient disk space and bandwidth."
 echo "Important: You cannot mine with CKPool-Solo until the Bitcoin Core blockchain is fully synchronized, which may take days depending on your hardware and network speed."
 
 # Prompt for service user (default to current sudo user)
@@ -92,21 +92,35 @@ else
 fi
 
 # Prompt for max disk space
-echo "Bitcoin blockchain full size is approximately 675 GB as of August 2025."
-read -p "Enter maximum disk space for Bitcoin data in GB (0 for full chain, default: 0): " max_gb
-if [ -z "$max_gb" ]; then max_gb=0; fi
-if [ "$max_gb" -eq 0 ]; then
+MIN_PRUNE_MB=550
+# A pruned node still keeps the UTXO set and block index, currently ~11 GB and
+# growing, so this floor is what pruning cannot go below regardless of prune=.
+PRUNED_OVERHEAD_GB=15
+echo "Bitcoin blockchain full size is approximately 810 GB as of August 2026."
+echo "Pruning is recommended when this node is only used for mining. CKPool needs"
+echo "the UTXO set and the current chain tip to build block templates and to verify"
+echo "and submit the blocks it solves; none of that requires keeping historical"
+echo "blocks, so pruning does not reduce what you can mine or what you are paid."
+echo "A pruned node still needs roughly ${PRUNED_OVERHEAD_GB} GB for the UTXO set and block index."
+echo "Choose the full chain only if this node will also serve historical blocks to"
+echo "other peers or rescan wallets."
+read -p "Enter maximum disk space for Bitcoin data in GB (0 for full chain, default: minimum ${MIN_PRUNE_MB}MB pruned): " max_gb
+if [ -z "$max_gb" ]; then
+    prune_mb=$MIN_PRUNE_MB
+    echo "Pruning to the minimum ${MIN_PRUNE_MB} MB of block data."
+    prune_line="prune=$prune_mb"
+    required_space=$((PRUNED_OVERHEAD_GB + 1))
+elif [ "$max_gb" -eq 0 ]; then
     prune_line=""
-    required_space=675
+    required_space=810
 else
     prune_mb=$((max_gb * 1024))
-    if [ $prune_mb -lt 550 ]; then
-        echo "Minimum prune size is 550 MB. Setting to 550 MB."
-        prune_mb=550
-        max_gb=$((prune_mb / 1024))
+    if [ $prune_mb -lt $MIN_PRUNE_MB ]; then
+        echo "Minimum prune size is ${MIN_PRUNE_MB} MB. Setting to ${MIN_PRUNE_MB} MB."
+        prune_mb=$MIN_PRUNE_MB
     fi
     prune_line="prune=$prune_mb"
-    required_space=$max_gb
+    required_space=$((PRUNED_OVERHEAD_GB + (prune_mb + 1023) / 1024))
 fi
 
 # Disk space check (add 10% buffer to required_space)
@@ -124,7 +138,7 @@ if [ "$available_space_gb" -lt "$required_space" ]; then
 fi
 
 # Prompt for assumevalid block hash
-read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 00000000000000000000c63fa7d726a1840c777a59ebc73f45a298989f78548a at block 951408, or 0 to disable): " assumevalid_hash
+read -p "To speed up blockchain sync, enter a trusted recent block hash for assumevalid (default: 0000000000000000000081c26d870f8ac4a0217b8c6dab7b63c25f03b3882c52 at block 960804, or 0 to disable): " assumevalid_hash
 if [ "$assumevalid_hash" = "0" ]; then
     assumevalid_line=""
     echo "Assumevalid disabled. Full blockchain verification will be performed."
@@ -132,7 +146,7 @@ elif [ -n "$assumevalid_hash" ]; then
     echo "Warning: Using assumevalid skips signature verification up to this block, reducing security. Ensure the hash is from a trusted source."
     assumevalid_line="assumevalid=$assumevalid_hash"
 else
-    assumevalid_line="assumevalid=00000000000000000000c63fa7d726a1840c777a59ebc73f45a298989f78548a"
+    assumevalid_line="assumevalid=0000000000000000000081c26d870f8ac4a0217b8c6dab7b63c25f03b3882c52"
 fi
 
 # Prompt for donation to CKPool author
@@ -166,8 +180,8 @@ echo "Enabling persistent journal storage for easier log access..."
 mkdir -p /var/log/journal
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
-# Download and verify Bitcoin Core v29.3 tarball
-BITCOIN_VERSION="29.3"
+# Download and verify Bitcoin Core v31.1 tarball
+BITCOIN_VERSION="31.1"
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
     BITCOIN_TAR="bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"
@@ -202,6 +216,10 @@ rpc_password=$(echo "$rpc_output" | tail -1 | sed 's/Your password://' | tr -d '
 cd ..
 
 cp -r bitcoin-${BITCOIN_VERSION}/bin/* /usr/local/bin/
+# The multiprocess node lives in libexec from v31 on, and the bin/bitcoin
+# wrapper resolves it relative to its own location as ../libexec/bitcoin-node.
+mkdir -p /usr/local/libexec
+cp bitcoin-${BITCOIN_VERSION}/libexec/bitcoin-node /usr/local/libexec/
 rm -rf bitcoin-${BITCOIN_VERSION} ${BITCOIN_TAR} SHA256SUMS SHA256SUMS.asc
 
 # Calculate dbcache: 25% of total memory in MB, capped at 12000 MB
