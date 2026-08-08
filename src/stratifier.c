@@ -8240,6 +8240,11 @@ static void parse_diff(stratum_instance_t *client, yyjson_mut_val *val)
 		LOGINFO("Discarding invalid diff %lf for client %s", diff, client->identity);
 		return;
 	}
+	/* We only really care about integer diffs so clamp the lower limit to
+	 * 1 or it will round down to zero, and a zero client diff is a divide
+	 * by zero in the vardiff calculation of add_submit(). */
+	if (unlikely(diff < 1))
+		diff = 1;
 	LOGINFO("Set client %s to diff %lf", client->identity, diff);
 	client->diff = diff;
 }
@@ -9816,8 +9821,14 @@ static void *statsupdate(void __maybe_unused *arg)
 		fprintf(fp, "%s\n", s);
 		dealloc(s);
 
-		/* Round to 4 significant digits */
-		percent = round(stats->accounted_diff_shares * 10000 / stats->network_diff) / 100;
+		/* Round to 4 significant digits. A zero network_diff would be a
+		 * fatal divide by zero as ckpool unmasks FE_DIVBYZERO; leave
+		 * percent at 0 until the first workbase sets a real value. */
+		if (likely(stats->network_diff > 0))
+			percent = round(stats->accounted_diff_shares * 10000 /
+					stats->network_diff) / 100;
+		else
+			percent = 0;
 		doc = yyjson_mut_pack("{sf,sI,sI,sI,sf,sf,sf,sf}",
 		        "diff", percent,
 			"accepted", stats->accounted_diff_shares,
@@ -10064,6 +10075,7 @@ void *throbber(void __maybe_unused *arg)
 	rename_proc("throbber");
 
 	while (42) {
+		workbase_t *wb;
 		double sdiff;
 		pool_stats_t *stats;
 		char stamp[128], hashrate[16], ch;
@@ -10076,8 +10088,13 @@ void *throbber(void __maybe_unused *arg)
 		suffix_string(stats->dsps1 * nonces, hashrate, 16, 3);
 		ch = status_chars[(counter++) & 0x3];
 		get_timestamp(stamp);
-		if (likely(sdata->current_workbase)) {
-			double bdiff = sdiff / sdata->current_workbase->network_diff * 100;
+		/* Read the workbase once: unlocked here as being transiently
+		 * wrong is harmless, but testing and dereferencing separately
+		 * is not. A zero network_diff would be a fatal divide by zero
+		 * as ckpool unmasks FE_DIVBYZERO. */
+		wb = sdata->current_workbase;
+		if (likely(wb && wb->network_diff)) {
+			double bdiff = sdiff / wb->network_diff * 100;
 
 			fprintf(stdout, "\33[2K\r%s %c %sH/s  %.1f SPS  %d users  %d workers  %.0f shares  %.1f%% diff",
 				stamp, ch, hashrate, stats->sps1, stats->users + stats->remote_users,
