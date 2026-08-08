@@ -6694,6 +6694,20 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 #include "sv2_jd.h"
 #include "connector.h"
 
+/* Round a difficulty up to the int64_t client difficulty is carried as,
+ * returning 0 for anything not usable. Bounded because a double to int64_t
+ * conversion that overflows raises FE_INVALID, which is fatal here, and SV2
+ * difficulty can be derived from a client supplied max_target. Matches the
+ * 1e18 bound suggest_diff() applies to the SV1 side. */
+static int64_t sane_diff_int64(const double diff)
+{
+	if (unlikely(!isfinite(diff) || diff < 1.0))
+		return 0;
+	if (unlikely(diff > 1e18))
+		return (int64_t)1e18;
+	return (int64_t)(diff + 0.999999);
+}
+
 bool stratifier_sv2_snapshot_work(struct sv2_work_snap *out, int64_t instance_id)
 {
 	sdata_t *sdata = ckpool.sdata;
@@ -6826,7 +6840,7 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 	client->useragent = strdup("sv2");
 	/* Round up so advertised target (from double diff) is never stricter
 	 * than the integer share threshold. */
-	client->diff = client->old_diff = (int64_t)(diff + 0.999999);
+	client->diff = client->old_diff = sane_diff_int64(diff);
 	if (client->diff < 1)
 		client->diff = client->old_diff = ckpool.startdiff;
 	memcpy(client->enonce1bin, enonce1, enonce1_len);
@@ -6903,11 +6917,11 @@ void stratifier_sv2_set_diff(int64_t instance_id, double diff)
 	stratum_instance_t *client;
 	int64_t d;
 
-	if (!sdata || instance_id < 1 || !isfinite(diff) || diff < 1.0)
+	if (!sdata || instance_id < 1)
 		return;
-	d = (int64_t)(diff + 0.999999);
+	d = sane_diff_int64(diff);
 	if (d < 1)
-		d = 1;
+		return;
 	client = ref_instance_by_id(sdata, instance_id);
 	if (!client)
 		return;

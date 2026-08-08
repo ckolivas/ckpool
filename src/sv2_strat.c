@@ -50,6 +50,9 @@ enum sv2_work_src {
 /* Recent jobs still accepted after tip update (parity with multi-workbase SV1). */
 #define SV2_JOB_RING			8
 
+/* Ceiling on channel difficulty, see clamp_channel_diff(). */
+#define SV2_MAX_CHANNEL_DIFF		1e15
+
 /* Snapshot of an accepted custom job for share reconstruction */
 struct sv2_custom_job {
 	uint32_t job_id;
@@ -568,6 +571,40 @@ static int target_cmp_le(const uint8_t a[32], const uint8_t b[32])
 }
 
 /*
+ * True if a wire f32 is finite. Screened by bit pattern deliberately: ckpool
+ * unmasks FE_INVALID, and on x86-64 both (double)f and isfinite(f) compile to
+ * SSE ops that raise #IA — and so SIGFPE — when f is a *signalling* NaN. A
+ * guard written as isfinite(f) faults on exactly the input it exists to
+ * reject, so an untrusted f32 must never reach the FPU until it is known
+ * finite. Sign is not considered; ordered comparisons are safe once the value
+ * cannot be NaN.
+ */
+static bool wire_f32_finite(float f)
+{
+	uint32_t bits;
+
+	memcpy(&bits, &f, sizeof(bits));
+	return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
+/*
+ * Bound a channel difficulty. Difficulty derived from a client supplied
+ * max_target is unbounded above: diff_from_target() floors a zero target at
+ * difficulty 1, so an all zero maximum_target yields ~2.7e67, and the
+ * stratifier carries client difficulty as an int64_t where an out of range
+ * double conversion raises FE_INVALID (fatal). A ceiling this far above
+ * network difficulty only ever engages on a target no miner could hit.
+ */
+static double clamp_channel_diff(double diff)
+{
+	if (!isfinite(diff) || diff < 1.0)
+		return 1.0;
+	if (diff > SV2_MAX_CHANNEL_DIFF)
+		return SV2_MAX_CHANNEL_DIFF;
+	return diff;
+}
+
+/*
  * A server (listen port) above 4000 is a highdiff port: like SV1, sessions on
  * it float no lower than ckpool.highdiff. Returns the floor (0 if not highdiff).
  */
@@ -592,7 +629,7 @@ static void choose_channel_diff(float nominal_hr, const uint8_t max_target[32],
 		mindiff = floor;
 
 	/* Wire f32 is untrusted — reject non-finite / negative before math. */
-	if (isfinite((double)nominal_hr) && nominal_hr > 0.0f)
+	if (wire_f32_finite(nominal_hr) && nominal_hr > 0.0f)
 		hr = (double)nominal_hr;
 	else
 		hr = 0.0;
@@ -617,9 +654,7 @@ static void choose_channel_diff(float nominal_hr, const uint8_t max_target[32],
 	max_diff = diff_from_target((uchar *)max_target);
 	if (isfinite(max_diff) && max_diff > 0 && diff < max_diff)
 		diff = max_diff;
-	if (!isfinite(diff) || diff < 1.0)
-		diff = 1.0;
-	*diff_out = diff;
+	*diff_out = clamp_channel_diff(diff);
 }
 
 static void assign_enonce1(struct sv2_channel *ch, int64_t client_id, uint32_t ch_id)
@@ -831,9 +866,7 @@ static void push_set_target(struct sv2_channel *ch)
 	target_from_diff(wire_target, diff);
 	if (has_max && target_cmp_le(wire_target, max_target) > 0) {
 		memcpy(wire_target, max_target, 32);
-		diff = diff_from_target(max_target);
-		if (!isfinite(diff) || diff < 1.0)
-			diff = 1.0;
+		diff = clamp_channel_diff(diff_from_target(max_target));
 		ch->diff = diff;
 	}
 	mutex_unlock(&sv2_lock);
@@ -974,9 +1007,7 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	target_from_diff(ok.target, ch->diff);
 	if (target_cmp_le(ok.target, ch->max_target) > 0) {
 		memcpy(ok.target, ch->max_target, 32);
-		ch->diff = diff_from_target(ch->max_target);
-		if (!isfinite(ch->diff) || ch->diff < 1.0)
-			ch->diff = 1.0;
+		ch->diff = clamp_channel_diff(diff_from_target(ch->max_target));
 	}
 	ok.extranonce_prefix_len = ch->enonce1_len;
 	memcpy(ok.extranonce_prefix, ch->enonce1, ch->enonce1_len);
@@ -1333,9 +1364,7 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	target_from_diff(ok.target, ch->diff);
 	if (target_cmp_le(ok.target, ch->max_target) > 0) {
 		memcpy(ok.target, ch->max_target, 32);
-		ch->diff = diff_from_target(ch->max_target);
-		if (!isfinite(ch->diff) || ch->diff < 1.0)
-			ch->diff = 1.0;
+		ch->diff = clamp_channel_diff(diff_from_target(ch->max_target));
 	}
 	ok.extranonce_size = ch->extranonce_size;
 	ok.extranonce_prefix_len = ch->enonce1_len;
@@ -1848,7 +1877,7 @@ uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 			break;
 		}
 		/* Spec: no response when accepted; Error only when invalid. */
-		if (!isfinite(nom_hr) || nom_hr < 0.0f) {
+		if (!wire_f32_finite(nom_hr) || nom_hr < 0.0f) {
 			memset(&uerr, 0, sizeof(uerr));
 			uerr.channel_id = ch_id;
 			snprintf(uerr.error_code, sizeof(uerr.error_code),
