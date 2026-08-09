@@ -286,7 +286,7 @@ cd /opt/ckpool
 make -j$(nproc)
 make install
 
-# Set up CKPool config (minimal, per README-SOLOMINING)
+# Set up CKPool config (minimal, per README-SOLOMINING.md)
 mkdir -p /etc/ckpool
 # Restore the SV2 keys kept from a previous install before ckpool can generate
 # new ones on first start.

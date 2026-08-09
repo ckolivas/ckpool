@@ -1,11 +1,11 @@
-Stratum proxy installation.
+# Stratum proxy installation
 
----
+## All-in-one proxy quickstart
 
-ALL-IN-ONE PROXY QUICKSTART:
-
+```bash
 wget https://api.bitbucket.org/2.0/repositories/ckolivas/ckpool/src/master/scripts/install-ckproxy.sh
 sudo scripts/install-ckproxy.sh
+```
 
 This will download the latest ckpool source code, install the required build
 packages, build and install ckpool, and set up ckproxy as a systemd service.
@@ -21,12 +21,14 @@ You will be prompted for one or more upstream pools to connect to. Pools are
 tried in the order entered, with automatic failover to the next entry if the
 first becomes unreachable. Each pool needs a URL, a username (usually your
 bitcoin payout address for solo pools, or worker name for regular pools) and
-a password (often unused - defaults to "x"). Accepted URL formats:
+a password (often unused - defaults to `x`). Accepted URL formats:
 
-  host:port                     Stratum V1 (e.g. solo.ckpool.org:3333)
-  stratum+tcp://host:port       Stratum V1 (explicit scheme)
-  host:port/AUTHORITYKEY        Stratum V2 (Noise-encrypted)
-  stratum2+tcp://host:port/KEY  Stratum V2 (explicit scheme)
+| URL form | Protocol |
+|----------|----------|
+| `host:port` | Stratum V1 (e.g. `solo.ckpool.org:3333`) |
+| `stratum+tcp://host:port` | Stratum V1 (explicit scheme) |
+| `host:port/AUTHORITYKEY` | Stratum V2 (Noise-encrypted) |
+| `stratum2+tcp://host:port/KEY` | Stratum V2 (explicit scheme) |
 
 Each pool's connection is tested as it is entered. Stratum V1 pools are tested
 with a real stratum handshake; Stratum V2 pools are encrypted so only TCP
@@ -37,22 +39,25 @@ You will then be asked which local port ckproxy should listen on for your
 miners (default 3334). Point your miners at the IP address of the proxy
 machine on that port, e.g.:
 
-  stratum+tcp://192.168.1.100:3334
+```
+stratum+tcp://192.168.1.100:3334
+```
 
 The proxy aggregates all your miners into a single upstream connection, which
 substantially reduces bandwidth to the upstream pool and keeps working through
 brief upstream outages.
 
-Configuration is written to /etc/ckpool/ckproxy.conf and logs go to
-/var/log/ckproxy. The service starts on boot and can be managed with:
+Configuration is written to `/etc/ckpool/ckproxy.conf` and logs go to
+`/var/log/ckproxy`. The service starts on boot and can be managed with:
 
-  systemctl status ckproxy
-  systemctl restart ckproxy
-  journalctl -u ckproxy -f
+```bash
+systemctl status ckproxy
+systemctl restart ckproxy
+journalctl -u ckproxy -f
+```
 
-To change pools or ports later, edit /etc/ckpool/ckproxy.conf and restart the
-service. See the ckproxy.conf example in the source directory for the full
+To change pools or ports later, edit `/etc/ckpool/ckproxy.conf` and restart the
+service. See the `ckproxy.conf` example in the source directory for the full
 list of configuration options, including Stratum V2 job declaration.
-
 
 Good luck.
