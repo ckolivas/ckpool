@@ -4,7 +4,8 @@
 
 ```bash
 wget https://api.bitbucket.org/2.0/repositories/ckolivas/ckpool/src/master/scripts/install-ckpool-solo.sh
-sudo scripts/install-ckpool-solo.sh
+chmod +x install-ckpool-solo.sh
+sudo ./install-ckpool-solo.sh
 ```
 
 This will download ckpool source code, v31.1 bitcoin daemon binary, check its
