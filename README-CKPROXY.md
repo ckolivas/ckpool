@@ -13,7 +13,9 @@ Follow the prompts to configure your upstream pool(s) and the local port for
 your miners to connect to.
 
 Should work on any .deb or .rpm based linux distribution (ubuntu, debian,
-fedora, centos, rhel) to download required packages. Installs as a systemd
+fedora, centos, rhel, and derivatives such as mint, pop, raspbian, kali,
+devuan, rocky, alma, oracle and amazon linux, identified by the ID_LIKE field
+in /etc/os-release) to download required packages. Installs as a systemd
 service running as the current user but can configure a new ckpool user
 instead.
 

@@ -3,17 +3,21 @@
 # Exit on errors
 set -e
 
-# Function to detect distro and set package manager
+# Function to detect distro and set package manager. Derivatives (mint, pop,
+# devuan, raspbian, kali, rocky, alma, oracle, amazon...) use the package names
+# of the distro they are built from, so match on ID first and fall back to the
+# ID_LIKE list that os-release advertises for exactly this purpose.
 detect_distro() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         DISTRO=$ID
+        DISTRO_LIKE=${ID_LIKE:-}
     else
         echo "Unsupported distribution. Exiting."
         exit 1
     fi
-    case $DISTRO in
-        ubuntu|debian)
+    case " $DISTRO $DISTRO_LIKE " in
+        *" ubuntu "*|*" debian "*)
             PKG_MANAGER="apt"
             INSTALL_CMD="apt install -y"
             UPDATE_CMD="apt update"
@@ -21,7 +25,7 @@ detect_distro() {
             # IPC shim links against; libsodium-dev is required by Stratum V2.
             PACKAGES="build-essential git autoconf automake libtool pkg-config yasm libzmq3-dev curl screen libevent-dev libssl-dev bsdmainutils python3 gnupg jq libcapnp-dev libsodium-dev"
             ;;
-        fedora|centos|rhel)
+        *" fedora "*|*" rhel "*|*" centos "*)
             PKG_MANAGER="dnf"  # or yum for older CentOS
             INSTALL_CMD="dnf install -y"
             UPDATE_CMD="dnf check-update"
@@ -29,14 +33,28 @@ detect_distro() {
             ;;
         *)
             echo "Unsupported distribution: $DISTRO. Exiting."
+            echo "Debian and Red Hat based distributions are supported; this one declares"
+            echo "neither in its /etc/os-release ID or ID_LIKE."
             exit 1
             ;;
     esac
+    if [ "$DISTRO" != "$DISTRO_LIKE" ] && [ -n "$DISTRO_LIKE" ]; then
+        echo "Detected $DISTRO, installing $PKG_MANAGER packages for $DISTRO_LIKE."
+    fi
 }
 
 # Check if sudo
 if [ "$EUID" -ne 0 ]; then
     echo "Please run with sudo or as root."
+    exit 1
+fi
+
+# Bitcoin Core and CKPool are installed as systemd services, and some supported
+# derivatives (devuan, antix, mx without systemd) do not have it.
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl not found. This installer sets up Bitcoin Core and CKPool as"
+    echo "systemd services, which this system does not use. Build and install"
+    echo "manually instead, see the self install instructions in README-SOLOMINING.md."
     exit 1
 fi
 

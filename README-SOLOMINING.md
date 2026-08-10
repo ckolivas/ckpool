@@ -20,7 +20,9 @@ configured and used for address validation and as the fallback whenever the
 IPC interface is unavailable, so nothing breaks if the socket goes away.
 
 Should work on any .deb or .rpm based linux distribution (ubuntu, debian,
-fedora, centos, rhel) to download required packages. Installs both as systemd
+fedora, centos, rhel, and derivatives such as mint, pop, raspbian, kali,
+devuan, rocky, alma, oracle and amazon linux, identified by the ID_LIKE field
+in /etc/os-release) to download required packages. Installs both as systemd
 services as the current user but can configure a new ckpool user for both. It
 defaults to running a minimally pruned bitcoin blockchain, keeping only 550MB
 of block data, to minimise hard drive storage. Pruning costs you nothing on a

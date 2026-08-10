@@ -13,31 +13,42 @@ CONF_FILE="$CONF_DIR/ckproxy.conf"
 LOG_DIR="/var/log/ckproxy"
 SERVICE_FILE="/etc/systemd/system/ckproxy.service"
 
-# Function to detect distro and set package manager
+# Function to detect distro and set package manager. Derivatives (mint, pop,
+# devuan, raspbian, kali, rocky, alma, oracle, amazon...) use the package names
+# of the distro they are built from, so match on ID first and fall back to the
+# ID_LIKE list that os-release advertises for exactly this purpose.
 detect_distro() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         DISTRO=$ID
+        DISTRO_LIKE=${ID_LIKE:-}
     else
         echo "Unsupported distribution. Exiting."
         exit 1
     fi
-    case $DISTRO in
-        ubuntu|debian)
+    case " $DISTRO $DISTRO_LIKE " in
+        *" ubuntu "*|*" debian "*)
+            PKG_MANAGER="apt"
             INSTALL_CMD="apt install -y"
             UPDATE_CMD="apt update"
             PACKAGES="build-essential git autoconf automake libtool pkg-config yasm libzmq3-dev"
             ;;
-        fedora|centos|rhel)
+        *" fedora "*|*" rhel "*|*" centos "*)
+            PKG_MANAGER="dnf"
             INSTALL_CMD="dnf install -y"
             UPDATE_CMD="dnf check-update || true"
             PACKAGES="gcc gcc-c++ make git autoconf automake libtool pkgconf-pkg-config yasm zeromq-devel"
             ;;
         *)
             echo "Unsupported distribution: $DISTRO. Exiting."
+            echo "Debian and Red Hat based distributions are supported; this one declares"
+            echo "neither in its /etc/os-release ID or ID_LIKE."
             exit 1
             ;;
     esac
+    if [ "$DISTRO" != "$DISTRO_LIKE" ] && [ -n "$DISTRO_LIKE" ]; then
+        echo "Detected $DISTRO, installing $PKG_MANAGER packages for $DISTRO_LIKE."
+    fi
 }
 
 # Parse a pool url into PARSED_HOST / PARSED_PORT / PARSED_SV2.
@@ -100,6 +111,15 @@ json_escape() {
 # Check if sudo
 if [ "$EUID" -ne 0 ]; then
     echo "Please run with sudo or as root."
+    exit 1
+fi
+
+# ckproxy is installed as a systemd service, and some supported derivatives
+# (devuan, antix, mx without systemd) do not have it.
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl not found. This installer sets up ckproxy as a systemd service,"
+    echo "which this system does not use. Build ckpool and run src/ckproxy manually"
+    echo "instead, see README-CKPOOL_MODES.md for the proxy configuration."
     exit 1
 fi
 
