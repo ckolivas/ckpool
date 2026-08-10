@@ -68,6 +68,16 @@ yet and the key does not exist, so run it again once mining begins.
 You will be given the option to enable donation to the ckpool author, and a
 custom signature to be added to any solved blocks.
 
+The installer can be re-run at any time to update an existing installation. It
+keeps the blockchain data, the SV2 keys and the ckpool logs, reuses the existing
+RPC credentials, and offers every previous setting as the default answer, so
+pressing enter through the prompts updates the software without changing the
+configuration. The previous `bitcoin.conf` and `ckpool.conf` are saved as
+`.bak` alongside the new ones. Nothing running is stopped or replaced until the
+new version has been downloaded, verified and built, and changing the pruning of
+a node that already holds block data requires an explicit confirmation, since
+Bitcoin Core cannot undo that in either direction.
+
 ## Self install instructions
 
 (build instructions not included.)
