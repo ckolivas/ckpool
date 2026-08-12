@@ -605,8 +605,14 @@ static void generate_coinbase(workbase_t *wb)
 		len = ser_number(wb->coinb1bin + ofs, wb->height);
 	ofs += len;
 
-	/* Followed by flag */
+	/* Followed by flag. gen_gbtbase() bounds these but clamp again here
+	 * since overflowing the fixed size coinb1 arrays with them would be
+	 * fatal. */
 	len = strlen(wb->flags) / 2;
+	if (unlikely(len > MAX_GBT_FLAGS_LEN)) {
+		LOGWARNING("Truncating oversized coinbase flags of length %d", len);
+		len = MAX_GBT_FLAGS_LEN;
+	}
 	wb->coinb1bin[ofs++] = len;
 	hex2bin(wb->coinb1bin + ofs, wb->flags, len);
 	ofs += len;
@@ -8323,6 +8329,17 @@ static user_instance_t *generate_remote_user(const char *workername)
 	username = strsep(&base_username, "._");
 	if (!username || !strlen(username))
 		username = base_username;
+	/* The username becomes a filename under logs/users/ so it must be
+	 * filtered as it is for directly connected clients in parse_authorise,
+	 * remembering the fallback above can leave separators in it. */
+	if (unlikely(!username || !strlen(username))) {
+		LOGWARNING("Empty username from remote workername %s", workername);
+		return NULL;
+	}
+	if (unlikely(strchr(username, '/') || username[0] == '.')) {
+		LOGWARNING("Invalid remote username %s", username);
+		return NULL;
+	}
 	len = strlen(username);
 	if (unlikely(len > 127))
 		username[127] = '\0';
@@ -8367,6 +8384,10 @@ static void parse_remote_share(sdata_t *sdata, yyjson_mut_val *val, const char *
 	if (unlikely(!isfinite(sdiff)))
 		sdiff = 0;
 	user = generate_remote_user(workername);
+	if (unlikely(!user)) {
+		LOGWARNING("Failed to generate user from remote message %s", buf);
+		return;
+	}
 	user->authorised = true;
 	worker = get_worker(sdata, user, workername);
 	check_best_diff(sdata, user, worker, sdiff, NULL);

@@ -752,7 +752,12 @@ retry:
 		}
 	}
 	proxi->nonce2len = size;
-	proxi->clients_per_proxy = 1ll << ((size - 3) * 8);
+	/* Only nonce2 space beyond the 3 bytes we use ourselves can be shared
+	 * amongst clients. Avoid a negative shift with smaller sizes. */
+	if (size > 3)
+		proxi->clients_per_proxy = 1ll << ((size - 3) * 8);
+	else
+		proxi->clients_per_proxy = 1;
 
 	LOGNOTICE("Found notify for new proxy %d:%d with enonce %s nonce2len %d", proxi->id,
 		proxi->subid, proxi->enonce1, proxi->nonce2len);

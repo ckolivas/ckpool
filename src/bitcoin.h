@@ -12,6 +12,12 @@
 
 typedef struct genwork gbtbase_t;
 
+/* Maximum binary length of the optional coinbaseaux flags accepted from
+ * getblocktemplate. The flags are copied verbatim into the fixed size coinbase
+ * templates in generate_coinbase() and must also leave the coinbase scriptsig
+ * under its 100 byte consensus limit. */
+#define MAX_GBT_FLAGS_LEN 32
+
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit);
 yyjson_doc *validate_txn(connsock_t *cs, const char *txn);
 bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt);

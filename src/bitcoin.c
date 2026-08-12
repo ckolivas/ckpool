@@ -243,6 +243,14 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
 	gbt->height = height;
 
+	/* The flags are optional non-consensus data appended to the coinbase
+	 * scriptsig and are decoded into fixed size buffers, so discard any
+	 * that are not valid hex of a length that fits rather than deriving
+	 * work from them. */
+	if (unlikely(*flags && (strlen(flags) > MAX_GBT_FLAGS_LEN * 2 || !validhex(flags)))) {
+		LOGERR("Invalid coinbaseaux flags %s in gbt, ignoring", flags);
+		flags = "";
+	}
 	gbt->flags = strdup(flags);
 
 	/* Create immutable json for faster access in gbt */
