@@ -19,7 +19,7 @@ GNU Public license V3. See included [COPYING](COPYING) for details.
 ## Bitcoind & solo mining download and quickstart
 
 ```bash
-wget https://bitbucket.org/ckolivas/ckpool/raw/master/scripts/install-ckpool-solo.sh
+wget https://api.bitbucket.org/2.0/repositories/ckolivas/ckpool/src/master/scripts/install-ckpool-solo.sh
 chmod +x install-ckpool-solo.sh
 sudo ./install-ckpool-solo.sh
 ```
