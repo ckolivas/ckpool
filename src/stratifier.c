@@ -40,6 +40,7 @@
 #ifdef HAVE_SV2
 #include "sv2_strat.h"
 #include "sv2_jd.h"
+#include "sv2_tx.h"
 #endif
 
 /* Consistent across all pool instances */
@@ -6988,7 +6989,6 @@ bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 	stratum_instance_t *client;
 	sdata_t *sdata = ckpool.sdata;
 	int cblen, i, en1len;
-	uint32_t *data32, *swap32;
 
 	if (!stratifier_sv2_snapshot_work(&snap, instance_id))
 		return false;
@@ -7016,9 +7016,11 @@ bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 		gen_hash(merkle_sha, merkle_root, 64);
 		memcpy(merkle_sha, merkle_root, 32);
 	}
-	data32 = (uint32_t *)merkle_sha;
-	swap32 = (uint32_t *)merkle_root_le;
-	flip_32(swap32, data32);
+	/* SV2 U256 fields carry the raw SHA256d digest bytes in little-endian
+	 * integer order. gen_hash() already returns those bytes; applying
+	 * CKPool's internal flip_32() here would word-swap the Merkle root and
+	 * cause miners to hash a different header than the pool validates. */
+	sv2_merkle_root_to_u256_le(merkle_sha, merkle_root_le);
 
 	if (wb_id_out)
 		*wb_id_out = snap.wb_id;

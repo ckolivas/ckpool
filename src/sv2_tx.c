@@ -270,6 +270,11 @@ void sv2_merkle_root_from_path(const uint8_t coinbase_txid[32],
 	memcpy(root, pair, 32);
 }
 
+void sv2_merkle_root_to_u256_le(const uint8_t raw_hash[32], uint8_t out[32])
+{
+	memcpy(out, raw_hash, 32);
+}
+
 double sv2_diff_from_nbits(uint32_t nbits)
 {
 	uint32_t be = htobe32(nbits);
