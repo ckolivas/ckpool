@@ -295,6 +295,14 @@ additional IPs/ports to bind to that will accept incoming requests for mining
 node communications. It is recommended to selectively isolate this address
 to minimise unnecessary communications with unauthorised nodes.
 
+`"passthroughserver"` : This takes the same format as the serverurl array and
+specifies additional IPs/ports to bind to that will accept incoming connections
+from downstream ckpassthrough/ckredirector instances. Passthrough connections
+are only accepted on these bindings, so a pool with no `"passthroughserver"`
+entry will refuse them on its regular serverurl ports. It is recommended to
+selectively isolate this address to minimise unnecessary communications with
+unauthorised passthroughs.
+
 `"nonce1length"` : This is optional allowing the extranonce1 length to be chosen
 from 2 to 8. Default 4
 

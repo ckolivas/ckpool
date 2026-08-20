@@ -91,6 +91,12 @@ Mandatory config fields:
 
 - At least one `"proxy"` entry with `"url"`, `"auth"`, and `"pass"`.
 
+Mandatory upstream pool config fields:
+
+- At least one `"passthroughserver"` entry, and the `"proxy"` `"url"` above must
+  point at it. Upstream ckpool instances only accept passthrough connections on
+  bindings listed there.
+
 ## Redirector mode
 
 When run with the `-R` or `--redirector` parameter, ckpool operates in the same
@@ -111,6 +117,10 @@ Mandatory config fields:
 
 - At least one `"proxy"` entry with `"url"`, `"auth"`, and `"pass"`.
 - At least one `"redirecturl"` entry.
+
+Mandatory upstream pool config fields:
+
+- At least one `"passthroughserver"` entry, matching the `"proxy"` `"url"` above.
 
 ---
 

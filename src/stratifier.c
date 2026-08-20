@@ -8117,8 +8117,8 @@ static void parse_method(sdata_t *sdata, stratum_instance_t *client,
 	if (unlikely(cmdmatch(method, "mining.passthrough"))) {
 		char buf[256];
 
-		if (ckpool.proxy || ckpool.node ) {
-			LOGNOTICE("Dropping client %s %s trying to connect as passthrough on unsupported server %d",
+		if (!ckpool.passthroughserver[client->server] || ckpool.proxy || ckpool.node) {
+			LOGNOTICE("Dropping client %s %s trying to connect as passthrough on non passthrough server %d",
 				  client->identity, client->address, client->server);
 			connector_drop_client(client_id);
 			drop_client(sdata, client_id);

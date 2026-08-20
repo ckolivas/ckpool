@@ -286,6 +286,8 @@ struct ckpool_instance {
 	bool *nodeserver; // If this server URL serves node information
 	int nodeservers; // If this server has remote node servers
 	bool *trusted; // If this server URL accepts trusted remote nodes
+	bool *passthroughserver; // If this server URL accepts passthrough clients
+	int passthroughservers; // Number of passthrough accepting bindings
 	char *upstream; // Upstream pool in trusted remote mode
 
 	int update_interval; // Seconds between stratum updates

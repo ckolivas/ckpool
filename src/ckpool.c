@@ -1407,6 +1407,17 @@ static void parse_proxies(yyjson_val *arr_val, const int arr_size)
 	}
 }
 
+/* Grow bool parallel arrays to new_n, zero-filling any new slots. */
+static bool *grow_bools(bool *old, int old_n, int new_n)
+{
+	bool *p = ckzalloc(sizeof(bool) * new_n);
+
+	if (old && old_n > 0)
+		memcpy(p, old, sizeof(bool) * ((old_n < new_n) ? old_n : new_n));
+	free(old);
+	return p;
+}
+
 static bool parse_serverurls(yyjson_val *arr_val)
 {
 	bool ret = false;
@@ -1428,6 +1439,7 @@ static bool parse_serverurls(yyjson_val *arr_val)
 	ckpool.server_highdiff = ckzalloc(sizeof(bool) * arr_size);
 	ckpool.nodeserver = ckzalloc(sizeof(bool) * arr_size);
 	ckpool.trusted = ckzalloc(sizeof(bool) * arr_size);
+	ckpool.passthroughserver = ckzalloc(sizeof(bool) * arr_size);
 #ifdef HAVE_SV2
 	ckpool.server_sv2 = ckzalloc(sizeof(bool) * arr_size);
 	ckpool.server_sv2_jd = ckzalloc(sizeof(bool) * arr_size);
@@ -1482,17 +1494,6 @@ static void free_sv2_urllist(char ***urls, int *nurls)
 		dealloc(*urls);
 	}
 	*nurls = 0;
-}
-
-/* Grow bool parallel arrays to new_n, zero-filling any new slots. */
-static bool *grow_bools(bool *old, int old_n, int new_n)
-{
-	bool *p = ckzalloc(sizeof(bool) * new_n);
-
-	if (old && old_n > 0)
-		memcpy(p, old, sizeof(bool) * ((old_n < new_n) ? old_n : new_n));
-	free(old);
-	return p;
 }
 
 /*
@@ -1592,6 +1593,7 @@ static void append_sv2_serverurls(char **urls, int nurl, bool jd, int defport)
 	ckpool.server_highdiff = grow_bools(ckpool.server_highdiff, n, total);
 	ckpool.nodeserver = grow_bools(ckpool.nodeserver, n, total);
 	ckpool.trusted = grow_bools(ckpool.trusted, n, total);
+	ckpool.passthroughserver = grow_bools(ckpool.passthroughserver, n, total);
 	ckpool.server_sv2 = grow_bools(ckpool.server_sv2, n, total);
 	ckpool.server_sv2_jd = grow_bools(ckpool.server_sv2_jd, n, total);
 
@@ -1613,6 +1615,7 @@ static void append_sv2_serverurls(char **urls, int nurl, bool jd, int defport)
 		ckpool.server_highdiff[idx] = false;
 		ckpool.nodeserver[idx] = false;
 		ckpool.trusted[idx] = false;
+		ckpool.passthroughserver[idx] = false;
 		ckpool.server_sv2[idx] = true;
 		ckpool.server_sv2_jd[idx] = jd;
 		added++;
@@ -1623,65 +1626,45 @@ static void append_sv2_serverurls(char **urls, int nurl, bool jd, int defport)
 }
 #endif
 
-static void parse_nodeservers(yyjson_val *arr_val)
+/* Append an array of extra URLs to serverurl[], growing all the parallel
+ * per-server flag arrays, and set the flag array *flags for each new entry. */
+static void parse_extra_serverurls(yyjson_val *arr_val, const char *name, bool **flags,
+				   int *count)
 {
 	int arr_size, i, j, total_urls;
 
 	if (!arr_val)
 		return;
 	if (!yyjson_is_arr(arr_val)) {
-		LOGWARNING("Unable to parse nodeservers entries as an array");
+		LOGWARNING("Unable to parse %s entries as an array", name);
 		return;
 	}
 	arr_size = yyjson_arr_size(arr_val);
 	if (!arr_size) {
-		LOGWARNING("Nodeserver array empty");
+		LOGWARNING("%s array empty", name);
 		return;
 	}
 	total_urls = ckpool.serverurls + arr_size;
 	ckpool.serverurl = realloc(ckpool.serverurl, sizeof(char *) * total_urls);
-	ckpool.nodeserver = realloc(ckpool.nodeserver, sizeof(bool) * total_urls);
-	ckpool.trusted = realloc(ckpool.trusted, sizeof(bool) * total_urls);
+	ckpool.server_highdiff = grow_bools(ckpool.server_highdiff, ckpool.serverurls, total_urls);
+	ckpool.nodeserver = grow_bools(ckpool.nodeserver, ckpool.serverurls, total_urls);
+	ckpool.trusted = grow_bools(ckpool.trusted, ckpool.serverurls, total_urls);
+	ckpool.passthroughserver = grow_bools(ckpool.passthroughserver, ckpool.serverurls, total_urls);
+#ifdef HAVE_SV2
+	ckpool.server_sv2 = grow_bools(ckpool.server_sv2, ckpool.serverurls, total_urls);
+	ckpool.server_sv2_jd = grow_bools(ckpool.server_sv2_jd, ckpool.serverurls, total_urls);
+#endif
 	for (i = 0, j = ckpool.serverurls; j < total_urls; i++, j++) {
 		yyjson_val *val = yyjson_arr_get(arr_val, i);
 
-		if (!_yyjson_get_string(&ckpool.serverurl[j], val, "nodeserver"))
-			LOGWARNING("Invalid nodeserver entry number %d", i);
-		ckpool.nodeserver[j] = true;
-		ckpool.nodeservers++;
+		if (!_yyjson_get_string(&ckpool.serverurl[j], val, name))
+			LOGWARNING("Invalid %s entry number %d", name, i);
+		(*flags)[j] = true;
+		if (count)
+			(*count)++;
 	}
 	ckpool.serverurls = total_urls;
 }
-
-static void parse_trusted(yyjson_val *arr_val)
-{
-	int arr_size, i, j, total_urls;
-
-	if (!arr_val)
-		return;
-	if (!yyjson_is_arr(arr_val)) {
-		LOGWARNING("Unable to parse trusted server entries as an array");
-		return;
-	}
-	arr_size = yyjson_arr_size(arr_val);
-	if (!arr_size) {
-		LOGWARNING("Trusted array empty");
-		return;
-	}
-	total_urls = ckpool.serverurls + arr_size;
-	ckpool.serverurl = realloc(ckpool.serverurl, sizeof(char *) * total_urls);
-	ckpool.nodeserver = realloc(ckpool.nodeserver, sizeof(bool) * total_urls);
-	ckpool.trusted = realloc(ckpool.trusted, sizeof(bool) * total_urls);
-	for (i = 0, j = ckpool.serverurls; j < total_urls; i++, j++) {
-		yyjson_val *val = yyjson_arr_get(arr_val, i);
-
-		if (!_yyjson_get_string(&ckpool.serverurl[j], val, "trusted"))
-			LOGWARNING("Invalid trusted server entry number %d", i);
-		ckpool.trusted[j] = true;
-	}
-	ckpool.serverurls = total_urls;
-}
-
 
 static bool parse_redirecturls(yyjson_val *arr_val)
 {
@@ -1775,6 +1758,7 @@ static void parse_config(void)
 			ckpool.server_highdiff = ckzalloc(sizeof(bool));
 			ckpool.nodeserver = ckzalloc(sizeof(bool));
 			ckpool.trusted = ckzalloc(sizeof(bool));
+			ckpool.passthroughserver = ckzalloc(sizeof(bool));
 #ifdef HAVE_SV2
 			ckpool.server_sv2 = ckzalloc(sizeof(bool));
 			ckpool.server_sv2_jd = ckzalloc(sizeof(bool));
@@ -1782,9 +1766,12 @@ static void parse_config(void)
 		}
 	}
 	arr_val = yyjson_obj_get(json_conf, "nodeserver");
-	parse_nodeservers(arr_val);
+	parse_extra_serverurls(arr_val, "nodeserver", &ckpool.nodeserver, &ckpool.nodeservers);
 	arr_val = yyjson_obj_get(json_conf, "trusted");
-	parse_trusted(arr_val);
+	parse_extra_serverurls(arr_val, "trusted", &ckpool.trusted, NULL);
+	arr_val = yyjson_obj_get(json_conf, "passthroughserver");
+	parse_extra_serverurls(arr_val, "passthroughserver", &ckpool.passthroughserver,
+			       &ckpool.passthroughservers);
 	yyjson_obj_get_string(&ckpool.upstream, json_conf, "upstream");
 	yyjson_obj_get_int64(&ckpool.mindiff, json_conf, "mindiff");
 	yyjson_obj_get_int64(&ckpool.startdiff, json_conf, "startdiff");
@@ -2070,11 +2057,12 @@ static void report_config(void)
 		highdiff = ckpool.server_highdiff && ckpool.server_highdiff[i];
 		if (port_from_serverurl(ckpool.serverurl[i]) > 4000)
 			highdiff = true;
-		printf("serverurl[%d] = %s type=%s highdiff=%d node=%d trusted=%d\n", i,
+		printf("serverurl[%d] = %s type=%s highdiff=%d node=%d trusted=%d passthrough=%d\n", i,
 		       ckpool.serverurl[i] ? ckpool.serverurl[i] : "(null)", kind,
 		       highdiff,
 		       ckpool.nodeserver ? ckpool.nodeserver[i] : 0,
-		       ckpool.trusted ? ckpool.trusted[i] : 0);
+		       ckpool.trusted ? ckpool.trusted[i] : 0,
+		       ckpool.passthroughserver ? ckpool.passthroughserver[i] : 0);
 	}
 #ifdef HAVE_SV2
 	printf("sv2urls = %d\n", ckpool.sv2urls);
@@ -2369,6 +2357,7 @@ int main(int argc, char **argv)
 		ckpool.server_highdiff = ckzalloc(sizeof(bool));
 		ckpool.nodeserver = ckzalloc(sizeof(bool));
 		ckpool.trusted = ckzalloc(sizeof(bool));
+		ckpool.passthroughserver = ckzalloc(sizeof(bool));
 #ifdef HAVE_SV2
 		ckpool.server_sv2 = ckzalloc(sizeof(bool));
 		ckpool.server_sv2_jd = ckzalloc(sizeof(bool));
