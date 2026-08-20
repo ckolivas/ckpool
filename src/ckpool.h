@@ -175,6 +175,9 @@ struct ckpool_instance {
 	int64_t maxsendqueue;
 	/* Maximum distinct users to create from authorisations, 0 to disable */
 	int maxusers;
+	/* Maximum concurrent subclient instances one passthrough, node or
+	 * trusted remote parent may create, 0 to disable */
+	int maxsubclients;
 	/* Honour client.reconnect requests from the upstream pool (proxy mode).
 	 * Defaults to true; set false to refuse all upstream redirects. */
 	bool reconnect;

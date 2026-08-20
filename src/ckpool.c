@@ -1781,6 +1781,7 @@ static void parse_config(void)
 	yyjson_obj_get_int(&ckpool.maxclients, json_conf, "maxclients");
 	yyjson_obj_get_int64(&ckpool.maxsendqueue, json_conf, "maxsendqueue");
 	yyjson_obj_get_int(&ckpool.maxusers, json_conf, "maxusers");
+	yyjson_obj_get_int(&ckpool.maxsubclients, json_conf, "maxsubclients");
 	yyjson_obj_get_bool(&ckpool.reconnect, json_conf, "reconnect");
 	yyjson_obj_get_double(&ckpool.donation, json_conf, "donation");
 	/* Avoid dust-sized donations */
@@ -2020,6 +2021,7 @@ static void report_config(void)
 	printf("maxclients = %d\n", ckpool.maxclients);
 	printf("maxsendqueue = %"PRId64"\n", ckpool.maxsendqueue);
 	printf("maxusers = %d\n", ckpool.maxusers);
+	printf("maxsubclients = %d\n", ckpool.maxsubclients);
 	printf("reconnect = %s\n", ckpool.reconnect ? "true" : "false");
 
 	printf("logdir = %s\n", ckpool.logdir);
@@ -2290,6 +2292,13 @@ int main(int argc, char **argv)
 		quit(0, "Invalid nonce2length %d specified, must be 2~8", ckpool.nonce2length);
 	if (!ckpool.update_interval)
 		ckpool.update_interval = 30;
+	/* Unlike maxclients, subclient instances are created directly from
+	 * remotely supplied ids with no socket of their own to limit them, so
+	 * this is bounded by default. A negative value disables the limit. */
+	if (!ckpool.maxsubclients)
+		ckpool.maxsubclients = 65536;
+	else if (ckpool.maxsubclients < 0)
+		ckpool.maxsubclients = 0;
 	if (!ckpool.mindiff)
 		ckpool.mindiff = 1;
 	/* Modern default; match shipped example confs. Override with "startdiff". */

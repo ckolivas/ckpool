@@ -341,6 +341,16 @@ maximum.
 `"maxclients"` : Optional upper limit on the number of clients ckpool will
 accept before rejecting further clients.
 
+`"maxsubclients"` : Optional upper limit on the number of subclients any one
+passthrough, node or trusted remote may have connected through it at once.
+Unlike regular clients, subclients have no connection of their own to limit
+them - each one exists purely because a downstream server said so, using an id
+it chose - so this defaults to 65536 rather than being unlimited. Set it to a
+negative value to disable the limit entirely. Subclients are additionally
+limited to being created at 1000 per second per parent with a burst of 10000,
+which is well above a large passthrough reconnecting every miner behind it at
+once and only catches sustained churn.
+
 `"zmqblock"` : Optional interface to use for zmq blockhash notification - ckpool
 only. Requires use of matched bitcoind `-zmqpubhashblock` option.
 Default: `tcp://127.0.0.1:28332`

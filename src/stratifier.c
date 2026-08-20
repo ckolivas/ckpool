@@ -316,6 +316,16 @@ struct stratum_instance {
 	bool trusted; /* Is this a trusted remote server */
 	bool remote; /* Is this a remote client on a trusted remote server */
 	bool sv2; /* Virtual SV2 mining session (no connector TCP client) */
+
+	/* Subclient accounting, used only on a passthrough, node or trusted
+	 * parent. Every id such a parent relays is chosen by the remote end
+	 * and creates an instance of its own here, so both the number that
+	 * may exist and the rate they may appear at are bounded. */
+	int subclients; /* Live subclient instances under this parent */
+	double subclient_tokens; /* Token bucket for new subclient creation */
+	tv_t last_subclient; /* Last time the token bucket was refilled */
+	time_t subclient_warned; /* Last time refusals were logged */
+	int64_t subclient_refused; /* Refusals since they were last logged */
 };
 
 struct share {
@@ -2679,12 +2689,15 @@ static void __disconnect_session(sdata_t *sdata, const stratum_instance_t *clien
 	sdata->disconnected_generated++;
 }
 
+static void __dec_subclients(sdata_t *sdata, const stratum_instance_t *client);
+
 /* Removes a client instance we know is on the stratum_instances list and from
  * the user client list if it's been placed on it */
 static void __del_client(sdata_t *sdata, stratum_instance_t *client)
 {
 	user_instance_t *user = client->user_instance;
 
+	__dec_subclients(sdata, client);
 	HASH_DEL(sdata->stratum_instances, client);
 	if (user) {
 		DL_DELETE2(user->clients, client, user_prev, user_next );
@@ -3758,6 +3771,24 @@ static stratum_instance_t *__instance_by_id(sdata_t *sdata, const int64_t id)
 	return client;
 }
 
+/* Enter with instance_lock held. A subclient instance is accounted for on the
+ * parent that created it so remove it from that count when it goes. The parent
+ * may already have gone, in which case there is nothing left to decrement. */
+static void __dec_subclients(sdata_t *sdata, const stratum_instance_t *client)
+{
+	stratum_instance_t *parent;
+	int64_t pass_id;
+
+	pass_id = subclient(client->id);
+	if (likely(!pass_id))
+		return;
+	parent = __instance_by_id(sdata, pass_id);
+	if (!parent)
+		return;
+	if (likely(parent->subclients > 0))
+		parent->subclients--;
+}
+
 static stratum_instance_t *instance_by_id(sdata_t *sdata, const int64_t id)
 {
 	stratum_instance_t *client;
@@ -3795,10 +3826,36 @@ static inline stratum_instance_t *ref_instance_by_id(sdata_t *sdata, const int64
 	return client;
 }
 
+/* Enter with write instance_lock held. The subclients of a passthrough, node or
+ * trusted parent have no connection of their own so nothing will ever tell us
+ * they have gone once their parent has. Drop them with it instead of leaving
+ * them to be reaped one minute later. */
+static int __drop_subclients(sdata_t *sdata, const stratum_instance_t *parent)
+{
+	stratum_instance_t *client, *tmp;
+	const int64_t parent_id = parent->id;
+	int dropped = 0;
+
+	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
+		if (subclient(client->id) != parent_id)
+			continue;
+		if (!client->ref) {
+			__del_client(sdata, client);
+			__kill_instance(sdata, client);
+		} else
+			client->dropped = true;
+		dropped++;
+	}
+	return dropped;
+}
+
 static void __drop_client(sdata_t *sdata, stratum_instance_t *client, bool lazily, char **msg)
 {
 	user_instance_t *user = client->user_instance;
+	int subclients = 0;
 
+	if (unlikely(client->subclients))
+		subclients = __drop_subclients(sdata, client);
 	if (unlikely(client->node))
 		DL_DELETE2(sdata->node_instances, client, node_prev, node_next);
 	else if (unlikely(client->trusted))
@@ -3819,6 +3876,9 @@ static void __drop_client(sdata_t *sdata, stratum_instance_t *client, bool lazil
 				 client->identity, client->address, client->workername,
 				 lazily ? "lazily" : "");
 		}
+	} else if (unlikely(subclients)) {
+		ASPRINTF(msg, "Dropped %s %s with %d subclients %s", client->identity,
+			 client->address, subclients, lazily ? "lazily" : "");
 	} else {
 		/* Workerless client. Too noisy to log them all */
 	}
@@ -3883,8 +3943,8 @@ static stratum_instance_t *__recruit_stratum_instance(sdata_t *sdata)
 static stratum_instance_t *__stratum_add_instance(int64_t id, const char *address,
 						  int server)
 {
+	stratum_instance_t *client, *old_client;
 	sdata_t *sdata = ckpool.sdata;
-	stratum_instance_t *client;
 	int64_t pass_id;
 
 	client = __recruit_stratum_instance(sdata);
@@ -3937,6 +3997,16 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 	}
 
 	ck_wlock(&sdata->instance_lock);
+	/* The lock is dropped above so another receive thread may have created
+	 * this same id in the meantime. Adding ours as well would put a second
+	 * entry for one id in the hash, unreachable by lookup and charged twice
+	 * to its parent, so discard ours and use theirs. */
+	old_client = __instance_by_id(sdata, client->id);
+	if (unlikely(old_client)) {
+		__dec_subclients(sdata, client);
+		__kill_instance(sdata, client);
+		return old_client;
+	}
 	HASH_ADD_I64(sdata->stratum_instances, id, client);
 	return client;
 }
@@ -3973,6 +4043,123 @@ static inline bool client_active(stratum_instance_t *client)
 static inline bool remote_server(stratum_instance_t *client)
 {
 	return (client->node || client->passthrough || client->trusted);
+}
+
+/* Rate at which a parent may create new subclients, and the burst of them it
+ * may create at once after a period of not doing so. A large passthrough
+ * reconnecting every miner behind it at once is a legitimate burst, so these
+ * are set well above that and only catch sustained churn, with maxsubclients
+ * bounding how many may be live at any one time. */
+#define SUBCLIENT_RATE 1000.0
+#define SUBCLIENT_BURST 10000.0
+
+/* Only messages that legitimately begin a mining session may create an
+ * instance for a subclient id we have not seen before. Anything else from an
+ * unknown id would have been discarded by parse_method as unsubscribed
+ * anyway, so refusing to create for it costs a working miner nothing. */
+static bool subclient_creates(const char *method)
+{
+	if (unlikely(!method))
+		return false;
+	/* mining.auth matches mining.authorize, which broken clients send
+	 * before subscribing and which parse_method tolerates. */
+	return (cmdmatch(method, "mining.subscribe") || cmdmatch(method, "mining.configure") ||
+		cmdmatch(method, "mining.auth"));
+}
+
+/* Addresses of subclients are supplied by their parent passthrough rather than
+ * generated by our own connector, so they are remote input and must be
+ * validated before being stored and logged. */
+static bool valid_ip_address(const char *address)
+{
+	struct in6_addr addr;
+
+	if (unlikely(!address[0]))
+		return false;
+	return (inet_pton(AF_INET, address, &addr) == 1 ||
+		inet_pton(AF_INET6, address, &addr) == 1);
+}
+
+/* Filled in by __subclient_create_ok for the caller to act on and log once it
+ * has dropped the instance_lock. */
+struct subclient_refusal {
+	const char *reason;
+	char identity[128]; /* Identity of the parent, not the subclient */
+	int64_t refused; /* Refusals by this parent since last logged */
+	int subclients; /* Live subclients of this parent */
+	bool warn; /* Refusal is abusive rather than merely out of order */
+	bool drop; /* Tell the parent to terminate this subclient */
+};
+
+typedef struct subclient_refusal subclient_refusal_t;
+
+/* Enter and exit with the write instance_lock held. Decides whether a message
+ * from a client_id we have no instance for may create one, charging it to the
+ * parent instance when it may. Direct clients have a socket of their own and
+ * are bounded by the connector's maxclients so are always allowed; subclients
+ * exist only because a parent said so, and every part of the id is chosen by
+ * the remote end, so they are bounded here instead. */
+static bool __subclient_create_ok(sdata_t *sdata, const int64_t id, const char *method,
+				  char *address, const int alen, subclient_refusal_t *sref)
+{
+	stratum_instance_t *parent;
+	int64_t pass_id;
+	double tdiff;
+	tv_t now;
+
+	pass_id = subclient(id);
+	if (likely(!pass_id))
+		return true;
+
+	tv_time(&now);
+	parent = __instance_by_id(sdata, pass_id);
+	/* An id encoding a parent that either no longer exists or was never
+	 * entitled to relay subclients can only be stale or forged. */
+	if (unlikely(!parent || !remote_server(parent))) {
+		snprintf(sref->identity, sizeof(sref->identity), "%"PRId64, pass_id);
+		sref->reason = "unknown parent";
+		sref->drop = true;
+		return false;
+	}
+	snprintf(sref->identity, sizeof(sref->identity), "%s", parent->identity);
+	/* Use the parent's own address rather than storing and logging junk */
+	if (unlikely(!valid_ip_address(address)))
+		snprintf(address, alen, "%s", parent->address);
+	if (!subclient_creates(method)) {
+		/* Out of order rather than abusive. Discard the message but
+		 * leave the subclient alone to subscribe properly. */
+		sref->reason = method ? method : "no method";
+		return false;
+	}
+	if (unlikely(ckpool.maxsubclients && parent->subclients >= ckpool.maxsubclients)) {
+		sref->reason = "maxsubclients reached";
+		goto refused;
+	}
+	tdiff = tvdiff(&now, &parent->last_subclient);
+	parent->last_subclient = now;
+	/* A zeroed timestamp on the first subclient fills the bucket */
+	parent->subclient_tokens += tdiff * SUBCLIENT_RATE;
+	if (parent->subclient_tokens > SUBCLIENT_BURST)
+		parent->subclient_tokens = SUBCLIENT_BURST;
+	if (unlikely(parent->subclient_tokens < 1)) {
+		sref->reason = "creating subclients too fast";
+		goto refused;
+	}
+	parent->subclient_tokens--;
+	parent->subclients++;
+	return true;
+refused:
+	parent->subclient_refused++;
+	sref->drop = true;
+	/* Rate limit the warning or refusing a flood becomes the flood */
+	if (now.tv_sec > parent->subclient_warned + 60) {
+		parent->subclient_warned = now.tv_sec;
+		sref->warn = true;
+		sref->refused = parent->subclient_refused;
+		sref->subclients = parent->subclients;
+		parent->subclient_refused = 0;
+	}
+	return false;
 }
 
 /* Ask the connector asynchronously to send us dropclient commands if this
@@ -4792,6 +4979,8 @@ static yyjson_mut_val *clientinfo(yyjson_mut_doc *doc, const stratum_instance_t 
 	yyjson_mut_obj_add_real(doc, val, "bestdiff", client->best_diff);
 	yyjson_mut_obj_add_int(doc, val, "proxyid", client->proxyid);
 	yyjson_mut_obj_add_int(doc, val, "subproxyid", client->subproxyid);
+	/* Only ever non zero on a passthrough, node or trusted parent */
+	yyjson_mut_obj_add_int(doc, val, "subclients", client->subclients);
 
 	return val;
 }
@@ -8535,8 +8724,11 @@ void parse_upstream_workinfo(yyjson_mut_val *val)
 static void parse_remote_auth(sdata_t *sdata, yyjson_mut_val *val, stratum_instance_t *remote,
 			      const int64_t remote_id)
 {
+	char address[INET6_ADDRSTRLEN] = {};
 	yyjson_mut_val *params, *method, *id_val;
+	subclient_refusal_t sref = {};
 	stratum_instance_t *client;
+	bool refused = false;
 	json_params_t *jp;
 	int64_t client_id;
 
@@ -8557,13 +8749,40 @@ static void parse_remote_auth(sdata_t *sdata, yyjson_mut_val *val, stratum_insta
 	 * to drop the client id locally once we finish with it */
 	ck_wlock(&sdata->instance_lock);
 	client = __instance_by_id(sdata, client_id);
-	if (likely(!client))
-		client = __stratum_add_instance(client_id, remote->address, remote->server);
-	client->remote = true;
-	yyjson_mut_obj_strdup(&client->useragent, val, "useragent");
-	yyjson_mut_obj_strncpy(client->enonce1, val, "enonce1", sizeof(client->enonce1));
-	yyjson_mut_obj_strncpy(client->address, val, "address", sizeof(client->address));
+	if (likely(!client)) {
+		/* A remote auth is the legitimate creation trigger for a
+		 * trusted remote's subclient, but the low bits of the id are
+		 * chosen by the remote end so bound it like any other. */
+		snprintf(address, sizeof(address), "%s", remote->address);
+		if (likely(__subclient_create_ok(sdata, client_id, "mining.auth", address,
+						 sizeof(address), &sref)))
+			client = __stratum_add_instance(client_id, address, remote->server);
+		else
+			refused = true;
+	}
+	if (likely(!refused)) {
+		client->remote = true;
+		yyjson_mut_obj_strdup(&client->useragent, val, "useragent");
+		yyjson_mut_obj_strncpy(client->enonce1, val, "enonce1", sizeof(client->enonce1));
+		yyjson_mut_obj_strncpy(client->address, val, "address", sizeof(client->address));
+		/* This address is supplied by the remote server, not generated
+		 * by our own connector, so fall back to the remote's own. */
+		if (unlikely(!valid_ip_address(client->address)))
+			snprintf(client->address, sizeof(client->address), "%s", remote->address);
+	}
 	ck_wunlock(&sdata->instance_lock);
+
+	if (unlikely(refused)) {
+		if (unlikely(sref.warn)) {
+			LOGWARNING("Refusing subclients of remote %s: %s, %"PRId64" refused with %d live",
+				   sref.identity, sref.reason, sref.refused, sref.subclients);
+		} else {
+			LOGINFO("Refused subclient %"PRId64" of remote %s: %s",
+				client_id, sref.identity, sref.reason);
+		}
+		discard_json_params(jp);
+		return;
+	}
 
 	ckmsgq_add(sdata->sauthq, jp);
 }
@@ -8995,12 +9214,14 @@ static void parse_instance_msg(sdata_t *sdata, smsg_t *msg, stratum_instance_t *
 
 static void srecv_process(smsg_t *msg)
 {
+	bool noid = false, dropped = false, refused = false;
 	char address[INET6_ADDRSTRLEN], *buf = NULL;
-	bool noid = false, dropped = false;
+	subclient_refusal_t sref = {};
 	yyjson_mut_val *root, *val;
 	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	yyjson_mut_doc *doc;
+	const char *method;
 	int server;
 
 	if (unlikely(!msg)) {
@@ -9087,18 +9308,43 @@ static void srecv_process(smsg_t *msg)
 	}
 	yyjson_mut_obj_clear(val);
 
+	/* Needed before we can decide whether an unknown id may create an
+	 * instance, and harmless to look up early for one that exists. */
+	method = yyjson_mut_get_str(yyjson_mut_obj_get(root, "method"));
+
 	/* Parse the message here */
 	ck_wlock(&sdata->instance_lock);
 	client = __instance_by_id(sdata, msg->client_id);
 	/* If client_id instance doesn't exist yet, create one */
 	if (unlikely(!client)) {
-		noid = true;
-		client = __stratum_add_instance(msg->client_id, address, server);
+		if (likely(__subclient_create_ok(sdata, msg->client_id, method, address,
+						 sizeof(address), &sref))) {
+			noid = true;
+			client = __stratum_add_instance(msg->client_id, address, server);
+			/* May be an existing instance another receive thread
+			 * created for this id while we were adding ours */
+			if (unlikely(client->dropped))
+				dropped = true;
+		} else
+			refused = true;
 	} else if (unlikely(client->dropped))
 		dropped = true;
-	if (likely(!dropped))
+	if (likely(!refused && !dropped))
 		__inc_instance_ref(client);
 	ck_wunlock(&sdata->instance_lock);
+
+	if (unlikely(refused)) {
+		if (unlikely(sref.warn)) {
+			LOGWARNING("Refusing subclients of parent %s: %s, %"PRId64" refused with %d live",
+				   sref.identity, sref.reason, sref.refused, sref.subclients);
+		} else {
+			LOGINFO("Refused subclient %"PRId64" of parent %s: %s",
+				msg->client_id, sref.identity, sref.reason);
+		}
+		if (sref.drop)
+			connector_drop_client(msg->client_id);
+		goto out;
+	}
 
 	if (unlikely(dropped)) {
 		/* Client may be NULL here */
