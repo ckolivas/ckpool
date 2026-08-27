@@ -7,6 +7,8 @@
  * any later version.  See COPYING for more details.
  */
 
+#include "config.h"
+
 #include <stdarg.h>
 #include <jansson.h>
 #include "libckpool.h"

@@ -1241,7 +1241,8 @@ static bool parse_reconnect(proxy_instance_t *proxy, json_t *val)
 			sscanf(newport_string, "%d", &new_port);
 	}
 	if (new_url && strlen(new_url) && new_port) {
-		char *dot_pool, *dot_reconnect;
+		const char *dot_reconnect;
+		char *dot_pool;
 		int len;
 
 		dot_pool = strchr(proxy->url, '.');

@@ -1,5 +1,25 @@
 AC_INIT([ckpool],[1.1.1],[kernel@kolivas.org])
 
+dnl Must come before anything that expands AC_PROG_CC/AC_PROG_CXX, which is as
+dnl early as AC_USE_SYSTEM_EXTENSIONS below. Autoconf fills in a bare "-g -O2"
+dnl the moment it detects a compiler, and a later "test -z" then sees a
+dnl non-empty value and never applies these.
+AC_MSG_CHECKING([whether to set default CFLAGS])
+if test -z "$CFLAGS"; then
+    CFLAGS="-g -O2 -Wall -march=native"
+    AC_MSG_RESULT([yes, setting default CFLAGS to $CFLAGS])
+else
+    AC_MSG_RESULT([no, using user-provided CFLAGS])
+fi
+
+AC_MSG_CHECKING([whether to set default CXXFLAGS])
+if test -z "$CXXFLAGS"; then
+    CXXFLAGS="-g -O2 -Wall -march=native"
+    AC_MSG_RESULT([yes, setting default CXXFLAGS to $CXXFLAGS])
+else
+    AC_MSG_RESULT([no, using user-provided CXXFLAGS])
+fi
+
 AC_CANONICAL_TARGET
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([src/ckpool.c])
@@ -14,14 +34,6 @@ AC_CANONICAL_HOST
 
 dnl Make sure anyone changing configure.ac/Makefile.am has a clue
 AM_MAINTAINER_MODE
-
-AC_MSG_CHECKING([whether to set default CFLAGS])
-if test -z "$CFLAGS"; then
-    CFLAGS="-O2 -Wall -march=native"
-    AC_MSG_RESULT([yes, setting default CFLAGS to $CFLAGS])
-else
-    AC_MSG_RESULT([no, using user-provided CFLAGS])
-fi
 
 dnl Checks for programs
 AC_PROG_CC

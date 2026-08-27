@@ -1907,14 +1907,12 @@ int get_sernumber(uchar *s)
 /* For testing a le encoded 256 byte hash against a target */
 bool fulltest(const uchar *hash, const uchar *target)
 {
-	uint32_t *hash32 = (uint32_t *)hash;
-	uint32_t *target32 = (uint32_t *)target;
 	bool ret = true;
 	int i;
 
 	for (i = 28 / 4; i >= 0; i--) {
-		uint32_t h32tmp = le32toh(hash32[i]);
-		uint32_t t32tmp = le32toh(target32[i]);
+		uint32_t h32tmp = le32toh(read_u32(hash + i * 4));
+		uint32_t t32tmp = le32toh(read_u32(target + i * 4));
 
 		if (h32tmp > t32tmp) {
 			ret = false;
@@ -2175,20 +2173,12 @@ static const double bits64 = 18446744073709551616.0;
 /* Converts a little endian 256 bit value to a double */
 double le256todouble(const uchar *target)
 {
-	uint64_t *data64;
 	double dcut64;
 
-	data64 = (uint64_t *)(target + 24);
-	dcut64 = le64toh(*data64) * bits192;
-
-	data64 = (uint64_t *)(target + 16);
-	dcut64 += le64toh(*data64) * bits128;
-
-	data64 = (uint64_t *)(target + 8);
-	dcut64 += le64toh(*data64) * bits64;
-
-	data64 = (uint64_t *)(target);
-	dcut64 += le64toh(*data64);
+	dcut64 = le64toh(read_u64(target + 24)) * bits192;
+	dcut64 += le64toh(read_u64(target + 16)) * bits128;
+	dcut64 += le64toh(read_u64(target + 8)) * bits64;
+	dcut64 += le64toh(read_u64(target));
 
 	return dcut64;
 }
@@ -2196,20 +2186,12 @@ double le256todouble(const uchar *target)
 /* Converts a big endian 256 bit value to a double */
 double be256todouble(const uchar *target)
 {
-	uint64_t *data64;
 	double dcut64;
 
-	data64 = (uint64_t *)(target);
-	dcut64 = be64toh(*data64) * bits192;
-
-	data64 = (uint64_t *)(target + 8);
-	dcut64 += be64toh(*data64) * bits128;
-
-	data64 = (uint64_t *)(target + 16);
-	dcut64 += be64toh(*data64) * bits64;
-
-	data64 = (uint64_t *)(target + 24);
-	dcut64 += be64toh(*data64);
+	dcut64 = be64toh(read_u64(target)) * bits192;
+	dcut64 += be64toh(read_u64(target + 8)) * bits128;
+	dcut64 += be64toh(read_u64(target + 16)) * bits64;
+	dcut64 += be64toh(read_u64(target + 24));
 
 	return dcut64;
 }
@@ -2260,7 +2242,7 @@ double diff_from_nbits(char *nbits)
 
 void target_from_diff(uchar *target, double diff)
 {
-	uint64_t *data64, h64;
+	uint64_t h64;
 	double d64, dcut64;
 
 	if (unlikely(diff == 0.0)) {
@@ -2274,31 +2256,27 @@ void target_from_diff(uchar *target, double diff)
 
 	dcut64 = d64 / bits192;
 	h64 = dcut64;
-	data64 = (uint64_t *)(target + 24);
-	*data64 = htole64(h64);
+	write_u64(target + 24, htole64(h64));
 	dcut64 = h64;
 	dcut64 *= bits192;
 	d64 -= dcut64;
 
 	dcut64 = d64 / bits128;
 	h64 = dcut64;
-	data64 = (uint64_t *)(target + 16);
-	*data64 = htole64(h64);
+	write_u64(target + 16, htole64(h64));
 	dcut64 = h64;
 	dcut64 *= bits128;
 	d64 -= dcut64;
 
 	dcut64 = d64 / bits64;
 	h64 = dcut64;
-	data64 = (uint64_t *)(target + 8);
-	*data64 = htole64(h64);
+	write_u64(target + 8, htole64(h64));
 	dcut64 = h64;
 	dcut64 *= bits64;
 	d64 -= dcut64;
 
 	h64 = d64;
-	data64 = (uint64_t *)(target);
-	*data64 = htole64(h64);
+	write_u64(target, htole64(h64));
 }
 
 void gen_hash(uchar *data, uchar *hash, int len)

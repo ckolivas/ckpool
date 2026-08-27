@@ -390,7 +390,7 @@ static void *listener(void *arg)
 {
 	proc_instance_t *pi = (proc_instance_t *)arg;
 	unixsock_t *us = &pi->us;
-	char *buf = NULL, *msg;
+	char *buf = NULL, *msg __maybe_unused;
 	int sockd;
 
 	rename_proc(pi->sockname);
@@ -800,8 +800,9 @@ static yyjson_doc *_yyjson_rpc_call(connsock_t *cs, const char *rpc_req, const b
 		ASPRINTF(&warning, "Zero length rpc_req passed to %s", __func__);
 		goto out;
 	}
-	http_req = ckalloc(len + 256); // Leave room for headers
-	sprintf(http_req,
+	/* ASPRINTF sizes for auth/url/port of any length; avoids fixed
+	 * ckalloc+sprintf and the null-destination format-overflow warning. */
+	ASPRINTF(&http_req,
 		 "POST / HTTP/1.1\r\n"
 		 "Authorization: Basic %s\r\n"
 		 "Host: %s:%s\r\n"
@@ -1887,10 +1888,10 @@ int main(int argc, char **argv)
 		if (send_recv_path(path, "ping")) {
 			for (i = 0; i < ckpool.serverurls; i++) {
 				char oldurl[INET6_ADDRSTRLEN], oldport[8];
-				char getfd[16];
+				char getfd[24];
 				int sockd;
 
-				snprintf(getfd, 15, "getxfd%d", i);
+				snprintf(getfd, sizeof(getfd), "getxfd%d", i);
 				sockd = open_unix_client(path);
 				if (sockd < 1)
 					break;

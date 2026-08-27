@@ -81,6 +81,21 @@
 #define __maybe_unused		__attribute__((unused))
 #define uninitialised_var(x) x = x
 
+/* Portable case fallthrough marker: C23 [[fallthrough]] where available,
+ * GCC/Clang attribute on older compilers, and a no-op on anything else. */
+#if defined(__has_c_attribute)
+#  if __has_c_attribute(fallthrough)
+#    define fallthrough [[fallthrough]]
+#  endif
+#endif
+#ifndef fallthrough
+#  if defined(__GNUC__) && __GNUC__ >= 7
+#    define fallthrough __attribute__((fallthrough))
+#  else
+#    define fallthrough ((void)0)
+#  endif
+#endif
+
 #ifndef MAX
 #define MAX(a,b) \
 	({ __typeof__ (a) _a = (a); \
@@ -99,54 +114,71 @@ typedef unsigned char uchar;
 typedef struct timeval tv_t;
 typedef struct timespec ts_t;
 
+/* memcpy-based so buffers need not be naturally aligned (SV2 frames, etc.) */
+static inline uint32_t read_u32(const void *p)
+{
+	uint32_t v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline void write_u32(void *p, uint32_t v)
+{
+	memcpy(p, &v, sizeof(v));
+}
+
+static inline uint64_t read_u64(const void *p)
+{
+	uint64_t v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline void write_u64(void *p, uint64_t v)
+{
+	memcpy(p, &v, sizeof(v));
+}
+
 static inline void swap_256(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
+	int i;
 
-	dest[0] = src[7];
-	dest[1] = src[6];
-	dest[2] = src[5];
-	dest[3] = src[4];
-	dest[4] = src[3];
-	dest[5] = src[2];
-	dest[6] = src[1];
-	dest[7] = src[0];
+	for (i = 0; i < 8; i++)
+		write_u32(dest + i * 4, read_u32(src + (7 - i) * 4));
 }
 
 static inline void bswap_256(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
+	int i;
 
-	dest[0] = bswap_32(src[7]);
-	dest[1] = bswap_32(src[6]);
-	dest[2] = bswap_32(src[5]);
-	dest[3] = bswap_32(src[4]);
-	dest[4] = bswap_32(src[3]);
-	dest[5] = bswap_32(src[2]);
-	dest[6] = bswap_32(src[1]);
-	dest[7] = bswap_32(src[0]);
+	for (i = 0; i < 8; i++)
+		write_u32(dest + i * 4, bswap_32(read_u32(src + (7 - i) * 4)));
 }
 
 static inline void flip_32(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
 	int i;
 
 	for (i = 0; i < 8; i++)
-		dest[i] = bswap_32(src[i]);
+		write_u32(dest + i * 4, bswap_32(read_u32(src + i * 4)));
 }
 
 static inline void flip_80(void *dest_p, const void *src_p)
 {
-	uint32_t *dest = dest_p;
-	const uint32_t *src = src_p;
+	const uchar *src = src_p;
+	uchar *dest = dest_p;
 	int i;
 
 	for (i = 0; i < 20; i++)
-		dest[i] = bswap_32(src[i]);
+		write_u32(dest + i * 4, bswap_32(read_u32(src + i * 4)));
 }
 
 #define cond_wait(_cond, _lock) _cond_wait(_cond, _lock, __FILE__, __func__, __LINE__)
