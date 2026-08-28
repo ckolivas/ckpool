@@ -1,4 +1,5 @@
 AM_CPPFLAGS = -D_GNU_SOURCE
 ACLOCAL_AMFLAGS = -I m4
-SUBDIRS = src test
+SUBDIRS = src
+DIST_SUBDIRS = src test
 EXTRA_DIST = ckpool.conf ckproxy.conf README README-SOLOMINING
