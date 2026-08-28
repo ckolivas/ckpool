@@ -1,4 +1,4 @@
-AC_PREREQ([2.71])
+AC_PREREQ([2.69])
 AC_INIT([jansson],[2.14],[https://github.com/akheron/jansson/issues])
 
 AC_CONFIG_AUX_DIR([.])
@@ -6,7 +6,7 @@ AM_INIT_AUTOMAKE([1.10 foreign])
 
 AC_CONFIG_SRCDIR([src/value.c])
 AC_CONFIG_HEADERS([jansson_private_config.h])
-AC_CONFIG_MACRO_DIRS([m4])
+AC_CONFIG_MACRO_DIR([m4])
 
 # Checks for programs.
 AC_PROG_CC

@@ -1,3 +1,4 @@
+AC_PREREQ([2.69])
 AC_INIT([ckpool],[1.1.1],[kernel@kolivas.org])
 
 dnl Must come before anything that expands AC_PROG_CC/AC_PROG_CXX, which is as
