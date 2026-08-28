@@ -1,7 +1,7 @@
 SUBDIRS	= jansson-2.14
 
 ACLOCAL_AMFLAGS = -I m4
-AM_CPPFLAGS =  -I$(top_srcdir)/src/jansson-2.14/src
+AM_CPPFLAGS = -D_GNU_SOURCE -I$(top_srcdir)/src/jansson-2.14/src
 
 native_objs :=
 
@@ -42,7 +42,7 @@ ckp2p_SOURCES = ckpool.c bitcoin.c yyjson.c yyjson_util.c ckp2p.c ckp2p_udp.c \
                  ckp2p_fec.c
 ckp2p_LDADD = libckpool.a jansson-2.14/src/.libs/libjansson.a @LIBS@
 ckp2p_DEPENDENCIES = libckpool.a jansson-2.14/src/.libs/libjansson.a
-ckp2p_CPPFLAGS = -Ijansson-2.14/src -DCKP2P
+ckp2p_CPPFLAGS = $(AM_CPPFLAGS) -DCKP2P
 
 notifier_SOURCES = notifier.c
 notifier_LDADD = libckpool.a @JANSSON_LIBS@
