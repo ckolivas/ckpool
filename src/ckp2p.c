@@ -658,6 +658,9 @@ static p2p_conn_t *get_peer(int peer)
 {
 	p2p_conn_t *conn = NULL;
 
+	if (peer < 0)
+		return NULL;
+
 	ck_rlock(&peerlock);
 	if (likely(peer < ckpool.p2purls))
 		conn = ckpool.p2pconn[peer];
@@ -1393,6 +1396,9 @@ static void add_fast_source(const uchar *hash, int peer)
 	int i;
 	bool added = false;
 
+	if (peer < 0)
+		return;
+
 	ck_wlock(&curblock.lock);
 	if (memcmp(fastsources.hash, hash, 32)) {
 		memcpy(fastsources.hash, hash, 32);
@@ -1426,7 +1432,7 @@ static void try_extend_txn_relay(int peer, const uchar *hash)
 	uint32_t plen;
 	int pending;
 
-	if (!peer)
+	if (peer <= 0)
 		return;
 
 	ck_wlock(&txn_relay_lock);
@@ -1924,7 +1930,8 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 	if (block_bits != current_bits) {
 		p2p_conn_t *src = get_peer(source);
 
-		if (current_bits > block_bits || source <= ckpool.prioclients ||
+		if (current_bits > block_bits ||
+		    (source >= 0 && source <= ckpool.prioclients) ||
 		    (src && src->ckp2p_peer)) {
 			LOGWARNING("Current bits set to 0x%08x (from peer %d)", block_bits, source);
 
@@ -2225,64 +2232,32 @@ static void *add_peer(void *arg)
 	pthread_detach(pthread_self());
 	rename_proc("ckp2pap");
 
-	if (!p2p_connect_socket(conn) || !do_handshake(conn, conn->port)) {
-		LOGINFO("No immediate connection to %s:%d, dropping", conn->host,
-			conn->port);
-		dealloc(conn);
-		goto out;
-	}
-
 	ck_wlock(&peerlock);
-	/* Do another check for duplicates under lock */
 	if (unlikely(_dup_peer(conn->host, conn->port))) {
 		ck_wunlock(&peerlock);
 		LOGINFO("Skipping duplicate peer %s:%d", conn->host, conn->port);
-		disconnect_conn(conn);
 		dealloc(conn);
 		goto out;
 	}
+	_append_conn(conn);
+	{
+		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
 
-	/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
-	int old = ckpool.p2purls;
-
-	/* p2purl */
-	char **old_p2purl = ckpool.p2purl;
-	ckpool.p2purl = ckalloc(sizeof(char *) * (old + 1));
-	if (old > 0)
-		memcpy(ckpool.p2purl, old_p2purl, sizeof(char *) * old);
-	char *new_url = ckalloc(strlen(conn->host) + strlen(conn->charport) + 2);
-	sprintf(new_url, "%s:%s", conn->host, conn->charport);
-	ckpool.p2purl[old] = new_url;
-	if (old_p2purl) dealloc(old_p2purl);
-
-	/* p2pcs (for API consistency) */
-	connsock_t **old_p2pcs = ckpool.p2pcs;
-	ckpool.p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
-	if (old > 0)
-		memcpy(ckpool.p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
-	ckpool.p2pcs[old] = NULL;
-	if (old_p2pcs) dealloc(old_p2pcs);
-
-	/* p2pconn */
-	p2p_conn_t **old_p2pconn = ckpool.p2pconn;
-	ckpool.p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
-	if (old > 0)
-		memcpy(ckpool.p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
-	ckpool.p2pconn[old] = conn;
-	if (old_p2pconn) dealloc(old_p2pconn);
-
-	conn->peer = old;
-	ckpool.p2purls = old + 1;
-	total_conns++;
-	_activate_conn(conn);
-
-	peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
-	p2ppeer->conn = conn;
-	sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
-	HASH_ADD_STR(p2ppeers, url, conn->p2ppeer);
+		p2ppeer->conn = conn;
+		sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
+		HASH_ADD_STR(p2ppeers, url, p2ppeer);
+	}
 	ck_wunlock(&peerlock);
 
-	LOGWARNING("Added whisper peer %s:%d", conn->host, conn->port);
+	if (!p2p_connect_socket(conn) || !do_handshake(conn, conn->port)) {
+		LOGINFO("No immediate connection to %s:%d, dropping", conn->host,
+			conn->port);
+		evict_peer(conn);
+		goto out;
+	}
+
+	activate_conn(conn);
+	LOGWARNING("Added whisper peer %d %s:%d", conn->peer, conn->host, conn->port);
 	add_conn_epoll(conn);
 out:
 	return NULL;
@@ -2509,6 +2484,12 @@ out:
 
 void p2p_handle_msg(p2p_conn_t *conn, const char *cmd, uchar *payload, uint32_t plen)
 {
+	if (!conn || conn->peer < 0) {
+		if (payload)
+			dealloc(payload);
+		return;
+	}
+
 	if (!strcmp(cmd, "version")) {
 		LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
 	} else if (!strcmp(cmd, "verack")) {
@@ -2812,7 +2793,7 @@ static void *submission_thread(void *arg)
 		/* Only relay to prioclients / ckp2p peers unless the compact
 		 * block has come from the local peer 0 source */
 		conn = get_peer(i);
-		if (cbt->source && i > ckpool.prioclients &&
+		if (cbt->source > 0 && i > ckpool.prioclients &&
 		    !(conn && conn->ckp2p_peer))
 			continue;
 
@@ -2926,6 +2907,8 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport, int sou
 		conn->netname = netdefs[0].name;
 	}
 
+	if (source < 0)
+		return conn;
 	if (!source)
 		LOGWARNING("ckp2p set up submission peer %d - %s:%s", source, host, charport);
 	else if (source <= ckpool.prioclients)
@@ -3037,60 +3020,28 @@ static void *p2p_acceptor(void __maybe_unused *arg)
 		conn->port = port_num;
 		memcpy(conn->genesis, netdefs[0].genesis, 32);
 		conn->netname = netdefs[0].name;
-		conn->peer = -1;
 		peer_alive(conn);
+
+		ck_wlock(&peerlock);
+		_append_conn(conn);
+		{
+			peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+
+			p2ppeer->conn = conn;
+			sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
+			HASH_ADD_STR(p2ppeers, url, p2ppeer);
+		}
+		ck_wunlock(&peerlock);
 
 		if (!do_incoming_handshake(conn)) {
 			LOGINFO("Incoming handshake failed from %s:%d", host, port_num);
-			close(newsock);
-			dealloc(conn);
+			evict_peer(conn);
 			continue;
 		}
 
-		ck_wlock(&peerlock);
-		/* Dynamically grow the peer lists (p2purl, p2pcs, p2pconn) */
-		int old = ckpool.p2purls;
-
-		/* p2purl */
-		char **old_p2purl = ckpool.p2purl;
-		ckpool.p2purl = ckalloc(sizeof(char *) * (old + 1));
-		if (old > 0)
-			memcpy(ckpool.p2purl, old_p2purl, sizeof(char *) * old);
-		char *new_url = ckalloc(strlen(host) + strlen(serv) + 2);
-		sprintf(new_url, "%s:%s", host, serv);
-		ckpool.p2purl[old] = new_url;
-		if (old_p2purl) dealloc(old_p2purl);
-
-		/* p2pcs (for API consistency) */
-		connsock_t **old_p2pcs = ckpool.p2pcs;
-		ckpool.p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
-		if (old > 0)
-			memcpy(ckpool.p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
-		ckpool.p2pcs[old] = NULL;
-		if (old_p2pcs) dealloc(old_p2pcs);
-
-		/* p2pconn */
-		p2p_conn_t **old_p2pconn = ckpool.p2pconn;
-		ckpool.p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
-		if (old > 0)
-			memcpy(ckpool.p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
-		ckpool.p2pconn[old] = conn;
-		if (old_p2pconn)
-			dealloc(old_p2pconn);
-
-		conn->peer = old;
-		ckpool.p2purls = old + 1;
-		total_conns++;
-		_activate_conn(conn);
-
-		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
-		p2ppeer->conn = conn;
-		sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
-		HASH_ADD_STR(p2ppeers, url, p2ppeer);
-		ck_wunlock(&peerlock);
-
+		activate_conn(conn);
 		add_conn_epoll(conn);
-		LOGWARNING("Added incoming peer %d (%s:%d)", old, host, port_num);
+		LOGWARNING("Added incoming peer %d (%s:%d)", conn->peer, host, port_num);
 	}
 
 	close(listen_sock);
@@ -3206,7 +3157,7 @@ int prepare_ckp2p(void)
 		}
 		ck_wunlock(&peerlock);
 		ckp2p_client_set(key, P2P_XPORT_UDP, conn);
-		LOGWARNING("ckp2p UDP peer %d - %s:%s", conn->peer, url, portstr);
+		LOGWARNING("ckp2p set up prio UDP peer %d - %s:%s", conn->peer, url, portstr);
 		free(url);
 		free(portstr);
 	}
