@@ -1452,7 +1452,8 @@ static void try_extend_txn_relay(int peer, const uchar *hash)
 	ck_wunlock(&txn_relay_lock);
 
 	sc = get_peer(peer);
-	if (unlikely(!sc) || sc->evicted || sc->sock < 0 || !sc->handshake_done)
+	if (unlikely(!sc) || sc->ckp2p_peer || sc->evicted || sc->sock < 0 ||
+	    !sc->handshake_done)
 		return;
 
 	ck_wlock(&txn_relay_lock);
@@ -1529,7 +1530,7 @@ static bool try_add_txn_relay_conn(p2p_conn_t *sc, int *sent, int conn_peers[],
 	int i, peer;
 	txn_relay_t *busy;
 
-	if (!sc || !sc->peer || *sent >= FAST_SOURCES_MAX)
+	if (!sc || !sc->peer || sc->ckp2p_peer || *sent >= FAST_SOURCES_MAX)
 		return false;
 	peer = sc->peer;
 
