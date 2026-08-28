@@ -246,6 +246,10 @@ struct ckpool_instance {
 	connsock_t **p2pcs;
 	p2p_conn_t **p2pconn;
 
+	/* Dedicated ckp2p UDP peers */
+	int ckp2peers;
+	char **ckp2peer;
+
 	char *externalip;
 
 	/* Difficulty settings */

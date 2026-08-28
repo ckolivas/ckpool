@@ -32,13 +32,14 @@ bin_PROGRAMS = ckp2p
 EXTRA_PROGRAMS = notifier ckpool ckpmsg
 
 ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
-                 yyjson.c yyjson_util.c ckp2p.c
+                 yyjson.c yyjson_util.c ckp2p.c ckp2p_udp.c ckp2p_fec.c
 ckpool_LDADD = libckpool.a @JANSSON_LIBS@ @LIBS@
 
 ckpmsg_SOURCES = ckpmsg.c
 ckpmsg_LDADD = libckpool.a @JANSSON_LIBS@
 
-ckp2p_SOURCES = ckpool.c bitcoin.c yyjson.c yyjson_util.c ckp2p.c
+ckp2p_SOURCES = ckpool.c bitcoin.c yyjson.c yyjson_util.c ckp2p.c ckp2p_udp.c \
+                 ckp2p_fec.c
 ckp2p_LDADD = libckpool.a jansson-2.14/src/.libs/libjansson.a @LIBS@
 ckp2p_DEPENDENCIES = libckpool.a jansson-2.14/src/.libs/libjansson.a
 ckp2p_CPPFLAGS = -Ijansson-2.14/src -DCKP2P

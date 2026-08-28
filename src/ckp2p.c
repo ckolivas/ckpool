@@ -25,6 +25,7 @@
 #include "libckpool.h"
 #include "sha2.h"
 #include "ckpool.h"
+#include "ckp2p_udp.h"
 #include "utlist.h"
 #include "uthash.h"
 
@@ -60,7 +61,10 @@ static struct current_block {
 } curblock;
 
 static uint32_t externalip;
+static bool external_is_v6;
+static struct in6_addr external_v6;
 static int externalport;
+static ckp2p_client_t *ckp2p_clients;
 static int total_conns;
 static int active_conns;
 static bool finished_init = false;
@@ -285,8 +289,18 @@ static bool ipv4_is_nonroutable(const uchar *ip)
 	return false;
 }
 
+static bool ipv6_is_nonroutable(const struct in6_addr *a)
+{
+	if (IN6_IS_ADDR_UNSPECIFIED(a) || IN6_IS_ADDR_LOOPBACK(a) ||
+	    IN6_IS_ADDR_MULTICAST(a) || IN6_IS_ADDR_LINKLOCAL(a))
+		return true;
+	if (IN6_IS_ADDR_V4MAPPED(a))
+		return ipv4_is_nonroutable(&a->s6_addr[12]);
+	return false;
+}
+
 /* Parse the addr_from field from a VERSION message payload.
- * Returns true only if a valid IPv4 listening address AND port (>0) was extracted. */
+ * Returns true if a routable IPv4 or IPv6 listening address AND port was extracted. */
 static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
                                     char *host_out, int *port_out)
 {
@@ -314,18 +328,64 @@ static bool parse_version_addr_from(const uchar *payload, uint32_t plen,
 		struct in_addr addr;
 
 		if (ipv4_is_nonroutable(ipv4)) {
-			inet_ntop(AF_INET, ipv4, host_out, INET_ADDRSTRLEN);
+			inet_ntop(AF_INET, ipv4, host_out, INET6_ADDRSTRLEN);
 			LOGDEBUG("Peer advertised non-routable address %s", host_out);
 			return false;
 		}
 		memcpy(&addr.s_addr, ipv4, 4);
-		inet_ntop(AF_INET, &addr, host_out, INET_ADDRSTRLEN);
+		inet_ntop(AF_INET, &addr, host_out, INET6_ADDRSTRLEN);
 		return true;
 	}
 
-	/* IPv6 not supported by ckp2p yet */
-	return false;
+	{
+		struct in6_addr a6;
+
+		memcpy(&a6, ip, 16);
+		if (ipv6_is_nonroutable(&a6)) {
+			inet_ntop(AF_INET6, &a6, host_out, INET6_ADDRSTRLEN);
+			LOGDEBUG("Peer advertised non-routable IPv6 address %s", host_out);
+			return false;
+		}
+		inet_ntop(AF_INET6, &a6, host_out, INET6_ADDRSTRLEN);
+		return true;
+	}
 }
+
+static bool version_ua_prefix(const uchar *payload, uint32_t plen, const char *pfx)
+{
+	uint8_t ualen;
+	size_t pl;
+
+	if (plen < 81 || !pfx)
+		return false;
+	ualen = payload[80];
+	pl = strlen(pfx);
+	if (ualen < pl || 81u + ualen > plen)
+		return false;
+	return !memcmp(payload + 81, pfx, pl);
+}
+
+static bool version_ua_is_ckp2p(const uchar *payload, uint32_t plen)
+{
+	return version_ua_prefix(payload, plen, "/ckp2p:");
+}
+
+static bool version_ua_is_ckp2p_v2(const uchar *payload, uint32_t plen)
+{
+	return version_ua_prefix(payload, plen, "/ckp2p:2.0/");
+}
+
+static bool is_ckp2p_prio(const p2p_conn_t *conn)
+{
+	if (!conn)
+		return false;
+	if (conn->ckp2p_peer)
+		return true;
+	return conn->peer >= 0 && conn->peer <= ckpool.prioclients;
+}
+
+static inline void _activate_conn(p2p_conn_t *conn);
+static void disconnect_conn(p2p_conn_t *conn);
 
 /* Return true if a VERSION payload indicates a blocksonly peer. */
 static bool version_is_blocksonly(const uchar *payload, uint32_t plen)
@@ -371,7 +431,7 @@ static bool reject_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint3
 		return false;
 
 	/* peer is -1 for incoming/dynamic peers until added; priority peers are always >= 0 */
-	if (conn->peer >= 0 && conn->peer <= ckpool.prioclients) {
+	if (is_ckp2p_prio(conn)) {
 		LOGNOTICE("Keeping blocksonly priority peer %d", conn->peer);
 		return false;
 	}
@@ -385,7 +445,7 @@ static bool reject_blocksonly_peer(p2p_conn_t *conn, const uchar *payload, uint3
 
 static void reset_reconnect(p2p_conn_t *conn)
 {
-	if (conn->peer < 0 || conn->peer > ckpool.prioclients)
+	if (!is_ckp2p_prio(conn))
 		conn->reconnect = KEEPALIVE_INTERVAL;
 }
 
@@ -395,11 +455,180 @@ static void peer_alive(p2p_conn_t *conn)
 	reset_reconnect(conn);
 }
 
+void p2p_mark_alive(p2p_conn_t *conn)
+{
+	if (conn)
+		peer_alive(conn);
+}
+
+static p2p_conn_t *_ckp2p_client_find(const char *ip)
+{
+	ckp2p_client_t *c = NULL;
+
+	if (!ip || !ip[0])
+		return NULL;
+	HASH_FIND_STR(ckp2p_clients, ip, c);
+	return c ? c->conn : NULL;
+}
+
+p2p_conn_t *ckp2p_client_find(const char *ip)
+{
+	p2p_conn_t *conn;
+
+	ck_rlock(&peerlock);
+	conn = _ckp2p_client_find(ip);
+	ck_runlock(&peerlock);
+	return conn;
+}
+
+void ckp2p_client_set(const char *ip, enum p2p_xport xport, p2p_conn_t *conn)
+{
+	ckp2p_client_t *c = NULL;
+	char key[INET6_ADDRSTRLEN];
+
+	if (!ip || !ip[0] || !conn)
+		return;
+	p2p_udp_canon_ip_str(ip, key, sizeof(key));
+	ck_wlock(&peerlock);
+	HASH_FIND_STR(ckp2p_clients, key, c);
+	if (!c) {
+		c = ckzalloc(sizeof(*c));
+		snprintf(c->ip, sizeof(c->ip), "%s", key);
+		HASH_ADD_STR(ckp2p_clients, ip, c);
+	}
+	c->xport = xport;
+	c->conn = conn;
+	ck_wunlock(&peerlock);
+}
+
+void ckp2p_client_drop_tcp(const char *ip, p2p_conn_t *keep)
+{
+	ckp2p_client_t *c = NULL;
+	p2p_conn_t *old = NULL;
+	char key[INET6_ADDRSTRLEN];
+
+	if (!ip || !ip[0])
+		return;
+	p2p_udp_canon_ip_str(ip, key, sizeof(key));
+	ck_wlock(&peerlock);
+	HASH_FIND_STR(ckp2p_clients, key, c);
+	if (c && c->xport == P2P_XPORT_TCP && c->conn && c->conn != keep) {
+		old = c->conn;
+		old->incoming_only = true;
+		c->conn = keep;
+		c->xport = P2P_XPORT_UDP;
+	}
+	ck_wunlock(&peerlock);
+	if (old) {
+		LOGNOTICE("Dropping TCP ckp2p session to %s in favour of UDP", key);
+		disconnect_conn(old);
+	}
+}
+
+static int _append_conn(p2p_conn_t *conn)
+{
+	int old = ckpool.p2purls;
+	char **old_p2purl = ckpool.p2purl;
+	connsock_t **old_p2pcs = ckpool.p2pcs;
+	p2p_conn_t **old_p2pconn = ckpool.p2pconn;
+	char *new_url;
+
+	ckpool.p2purl = ckalloc(sizeof(char *) * (old + 1));
+	if (old > 0)
+		memcpy(ckpool.p2purl, old_p2purl, sizeof(char *) * old);
+	new_url = ckalloc(strlen(conn->host) + strlen(conn->charport) + 2);
+	sprintf(new_url, "%s:%s", conn->host, conn->charport);
+	ckpool.p2purl[old] = new_url;
+	if (old_p2purl)
+		dealloc(old_p2purl);
+
+	ckpool.p2pcs = ckalloc(sizeof(connsock_t *) * (old + 1));
+	if (old > 0)
+		memcpy(ckpool.p2pcs, old_p2pcs, sizeof(connsock_t *) * old);
+	ckpool.p2pcs[old] = NULL;
+	if (old_p2pcs)
+		dealloc(old_p2pcs);
+
+	ckpool.p2pconn = ckalloc(sizeof(p2p_conn_t *) * (old + 1));
+	if (old > 0)
+		memcpy(ckpool.p2pconn, old_p2pconn, sizeof(p2p_conn_t *) * old);
+	ckpool.p2pconn[old] = conn;
+	if (old_p2pconn)
+		dealloc(old_p2pconn);
+
+	conn->peer = old;
+	ckpool.p2purls = old + 1;
+	total_conns++;
+	return old;
+}
+
+p2p_conn_t *ckp2p_udp_bind_peer(const char *ip, const struct sockaddr *sa,
+				socklen_t slen)
+{
+	p2p_conn_t *conn;
+	peerlist_t *p2ppeer;
+	char key[INET6_ADDRSTRLEN];
+	int port = CKP2P_LISTEN_PORT;
+
+	if (!ip)
+		return NULL;
+	p2p_udp_canon_ip_str(ip, key, sizeof(key));
+	ck_wlock(&peerlock);
+	conn = _ckp2p_client_find(key);
+	if (conn) {
+		if (sa && slen && slen <= sizeof(conn->udp_dst)) {
+			memcpy(&conn->udp_dst, sa, slen);
+			conn->udp_dstlen = slen;
+		}
+		ck_wunlock(&peerlock);
+		return conn;
+	}
+
+	if (sa && sa->sa_family == AF_INET)
+		port = ntohs(((const struct sockaddr_in *)sa)->sin_port);
+	else if (sa && sa->sa_family == AF_INET6)
+		port = ntohs(((const struct sockaddr_in6 *)sa)->sin6_port);
+
+	conn = ckzalloc(sizeof(*conn));
+	cklock_init(&conn->block_lock);
+	conn->sock = -1;
+	conn->udp = true;
+	conn->ckp2p_peer = true;
+	strncpy(conn->host, key, sizeof(conn->host) - 1);
+	snprintf(conn->charport, sizeof(conn->charport), "%d", port);
+	conn->port = port;
+	memcpy(conn->magic, netdefs[0].magic, 4);
+	memcpy(conn->genesis, netdefs[0].genesis, 32);
+	conn->netname = netdefs[0].name;
+	if (sa && slen && slen <= sizeof(conn->udp_dst)) {
+		memcpy(&conn->udp_dst, sa, slen);
+		conn->udp_dstlen = slen;
+	}
+	peer_alive(conn);
+	_append_conn(conn);
+	_activate_conn(conn);
+	p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+	p2ppeer->conn = conn;
+	sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
+	HASH_ADD_STR(p2ppeers, url, p2ppeer);
+	ck_wunlock(&peerlock);
+
+	ckp2p_client_set(key, P2P_XPORT_UDP, conn);
+	LOGWARNING("Added UDP ckp2p peer %d (%s:%d)", conn->peer, key, port);
+	return conn;
+}
+
 static void p2p_send(p2p_conn_t *conn, const char *cmd, const uchar *payload, uint32_t plen)
 {
 	uchar hdr[24];
 	uchar chksum[4];
 	uint32_t plen_le;
+
+	if (conn->udp) {
+		if (!p2p_udp_send(conn, cmd, payload, plen))
+			LOGNOTICE("p2p_send(%s) UDP failed to peer %d", cmd, conn->peer);
+		return;
+	}
 
 	memcpy(hdr, conn->magic, 4);
 	memset(hdr + 4, 0, 12);
@@ -529,7 +758,18 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 	uint64_t from_services_le = htole64(services);
 	memcpy(version_payload + off, &from_services_le, sizeof(from_services_le));
 	off += sizeof(from_services_le);
-	memset(version_payload + off, 0, 16);
+	{
+		uchar from_ip[16] = {};
+
+		if (external_is_v6)
+			memcpy(from_ip, &external_v6, 16);
+		else if (externalip) {
+			from_ip[10] = 0xff;
+			from_ip[11] = 0xff;
+			memcpy(from_ip + 12, &externalip, 4);
+		}
+		memcpy(version_payload + off, from_ip, 16);
+	}
 	off += 16;
 	uint16_t from_port_be = htons(CKP2P_LISTEN_PORT);
 	memcpy(version_payload + off, &from_port_be, sizeof(from_port_be));
@@ -541,7 +781,7 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 	memcpy(version_payload + off, &nnonce_le, sizeof(nnonce_le));
 	off += sizeof(nnonce_le);
 
-	const char *ua = "/ckp2p:1.0/";
+	const char *ua = "/ckp2p:2.0/";
 	uchar ualen = (uchar)strlen(ua);
 	version_payload[off++] = ualen;
 	memcpy(version_payload + off, ua, ualen);
@@ -557,53 +797,94 @@ static void send_version(p2p_conn_t *conn, int remote_port)
 	p2p_send(conn, "version", version_payload, sizeof(version_payload));
 }
 
-/* Send self-advertisement via addrv2 (BIP155) so other nodes can discover us.
- * Uses getsockname() on the live socket to automatically get our public IPv4 address. */
+/* Send self-advertisement via addrv2 (BIP155) so other nodes can discover us. */
 static void send_self_addrv2(p2p_conn_t *conn)
 {
-	struct sockaddr_in local;
-	socklen_t len = sizeof(local);
+	uchar payload[80];
+	uint32_t pos = 0, now, now_le;
+	uint16_t port_be;
+	bool v6 = external_is_v6;
+	uint32_t v4 = externalip;
 
-	if (externalip)
-		local.sin_addr.s_addr = externalip;
-	else if (getsockname(conn->sock, (struct sockaddr *)&local, &len) < 0) {
-		LOGDEBUG("getsockname failed for self-advertisement");
+	if (!v6 && !v4 && conn->sock >= 0) {
+		struct sockaddr_storage ss;
+		socklen_t slen = sizeof(ss);
+
+		if (!getsockname(conn->sock, (struct sockaddr *)&ss, &slen)) {
+			if (ss.ss_family == AF_INET6) {
+				struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&ss;
+
+				if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr))
+					memcpy(&v4, &in6->sin6_addr.s6_addr[12], 4);
+				else {
+					external_v6 = in6->sin6_addr;
+					v6 = true;
+				}
+			} else if (ss.ss_family == AF_INET) {
+				v4 = ((struct sockaddr_in *)&ss)->sin_addr.s_addr;
+			}
+		}
+	}
+	if (!v6 && !v4) {
+		LOGDEBUG("No address for self-advertisement");
 		return;
 	}
 
-	/* Build addrv2 payload with exactly 1 address (our own) */
-	uchar payload[64];
-	uint32_t pos = 0;
-
-	/* count = 1 (varint) */
 	payload[pos++] = 1;
-
-	/* time (uint32_t, current time) */
-	uint32_t now = (uint32_t)time(NULL);
-	uint32_t now_le = htole32(now);
+	now = (uint32_t)time(NULL);
+	now_le = htole32(now);
 	memcpy(payload + pos, &now_le, 4);
 	pos += 4;
-
-	/* services (varint = 9) */
 	payload[pos++] = 9;
-
-	/* network ID = 1 (IPv4) */
-	payload[pos++] = 1;
-
-	/* address length (varint = 4) */
-	payload[pos++] = 4;
-
-	/* IPv4 address (network byte order) */
-	memcpy(payload + pos, &local.sin_addr.s_addr, 4);
-	pos += 4;
-
-	/* port (big-endian, our listening port) */
-	uint16_t port_be = htons(CKP2P_LISTEN_PORT);
+	if (v6) {
+		payload[pos++] = 2;
+		payload[pos++] = 16;
+		memcpy(payload + pos, &external_v6, 16);
+		pos += 16;
+	} else {
+		payload[pos++] = 1;
+		payload[pos++] = 4;
+		memcpy(payload + pos, &v4, 4);
+		pos += 4;
+	}
+	port_be = htons(externalport ? externalport : CKP2P_LISTEN_PORT);
 	memcpy(payload + pos, &port_be, 2);
 	pos += 2;
 
 	p2p_send(conn, "addrv2", payload, pos);
 	LOGINFO("Sent self addrv2 advertisement to peer (%s:%d)", conn->host, conn->port);
+}
+
+static bool try_udp_upgrade(p2p_conn_t *conn, const uchar *payload, uint32_t plen,
+			    const char *src_ip, int adv_port)
+{
+	char key[INET6_ADDRSTRLEN];
+	int udp_port;
+
+	if (!conn || conn->peer == 0 || !src_ip)
+		return false;
+	if (!version_ua_is_ckp2p(payload, plen))
+		return false;
+	conn->ckp2p_peer = true;
+	p2p_udp_canon_ip_str(src_ip, key, sizeof(key));
+	ckp2p_client_set(key, P2P_XPORT_TCP, conn);
+	if (!version_ua_is_ckp2p_v2(payload, plen) || p2p_udp_fd() < 0)
+		return false;
+	udp_port = adv_port > 0 ? adv_port : CKP2P_LISTEN_PORT;
+	if (!p2p_udp_fill_dst(conn, src_ip, udp_port))
+		return false;
+	if (!p2p_udp_hello(conn) || !p2p_udp_hello_wait(conn, 500))
+		return false;
+	if (conn->sock >= 0) {
+		close(conn->sock);
+		conn->sock = -1;
+	}
+	conn->udp = true;
+	conn->handshake_done = true;
+	ckp2p_client_drop_tcp(key, conn);
+	ckp2p_client_set(key, P2P_XPORT_UDP, conn);
+	LOGNOTICE("Upgraded peer %d %s to UDP", conn->peer, key);
+	return true;
 }
 
 static void handle_ping(p2p_conn_t *conn, uchar *payload, uint32_t len)
@@ -660,9 +941,11 @@ static void deactivate_conn(p2p_conn_t *conn)
 static void disconnect_conn(p2p_conn_t *conn)
 {
 	LOGDEBUG("Disconnecting peer %d", conn->peer);
-	close(conn->sock);
+	if (conn->sock >= 0)
+		close(conn->sock);
 	conn->sock = -1;
-	conn->handshake_done = false;
+	if (!conn->udp)
+		conn->handshake_done = false;
 	deactivate_conn(conn);
 }
 
@@ -706,8 +989,12 @@ static void _add_connector(p2p_conn_t *conn)
 		new = true;
 	}
 
-	if (new)
-		ckmsgq_add(p2p_connectors, conn);
+	if (new) {
+		if (is_ckp2p_prio(conn))
+			ckmsgq_add_front(p2p_connectors, conn);
+		else
+			ckmsgq_add(p2p_connectors, conn);
+	}
 }
 
 static void add_connector(p2p_conn_t *conn)
@@ -722,13 +1009,13 @@ static void add_connector(p2p_conn_t *conn)
 		waker->peer = conn->peer;
 		HASH_ADD_INT(connector_wakes, peer, waker);
 		new = true;
-		if (conn->peer > ckpool.prioclients)
+		if (!is_ckp2p_prio(conn))
 			tv_monotonic(&conn->last_attempt);
 	}
 	ck_wunlock(&peerlock);
 
 	if (new) {
-		if (conn->peer <= ckpool.prioclients)
+		if (is_ckp2p_prio(conn))
 			ckmsgq_add_front(p2p_connectors, conn);
 		else
 			ckmsgq_add(p2p_connectors, conn);
@@ -1633,9 +1920,12 @@ static void handle_cmpctblock(uchar *payload, uint32_t plen, int source)
 	memcpy(&block_bits, header + 72, 4);
 	block_bits = le32toh(block_bits);
 
-	/* Trust priority peers implicitly; other peers only if diff is higher */
+	/* Trust priority / ckp2p peers implicitly; other peers only if diff is higher */
 	if (block_bits != current_bits) {
-		if (current_bits > block_bits || source <= ckpool.prioclients) {
+		p2p_conn_t *src = get_peer(source);
+
+		if (current_bits > block_bits || source <= ckpool.prioclients ||
+		    (src && src->ckp2p_peer)) {
 			LOGWARNING("Current bits set to 0x%08x (from peer %d)", block_bits, source);
 
 			ck_wlock(&curblock.lock);
@@ -1731,7 +2021,17 @@ static bool do_handshake(p2p_conn_t *conn, int port)
 			return false;
 		LOGINFO("Received %s (%u bytes)", cmd, plen);
 		if (!strcmp(cmd, "version")) {
+			char adv_host[INET6_ADDRSTRLEN] = {};
+			int adv_port = 0;
+
 			LOGINFO("Received VERSION from peer");
+			parse_version_addr_from(payload, plen, adv_host, &adv_port);
+			if (try_udp_upgrade(conn, payload, plen, conn->host,
+					    adv_port ? adv_port : conn->port)) {
+				dealloc(payload);
+				send_self_addrv2(conn);
+				return true;
+			}
 			if (reject_blocksonly_peer(conn, payload, plen)) {
 				dealloc(payload);
 				close(conn->sock);
@@ -1815,11 +2115,12 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 			return false;
 		LOGINFO("Received %s (%u bytes)", cmd, plen);
 		if (!strcmp(cmd, "version")) {
-			LOGINFO("Received VERSION from incoming peer");
-
-			/* Try to extract the peer's real listening address/port from addr_from */
-			char adv_host[INET_ADDRSTRLEN] = {0};
+			char src_host[256];
+			char adv_host[INET6_ADDRSTRLEN] = {0};
 			int adv_port = 0;
+
+			LOGINFO("Received VERSION from incoming peer");
+			snprintf(src_host, sizeof(src_host), "%s", conn->host);
 
 			if (parse_version_addr_from(payload, plen, adv_host, &adv_port)) {
 				LOGNOTICE("Peer advertised listening address %s:%d - updating reconnection info",
@@ -1827,12 +2128,19 @@ static bool do_incoming_handshake(p2p_conn_t *conn)
 				strncpy(conn->host, adv_host, sizeof(conn->host) - 1);
 			}
 			if (!adv_port)
-				adv_port = P2P_LISTEN_PORT; /* Set to default if we don't get it */
+				adv_port = CKP2P_LISTEN_PORT;
 			conn->port = adv_port;
 			snprintf(conn->charport, sizeof(conn->charport), "%d", adv_port);
 			if (dup_peer(conn->host, conn->port)) {
 				LOGNOTICE("Duplicate incoming peer %s:%s, will not reconnect if dropped", conn->host, conn->charport);
 				conn->incoming_only = true;
+			}
+
+			if (try_udp_upgrade(conn, payload, plen, src_host, adv_port)) {
+				if (payload)
+					dealloc(payload);
+				send_self_addrv2(conn);
+				return true;
 			}
 
 			if (reject_blocksonly_peer(conn, payload, plen)) {
@@ -2157,6 +2465,14 @@ static void p2p_connector(p2p_conn_t *conn)
 	if (unlikely(conn->evicted))
 		goto out;
 
+	if (conn->udp) {
+		if (!conn->handshake_done)
+			p2p_udp_hello(conn);
+		if (conn->handshake_done)
+			activate_conn(conn);
+		goto out;
+	}
+
 	if (conn->sock < 0) {
 		if (conn->incoming_only) {
 			evict_peer(conn);
@@ -2165,12 +2481,18 @@ static void p2p_connector(p2p_conn_t *conn)
 
 		if (p2p_connect_socket(conn)) {
 			if (!do_handshake(conn, conn->port)) {
-				close(conn->sock);
+				if (conn->sock >= 0)
+					close(conn->sock);
 				conn->sock = -1;
 			}
 		}
-		if (conn->sock < 0)
+		if (conn->sock < 0 && !conn->udp)
 			goto out;
+	}
+
+	if (conn->udp) {
+		activate_conn(conn);
+		goto out;
 	}
 
 	activate_conn(conn);
@@ -2185,6 +2507,77 @@ out:
 	return;
 }
 
+void p2p_handle_msg(p2p_conn_t *conn, const char *cmd, uchar *payload, uint32_t plen)
+{
+	if (!strcmp(cmd, "version")) {
+		LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
+	} else if (!strcmp(cmd, "verack")) {
+		LOGINFO("Received VERACK (%u bytes) - handling for handshake", plen);
+	} else if (!strcmp(cmd, "ping")) {
+		LOGINFO("Received PING (%u bytes) - replying with PONG", plen);
+		handle_ping(conn, payload, plen);
+		return;
+	} else if (!strcmp(cmd, "pong")) {
+		LOGDEBUG("Received PONG (%u bytes) - ignoring (keep-alive response)", plen);
+	} else if (!strcmp(cmd, "sendcmpct")) {
+		LOGINFO("Received SENDCMPCT (%u bytes) - handling compact block negotiation", plen);
+		handle_sendcmpct(conn, payload, plen);
+		return;
+	} else if (!strcmp(cmd, "getdata")) {
+		LOGINFO("Received GETDATA (%u bytes) - handling (request for compact block or tx)", plen);
+		handle_getdata(conn, payload, plen);
+		return;
+	} else if (!strcmp(cmd, "getblocktxn")) {
+		LOGINFO("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
+		handle_getblocktxn(conn, payload, plen);
+		return;
+	} else if (!strcmp(cmd, "inv")) {
+		handle_inv(conn, payload, plen);
+		return;
+	} else if (!strcmp(cmd, "headers")) {
+		LOGINFO("Received HEADERS (%u bytes) - ignoring", plen);
+	} else if (!strcmp(cmd, "cmpctblock")) {
+		LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
+		handle_cmpctblock(payload, plen, conn->peer);
+		return;
+	} else if (!strcmp(cmd, "tx")) {
+		LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
+	} else if (!strcmp(cmd, "block")) {
+		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
+	} else if (!strcmp(cmd, "blocktxn")) {
+		LOGDEBUG("Received BLOCKTXN (%u bytes) - handling (block transactions response)", plen);
+		handle_blocktxn_relay(conn, payload, plen);
+		return;
+	} else if (!strcmp(cmd, "getheaders")) {
+		LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
+	} else if (!strcmp(cmd, "getblocks")) {
+		LOGDEBUG("Received GETBLOCKS (%u bytes) - ignoring (blocks request)", plen);
+	} else if (!strcmp(cmd, "getaddr")) {
+		LOGDEBUG("Received GETADDR (%u bytes) - ignoring (peer discovery request)", plen);
+	} else if (!strcmp(cmd, "addr")) {
+		LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
+	} else if (!strcmp(cmd, "addrv2")) {
+		LOGINFO("Received ADDRV2 (%u bytes)", plen);
+		parse_addrv2(payload, plen);
+		return;
+	} else if (!strcmp(cmd, "feefilter")) {
+		LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
+	} else if (!strcmp(cmd, "reject")) {
+		LOGDEBUG("Received REJECT (%u bytes) - ignoring (rejection message)", plen);
+	} else if (!strcmp(cmd, "notfound")) {
+		LOGDEBUG("Received NOTFOUND (%u bytes) - ignoring (item not found)", plen);
+	} else if (!strcmp(cmd, "wtxidrelay")) {
+		LOGDEBUG("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
+	} else if (!strcmp(cmd, "sendaddrv2")) {
+		LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
+	} else {
+		LOGINFO("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
+	}
+
+	if (payload)
+		dealloc(payload);
+}
+
 static void p2p_reader(p2p_conn_t *conn)
 {
 	uchar *payload = NULL;
@@ -2195,6 +2588,11 @@ static void p2p_reader(p2p_conn_t *conn)
 
 	if (unlikely(conn->evicted))
 		goto out;
+
+	if (conn->udp) {
+		activate_conn(conn);
+		goto out;
+	}
 
 	if (conn->sock < 0 || !conn->handshake_done) {
 		deactivate_conn(conn);
@@ -2218,74 +2616,7 @@ static void p2p_reader(p2p_conn_t *conn)
 		goto out;
 	}
 
-	// Log all received messages with descriptive type, even if ignoring
-	if (!strcmp(cmd, "version")) {
-		LOGINFO("Received VERSION (%u bytes) - handling for handshake", plen);
-	} else if (!strcmp(cmd, "verack")) {
-		LOGINFO("Received VERACK (%u bytes) - handling for handshake", plen);
-	} else if (!strcmp(cmd, "ping")) {
-		LOGINFO("Received PING (%u bytes) - replying with PONG", plen);
-		handle_ping(conn, payload, plen);
-		goto rearm; // Skip dealloc since handler does it
-	} else if (!strcmp(cmd, "pong")) {
-		LOGDEBUG("Received PONG (%u bytes) - ignoring (keep-alive response)", plen);
-	} else if (!strcmp(cmd, "sendcmpct")) {
-		LOGINFO("Received SENDCMPCT (%u bytes) - handling compact block negotiation", plen);
-		handle_sendcmpct(conn, payload, plen);
-		goto rearm; // Skip dealloc since handler does it
-	} else if (!strcmp(cmd, "getdata")) {
-		LOGINFO("Received GETDATA (%u bytes) - handling (request for compact block or tx)", plen);
-		handle_getdata(conn, payload, plen);
-		goto rearm; // Skip dealloc since handler does it
-	} else if (!strcmp(cmd, "getblocktxn")) {
-		LOGINFO("Received GETBLOCKTXN (%u bytes) - handling (request for block txn)", plen);
-		handle_getblocktxn(conn, payload, plen);
-		goto rearm; // Skip dealloc since handler does it
-	} else if (!strcmp(cmd, "inv")) {
-		handle_inv(conn, payload, plen);
-		goto rearm;
-	} else if (!strcmp(cmd, "headers")) {
-		LOGINFO("Received HEADERS (%u bytes) - ignoring", plen);
-	} else if (!strcmp(cmd, "cmpctblock")) {
-		LOGNOTICE("Received CMPCTBLOCK from peer %d (%u bytes) - handling (resend to all nodes)", conn->peer, plen);
-		handle_cmpctblock(payload, plen, conn->peer);
-		goto rearm;
-	} else if (!strcmp(cmd, "tx")) {
-		LOGDEBUG("Received TX (%u bytes) - ignoring (transaction data)", plen);
-	} else if (!strcmp(cmd, "block")) {
-		LOGINFO("Received BLOCK (%u bytes) - ignoring (full block data)", plen);
-	} else if (!strcmp(cmd, "blocktxn")) {
-		LOGDEBUG("Received BLOCKTXN (%u bytes) - handling (block transactions response)", plen);
-		handle_blocktxn_relay(conn, payload, plen);
-		goto rearm;
-	} else if (!strcmp(cmd, "getheaders")) {
-		LOGDEBUG("Received GETHEADERS (%u bytes) - ignoring (headers request)", plen);
-	} else if (!strcmp(cmd, "getblocks")) {
-		LOGDEBUG("Received GETBLOCKS (%u bytes) - ignoring (blocks request)", plen);
-	} else if (!strcmp(cmd, "getaddr")) {
-		LOGDEBUG("Received GETADDR (%u bytes) - ignoring (peer discovery request)", plen);
-	} else if (!strcmp(cmd, "addr")) {
-		LOGDEBUG("Received ADDR (%u bytes) - ignoring (peer addresses)", plen);
-	} else if (!strcmp(cmd, "addrv2")) {
-		LOGINFO("Received ADDRV2 (%u bytes)", plen);
-		parse_addrv2(payload, plen);
-		goto rearm; // Handler deallocates
-	} else if (!strcmp(cmd, "feefilter")) {
-		LOGDEBUG("Received FEEFILTER (%u bytes) - ignoring (fee filter)", plen);
-	} else if (!strcmp(cmd, "reject")) {
-		LOGDEBUG("Received REJECT (%u bytes) - ignoring (rejection message)", plen);
-	} else if (!strcmp(cmd, "notfound")) {
-		LOGDEBUG("Received NOTFOUND (%u bytes) - ignoring (item not found)", plen);
-	} else if (!strcmp(cmd, "wtxidrelay")) {
-		LOGDEBUG("Received WTXIDRELAY (%u bytes) - ignoring (wtxid relay negotiation)", plen);
-	} else if (!strcmp(cmd, "sendaddrv2")) {
-		LOGDEBUG("Received SENDADDRV2 (%u bytes) - ignoring (addrv2 negotiation)", plen);
-	} else {
-		LOGINFO("Received unknown command %s (%u bytes) - ignoring", cmd, plen);
-	}
-
-	if (payload)
-		dealloc(payload);
+	p2p_handle_msg(conn, cmd, payload, plen);
 rearm:
 	del_reader(conn);
 	add_conn_epoll(conn);
@@ -2314,14 +2645,28 @@ static void dump_peers(void)
 
 	ck_rlock(&peerlock);
 	/* Start at peer 1 */
-	for (p2ppeer = p2ppeers->hh.next; p2ppeer!= NULL; p2ppeer = p2ppeer->hh.next) {
+	for (p2ppeer = p2ppeers ? p2ppeers->hh.next : NULL; p2ppeer != NULL; p2ppeer = p2ppeer->hh.next) {
 		p2p_conn_t *conn = p2ppeer->conn;
 		struct in6_addr addr;
 
-		if (conn->incoming_only)
+		if (conn->incoming_only || conn->udp || conn->ckp2p_peer)
 			continue;
 
 		/* check if host is ipv6 */
+		if (inet_pton(AF_INET6, conn->host, &addr) == 1)
+			fprintf(fp, "%s\n\t\"[%s]:%d\"", count++ ? "," : "", conn->host, conn->port);
+		else
+			fprintf(fp, "%s\n\t\"%s:%d\"", count++ ? "," : "", conn->host, conn->port);
+	}
+
+	fprintf(fp, "\n],\n\"ckp2peers\" : [");
+	count = 0;
+	for (p2ppeer = p2ppeers; p2ppeer != NULL; p2ppeer = p2ppeer->hh.next) {
+		p2p_conn_t *conn = p2ppeer->conn;
+		struct in6_addr addr;
+
+		if (!conn || conn->incoming_only || (!conn->udp && !conn->ckp2p_peer))
+			continue;
 		if (inet_pton(AF_INET6, conn->host, &addr) == 1)
 			fprintf(fp, "%s\n\t\"[%s]:%d\"", count++ ? "," : "", conn->host, conn->port);
 		else
@@ -2378,6 +2723,18 @@ static void *p2p_keepalive(void __maybe_unused *arg)
 				continue;
 			if (conn->evicted)
 				continue;
+			if (conn->udp) {
+				if (!conn->handshake_done) {
+					add_connector(conn);
+					continue;
+				}
+				if (ping) {
+					nonce = ((uint64_t)rand() << 32) | rand();
+					p2p_udp_ping(conn, nonce);
+				}
+				continue;
+			}
+
 			if (!conn->handshake_done || conn->sock < 0) {
 				int attempted, timeout = EVICT_TIMEOUT;
 				bool prio;
@@ -2387,8 +2744,8 @@ static void *p2p_keepalive(void __maybe_unused *arg)
 					continue;
 				}
 
-				prio = (i <= ckpool.prioclients);
-				/* Never evict priority clients */
+				prio = is_ckp2p_prio(conn);
+				/* Never evict priority / ckp2p clients */
 				if (!prio) {
 					int unresponsive = tvdiff(&now, &conn->last_alive);
 
@@ -2452,17 +2809,18 @@ static void *submission_thread(void *arg)
 	for (i = 1; i < p2purls; i++) {
 		p2p_conn_t *conn;
 
-		/* Only relay to prioclients unless the compact block has come
-		 * from the local peer 0 source */
-		if (cbt->source && i > ckpool.prioclients)
-			break;
+		/* Only relay to prioclients / ckp2p peers unless the compact
+		 * block has come from the local peer 0 source */
+		conn = get_peer(i);
+		if (cbt->source && i > ckpool.prioclients &&
+		    !(conn && conn->ckp2p_peer))
+			continue;
 
 		if (i == cbt->source) {
 			LOGDEBUG("Skipping relaying compact block to source node %d", i);
 			continue;
 		}
 
-		conn = get_peer(i);
 		if (unlikely(!conn)) {
 			LOGDEBUG("Skipping relaying compact block to uninitialised node %d", i);
 			continue;
@@ -2477,7 +2835,8 @@ static void *submission_thread(void *arg)
 			continue;
 		}
 
-		if (conn->sock < 0 || !conn->handshake_done) {
+		if (!conn->handshake_done ||
+		    (!conn->udp && conn->sock < 0)) {
 			LOGINFO("Connection %d not active - skipping submission", i);
 			continue;
 		}
@@ -2495,10 +2854,10 @@ static void *submission_thread(void *arg)
 
 		p2p_send(conn, "cmpctblock", cbt->cmpct_payload, cbt->cmpct_len);
 
-		/* Disconnect all priority peers except peer 0-1 which should be
-		 * localhost to avoid inducing latency at their end in case they
-		 * ask for more information from ckp2p.*/
-		if (i > 1 && i <= ckpool.prioclients) {
+		/* Disconnect bitcoind prio peers except 0-1 after send. Never
+		 * disconnect ckp2p clients (TCP or UDP). */
+		if (i > 1 && i <= ckpool.prioclients && !conn->ckp2p_peer &&
+		    !conn->udp) {
 			disconnect_conn(conn);
 			add_connector(conn);
 		}
@@ -2577,11 +2936,31 @@ static p2p_conn_t *ckp2p_connect(const char *host, const char *charport, int sou
 	return conn;
 }
 
-/* Listener socket creator (all interfaces) */
+/* Listener socket creator (dual-stack, fall back to IPv4) */
 static int create_p2p_listener(void)
 {
-	int sock;
+	struct sockaddr_in6 sin6;
 	struct sockaddr_in sin;
+	int sock, opt, v6only;
+
+	sock = socket(AF_INET6, SOCK_STREAM, 0);
+	if (sock >= 0) {
+		opt = 1;
+		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+		v6only = 0;
+		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+		memset(&sin6, 0, sizeof(sin6));
+		sin6.sin6_family = AF_INET6;
+		sin6.sin6_port = htons(externalport);
+		sin6.sin6_addr = in6addr_any;
+		if (!bind(sock, (struct sockaddr *)&sin6, sizeof(sin6)) &&
+		    !listen(sock, 32)) {
+			LOGNOTICE("ckp2p listening on [::]:%d for incoming P2P connections",
+				  externalport);
+			return sock;
+		}
+		close(sock);
+	}
 
 	sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
@@ -2589,7 +2968,7 @@ static int create_p2p_listener(void)
 		return -1;
 	}
 
-	int opt = 1;
+	opt = 1;
 	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
 	memset(&sin, 0, sizeof(sin));
@@ -2626,9 +3005,11 @@ static void *p2p_acceptor(void __maybe_unused *arg)
 		return NULL;
 
 	while (42) {
-		struct sockaddr_in client_addr;
+		struct sockaddr_storage client_addr;
 		socklen_t clen = sizeof(client_addr);
 		int newsock;
+		char host[INET6_ADDRSTRLEN], serv[16];
+		int port_num;
 
 		while (client_watermarks())
 			sleep(KEEPALIVE_INTERVAL);
@@ -2639,10 +3020,11 @@ static void *p2p_acceptor(void __maybe_unused *arg)
 			continue;
 		}
 
-		char host[INET_ADDRSTRLEN];
-		inet_ntop(AF_INET, &client_addr.sin_addr, host, sizeof(host));
-		int port_num = ntohs(client_addr.sin_port);
-		char serv[16];
+		p2p_udp_canon_ip((struct sockaddr *)&client_addr, host, sizeof(host));
+		if (client_addr.ss_family == AF_INET6)
+			port_num = ntohs(((struct sockaddr_in6 *)&client_addr)->sin6_port);
+		else
+			port_num = ntohs(((struct sockaddr_in *)&client_addr)->sin_port);
 		snprintf(serv, sizeof(serv), "%d", port_num);
 
 		LOGNOTICE("Incoming ckp2p connection from %s:%d", host, port_num);
@@ -2730,23 +3112,34 @@ int prepare_ckp2p(void)
 	if (ckpool.externalip) {
 		connsock_t cslocal = {};
 		struct in_addr addr;
+		struct in6_addr addr6;
 
 		if (!extract_sockaddr(ckpool.externalip, &cslocal.url, &cslocal.port)) {
 			LOGEMERG("Failed to extract address from externalip %s", ckpool.externalip);
 			return -1;
 		}
-		if (inet_aton(cslocal.url, &addr) == 0) {
+		sscanf(cslocal.port, "%d", &externalport);
+		if (!externalport)
+			externalport = CKP2P_LISTEN_PORT;
+		if (inet_pton(AF_INET6, cslocal.url, &addr6) == 1) {
+			if (IN6_IS_ADDR_V4MAPPED(&addr6)) {
+				memcpy(&externalip, &addr6.s6_addr[12], 4);
+				external_is_v6 = false;
+			} else {
+				external_v6 = addr6;
+				external_is_v6 = true;
+			}
+		} else if (inet_pton(AF_INET, cslocal.url, &addr) == 1) {
+			externalip = addr.s_addr;
+			external_is_v6 = false;
+		} else {
 			LOGEMERG("Failed to parse IP from externalip %s", ckpool.externalip);
 			free(cslocal.url);
 			free(cslocal.port);
 			return -1;
 		}
-		sscanf(cslocal.port, "%d", &externalport);
-		if (!externalport)
-			externalport = CKP2P_LISTEN_PORT;
 		free(cslocal.url);
 		free(cslocal.port);
-		externalip = addr.s_addr;
 	} else {
 		externalport = CKP2P_LISTEN_PORT;
 		ASPRINTF(&ckpool.externalip, "127.0.0.1:%d", externalport);
@@ -2778,6 +3171,46 @@ int prepare_ckp2p(void)
 	}
 	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
+	p2p_udp_set_magic(netdefs[0].magic);
+	p2p_udp_set_genesis(netdefs[0].genesis);
+	if (p2p_udp_init(externalport) >= 0)
+		create_pthread(&pthread, p2p_udp_receiver, NULL);
+
+	for (i = 0; i < ckpool.ckp2peers; i++) {
+		char *url = NULL, *portstr = NULL;
+		p2p_conn_t *conn;
+		int port;
+		char key[INET6_ADDRSTRLEN];
+
+		if (!ckpool.ckp2peer[i])
+			continue;
+		if (!extract_sockaddr(ckpool.ckp2peer[i], &url, &portstr)) {
+			LOGWARNING("Invalid ckp2peers entry %s", ckpool.ckp2peer[i]);
+			continue;
+		}
+		sscanf(portstr, "%d", &port);
+		conn = ckp2p_connect(url, portstr, -1);
+		conn->udp = true;
+		conn->ckp2p_peer = true;
+		if (!p2p_udp_fill_dst(conn, url, port))
+			LOGWARNING("Failed to resolve ckp2peer %s", ckpool.ckp2peer[i]);
+		p2p_udp_canon_ip_str(url, key, sizeof(key));
+		ck_wlock(&peerlock);
+		_append_conn(conn);
+		{
+			peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+
+			p2ppeer->conn = conn;
+			sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
+			HASH_ADD_STR(p2ppeers, url, p2ppeer);
+		}
+		ck_wunlock(&peerlock);
+		ckp2p_client_set(key, P2P_XPORT_UDP, conn);
+		LOGWARNING("ckp2p UDP peer %d - %s:%s", conn->peer, url, portstr);
+		free(url);
+		free(portstr);
+	}
+
 	num_threads = sysconf(_SC_NPROCESSORS_ONLN);
 	p2p_readers = create_ckmsgqs("p2pread", &p2p_reader, num_threads);
 	p2p_connectors = create_ckmsgqs("p2pconnect", &p2p_connector, num_threads);
@@ -2795,6 +3228,7 @@ int prepare_ckp2p(void)
 	LOGWARNING("ckp2p listener thread started for incoming connections on port %d", externalport);
 
 	ck_wlock(&peerlock);
+	p2purls = ckpool.p2purls;
 	for (i = 0; i < p2purls; i++)
 		_add_connector(ckpool.p2pconn[i]);
 	ck_wunlock(&peerlock);

@@ -59,6 +59,9 @@ AC_CHECK_HEADERS(sys/epoll.h libpq-fe.h postgresql/libpq-fe.h grp.h)
 AC_CHECK_HEADERS(gsl/gsl_math.h gsl/gsl_cdf.h)
 AC_CHECK_HEADERS(openssl/x509.h openssl/hmac.h)
 AC_CHECK_HEADERS(zmq.h)
+AC_CHECK_HEADERS([isa-l.h], [], [
+	AC_MSG_ERROR([libisal-dev required for ckp2p UDP FEC: sudo apt install libisal-dev])
+])
 
 AC_CHECK_PROG(YASM, yasm, yes)
 AM_CONDITIONAL([HAVE_YASM], [test x$YASM = xyes])
@@ -117,6 +120,9 @@ AC_SEARCH_LIBS(clock_nanosleep, rt, , echo "Error: Required library rt not found
 AC_SEARCH_LIBS(exp, m, , echo "Error: Required library math not found." && exit 1)
 AC_SEARCH_LIBS(pthread_mutex_trylock, pthread, , echo "Error: Required library pthreads not found." && exit 1)
 AC_SEARCH_LIBS(zmq_socket, zmq, ZMQ=yes, ZMQ=no)
+AC_SEARCH_LIBS(ec_encode_data, isal, ISAL=yes, [
+	AC_MSG_ERROR([libisal-dev required for ckp2p UDP FEC: sudo apt install libisal-dev])
+])
 
 AC_CONFIG_FILES([Makefile src/Makefile test/Makefile])
 
@@ -128,6 +134,7 @@ echo
 echo "Compilation............: make (or gmake)"
 echo "  YASM (Intel ASM).....: $YASM"
 echo "  ZMQ..................: $ZMQ"
+echo "  ISA-L (UDP FEC)......: $ISAL"
 echo "  CPPFLAGS.............: $CPPFLAGS"
 echo "  CFLAGS...............: $CFLAGS"
 echo "  LDFLAGS..............: $LDFLAGS"
