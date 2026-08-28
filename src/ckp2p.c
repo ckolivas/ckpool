@@ -2610,11 +2610,39 @@ out:
 	del_reader(conn);
 }
 
+static void dump_hostport(FILE *fp, int *count, const char *host, int port)
+{
+	struct in6_addr addr;
+
+	if (inet_pton(AF_INET6, host, &addr) == 1)
+		fprintf(fp, "%s\n\t\"[%s]:%d\"", (*count)++ ? "," : "", host, port);
+	else
+		fprintf(fp, "%s\n\t\"%s:%d\"", (*count)++ ? "," : "", host, port);
+}
+
+static bool ckp2peer_configured(const char *host, int port)
+{
+	char buf[INET6_ADDRSTRLEN + 16];
+	struct in6_addr addr;
+	int i;
+
+	if (inet_pton(AF_INET6, host, &addr) == 1)
+		snprintf(buf, sizeof(buf), "[%s]:%d", host, port);
+	else
+		snprintf(buf, sizeof(buf), "%s:%d", host, port);
+
+	for (i = 0; i < ckpool.ckp2peers; i++) {
+		if (ckpool.ckp2peer[i] && !strcmp(ckpool.ckp2peer[i], buf))
+			return true;
+	}
+	return false;
+}
+
 /* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
 static void dump_peers(void)
 {
 	peerlist_t *p2ppeer;
-	int count = 0;
+	int count = 0, i;
 	FILE *fp;
 
 	fp = fopen("peers.conf", "we");
@@ -2631,30 +2659,27 @@ static void dump_peers(void)
 	/* Start at peer 1 */
 	for (p2ppeer = p2ppeers ? p2ppeers->hh.next : NULL; p2ppeer != NULL; p2ppeer = p2ppeer->hh.next) {
 		p2p_conn_t *conn = p2ppeer->conn;
-		struct in6_addr addr;
 
-		if (conn->incoming_only || conn->udp || conn->ckp2p_peer)
+		if (!conn || conn->incoming_only || conn->udp || conn->ckp2p_peer)
 			continue;
-
-		/* check if host is ipv6 */
-		if (inet_pton(AF_INET6, conn->host, &addr) == 1)
-			fprintf(fp, "%s\n\t\"[%s]:%d\"", count++ ? "," : "", conn->host, conn->port);
-		else
-			fprintf(fp, "%s\n\t\"%s:%d\"", count++ ? "," : "", conn->host, conn->port);
+		dump_hostport(fp, &count, conn->host, conn->port);
 	}
 
 	fprintf(fp, "\n],\n\"ckp2peers\" : [");
 	count = 0;
+	for (i = 0; i < ckpool.ckp2peers; i++) {
+		if (!ckpool.ckp2peer[i])
+			continue;
+		fprintf(fp, "%s\n\t\"%s\"", count++ ? "," : "", ckpool.ckp2peer[i]);
+	}
 	for (p2ppeer = p2ppeers; p2ppeer != NULL; p2ppeer = p2ppeer->hh.next) {
 		p2p_conn_t *conn = p2ppeer->conn;
-		struct in6_addr addr;
 
 		if (!conn || conn->incoming_only || (!conn->udp && !conn->ckp2p_peer))
 			continue;
-		if (inet_pton(AF_INET6, conn->host, &addr) == 1)
-			fprintf(fp, "%s\n\t\"[%s]:%d\"", count++ ? "," : "", conn->host, conn->port);
-		else
-			fprintf(fp, "%s\n\t\"%s:%d\"", count++ ? "," : "", conn->host, conn->port);
+		if (ckp2peer_configured(conn->host, conn->port))
+			continue;
+		dump_hostport(fp, &count, conn->host, conn->port);
 	}
 	ck_runlock(&peerlock);
 
