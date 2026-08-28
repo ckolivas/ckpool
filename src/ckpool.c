@@ -1310,11 +1310,29 @@ static void parse_ckp2peers(const json_t *arr_val, const int arr_size)
 	ckpool.ckp2peers = arr_size;
 	ckpool.ckp2peer = ckzalloc(sizeof(char *) * arr_size);
 	for (i = 0, j = 0; i < arr_size; i++) {
+		int k;
+
 		val = json_array_get(arr_val, i);
-		if (!_json_get_string(&ckpool.ckp2peer[j], val, "ckp2peers"))
+		if (!_json_get_string(&ckpool.ckp2peer[j], val, "ckp2peers")) {
 			LOGWARNING("Invalid ckp2peers entry number %d", i);
-		else
-			j++;
+			continue;
+		}
+		if (ckpool.externalip && !strcmp(ckpool.ckp2peer[j], ckpool.externalip)) {
+			LOGNOTICE("Ignoring ckp2peers entry %s (this node's externalip)",
+				  ckpool.ckp2peer[j]);
+			dealloc(ckpool.ckp2peer[j]);
+			continue;
+		}
+		for (k = 0; k < j; k++) {
+			if (ckpool.ckp2peer[k] && !strcmp(ckpool.ckp2peer[k], ckpool.ckp2peer[j]))
+				break;
+		}
+		if (k < j) {
+			LOGNOTICE("Ignoring duplicate ckp2peers entry %s", ckpool.ckp2peer[j]);
+			dealloc(ckpool.ckp2peer[j]);
+			continue;
+		}
+		j++;
 	}
 	ckpool.ckp2peers = j;
 }
@@ -1491,13 +1509,13 @@ static void parse_config(void)
 		if (arr_size)
 			parse_p2purls(arr_val, arr_size);
 	}
+	json_get_string(&ckpool.externalip, json_conf, "externalip");
 	arr_val = json_object_get(json_conf, "ckp2peers");
 	if (arr_val && json_is_array(arr_val)) {
 		arr_size = json_array_size(arr_val);
 		if (arr_size)
 			parse_ckp2peers(arr_val, arr_size);
 	}
-	json_get_string(&ckpool.externalip, json_conf, "externalip");
 	json_get_string(&ckpool.btcaddress, json_conf, "btcaddress");
 	json_get_string(&ckpool.btcsig, json_conf, "btcsig");
 	if (ckpool.btcsig && strlen(ckpool.btcsig) > 38) {

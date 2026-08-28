@@ -388,6 +388,7 @@ static bool is_ckp2p_prio(const p2p_conn_t *conn)
 
 static inline void _activate_conn(p2p_conn_t *conn);
 static void disconnect_conn(p2p_conn_t *conn);
+static bool peer_is_self(const char *host, int port);
 
 /* Return true if a VERSION payload indicates a blocksonly peer. */
 static bool version_is_blocksonly(const uchar *payload, uint32_t plen)
@@ -2274,6 +2275,8 @@ static void add_peer_async(const char *host, int port)
 	LOGINFO("New addrv2: %s:%d", host, port);
 	if (!finished_init)
 		return;
+	if (peer_is_self(host, port))
+		return;
 
 	conn = ckzalloc(sizeof(*conn));
 	cklock_init(&conn->block_lock);
@@ -2610,39 +2613,85 @@ out:
 	del_reader(conn);
 }
 
-static void dump_hostport(FILE *fp, int *count, const char *host, int port)
+static void hostport_str(char *buf, size_t len, const char *host, int port)
 {
 	struct in6_addr addr;
 
 	if (inet_pton(AF_INET6, host, &addr) == 1)
-		fprintf(fp, "%s\n\t\"[%s]:%d\"", (*count)++ ? "," : "", host, port);
+		snprintf(buf, len, "[%s]:%d", host, port);
 	else
-		fprintf(fp, "%s\n\t\"%s:%d\"", (*count)++ ? "," : "", host, port);
+		snprintf(buf, len, "%s:%d", host, port);
 }
 
-static bool ckp2peer_configured(const char *host, int port)
+static bool peer_is_self(const char *host, int port)
 {
-	char buf[INET6_ADDRSTRLEN + 16];
-	struct in6_addr addr;
-	int i;
+	char canon[INET6_ADDRSTRLEN], ext[INET6_ADDRSTRLEN];
+	int extport = externalport ? externalport : CKP2P_LISTEN_PORT;
 
-	if (inet_pton(AF_INET6, host, &addr) == 1)
-		snprintf(buf, sizeof(buf), "[%s]:%d", host, port);
-	else
-		snprintf(buf, sizeof(buf), "%s:%d", host, port);
-
-	for (i = 0; i < ckpool.ckp2peers; i++) {
-		if (ckpool.ckp2peer[i] && !strcmp(ckpool.ckp2peer[i], buf))
+	if (!host || !host[0])
+		return false;
+	if (port && port != extport)
+		return false;
+	p2p_udp_canon_ip_str(host, canon, sizeof(canon));
+	if (!strcmp(canon, "127.0.0.1") || !strcmp(canon, "::1"))
+		return true;
+	if (external_is_v6) {
+		inet_ntop(AF_INET6, &external_v6, ext, sizeof(ext));
+		if (!strcmp(canon, ext))
 			return true;
 	}
+	if (externalip) {
+		struct in_addr a = { .s_addr = externalip };
+
+		inet_ntop(AF_INET, &a, ext, sizeof(ext));
+		if (!strcmp(canon, ext))
+			return true;
+	}
+	if (ckpool.externalip && port == extport) {
+		char *url = NULL, *pstr = NULL;
+		int p = 0;
+
+		if (extract_sockaddr(ckpool.externalip, &url, &pstr)) {
+			char extcanon[INET6_ADDRSTRLEN];
+			bool match;
+
+			sscanf(pstr, "%d", &p);
+			p2p_udp_canon_ip_str(url, extcanon, sizeof(extcanon));
+			match = (p == port && !strcmp(canon, extcanon));
+			free(url);
+			free(pstr);
+			if (match)
+				return true;
+		}
+	}
 	return false;
+}
+
+struct dump_seen {
+	UT_hash_handle hh;
+	char url[288];
+};
+
+static bool dump_seen_add(struct dump_seen **seen, const char *url)
+{
+	struct dump_seen *s = NULL;
+
+	HASH_FIND_STR(*seen, url, s);
+	if (s)
+		return false;
+	s = ckzalloc(sizeof(*s));
+	snprintf(s->url, sizeof(s->url), "%s", url);
+	HASH_ADD_STR(*seen, url, s);
+	return true;
 }
 
 /* Stores a copy of non-evicted outgoing peers every minute to peers.conf */
 static void dump_peers(void)
 {
+	struct dump_seen *seen = NULL, *s, *stmp;
 	peerlist_t *p2ppeer;
 	int count = 0, i;
+	char url[288];
 	FILE *fp;
 
 	fp = fopen("peers.conf", "we");
@@ -2662,13 +2711,33 @@ static void dump_peers(void)
 
 		if (!conn || conn->incoming_only || conn->udp || conn->ckp2p_peer)
 			continue;
-		dump_hostport(fp, &count, conn->host, conn->port);
+		hostport_str(url, sizeof(url), conn->host, conn->port);
+		if (!dump_seen_add(&seen, url))
+			continue;
+		fprintf(fp, "%s\n\t\"%s\"", count++ ? "," : "", url);
 	}
 
 	fprintf(fp, "\n],\n\"ckp2peers\" : [");
 	count = 0;
 	for (i = 0; i < ckpool.ckp2peers; i++) {
+		char *host = NULL, *pstr = NULL;
+		int port = 0;
+
 		if (!ckpool.ckp2peer[i])
+			continue;
+		if (ckpool.externalip && !strcmp(ckpool.ckp2peer[i], ckpool.externalip))
+			continue;
+		if (extract_sockaddr(ckpool.ckp2peer[i], &host, &pstr)) {
+			sscanf(pstr, "%d", &port);
+			if (peer_is_self(host, port)) {
+				free(host);
+				free(pstr);
+				continue;
+			}
+			free(host);
+			free(pstr);
+		}
+		if (!dump_seen_add(&seen, ckpool.ckp2peer[i]))
 			continue;
 		fprintf(fp, "%s\n\t\"%s\"", count++ ? "," : "", ckpool.ckp2peer[i]);
 	}
@@ -2677,11 +2746,19 @@ static void dump_peers(void)
 
 		if (!conn || conn->incoming_only || (!conn->udp && !conn->ckp2p_peer))
 			continue;
-		if (ckp2peer_configured(conn->host, conn->port))
+		if (peer_is_self(conn->host, conn->port))
 			continue;
-		dump_hostport(fp, &count, conn->host, conn->port);
+		hostport_str(url, sizeof(url), conn->host, conn->port);
+		if (!dump_seen_add(&seen, url))
+			continue;
+		fprintf(fp, "%s\n\t\"%s\"", count++ ? "," : "", url);
 	}
 	ck_runlock(&peerlock);
+
+	HASH_ITER(hh, seen, s, stmp) {
+		HASH_DEL(seen, s);
+		free(s);
+	}
 
 	fprintf(fp, "\n]\n}\n");
 	fclose(fp);
@@ -3040,6 +3117,12 @@ static void *p2p_acceptor(void __maybe_unused *arg)
 
 		LOGNOTICE("Incoming ckp2p connection from %s:%d", host, port_num);
 
+		if (peer_is_self(host, externalport)) {
+			LOGNOTICE("Ignoring incoming connection from this node's externalip %s", host);
+			close(newsock);
+			continue;
+		}
+
 		p2p_conn_t *conn = ckzalloc(sizeof(*conn));
 		cklock_init(&conn->block_lock);
 		conn->sock = newsock;
@@ -3168,6 +3251,12 @@ int prepare_ckp2p(void)
 			continue;
 		}
 		sscanf(portstr, "%d", &port);
+		if (peer_is_self(url, port) || dup_peer(url, port)) {
+			LOGNOTICE("Ignoring ckp2peer %s", ckpool.ckp2peer[i]);
+			free(url);
+			free(portstr);
+			continue;
+		}
 		conn = ckp2p_connect(url, portstr, -1);
 		conn->udp = true;
 		conn->ckp2p_peer = true;
