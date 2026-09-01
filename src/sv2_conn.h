@@ -11,9 +11,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 
 #include "sv2_noise.h"
 #include "sv2_types.h"
+
+/* Pre-session idle deadlines (connector reaper). Handshake is 1 RTT. */
+#define SV2_IDLE_HANDSHAKE_TIMEOUT	10
+#define SV2_IDLE_SETUP_TIMEOUT		60
+#define SV2_IDLE_CHANNEL_TIMEOUT	60
 
 struct sv2_conn {
 	sv2_noise_session_t *noise;
@@ -61,5 +67,13 @@ const struct sv2_noise_server_keys *sv2_get_server_keys(void);
 bool sv2_handshake_try_reserve(const char *address_name);
 /* Release global in-flight handshake slot (complete or drop). */
 void sv2_handshake_release(void);
+
+/*
+ * True if a Noise-complete-or-not SV2 socket has outlived its pre-session
+ * deadline. has_channel (mining Open*.Success / JD Allocate.Success) is
+ * terminal. *timeout is the limit that fired when the return is true.
+ */
+bool sv2_pre_session_expired(bool hs_inflight, time_t setup_time, bool has_channel,
+			     time_t accept_time, time_t now, int *timeout);
 
 #endif /* SV2_CONN_H */

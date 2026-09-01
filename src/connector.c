@@ -97,7 +97,8 @@ struct client_instance {
 	 * message reaches the stratifier, so a socket that connects and stays
 	 * silent is invisible to the stratifier's unauthorised client reaper
 	 * while still occupying an fd and a maxclients slot. Only the connector
-	 * can see these, so they are reaped here. */
+	 * can see these, so they are reaped here. got_msg is the SV1 latch
+	 * (first complete JSON); SV2 uses the setup/channel fields below. */
 	time_t accept_time;
 	bool got_msg;
 
@@ -115,6 +116,10 @@ struct client_instance {
 	bool sv2_jd;
 	/* Per-connection Noise + reassembly (connector-owned). */
 	struct sv2_conn *sv2c;
+	/* Set when SetupConnection.Success is queued; 0 until then. */
+	time_t sv2_setup_time;
+	/* Mining: Open*Channel.Success. JD: AllocateMiningJobToken.Success. */
+	bool sv2_has_channel;
 #endif
 };
 
@@ -735,13 +740,9 @@ static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
 		dealloc(frame_lens);
 		return false;
 	}
-	/* A cleared inflight flag means the Noise handshake completed, so this
-	 * peer has proven it speaks SV2 and is no longer reapable as idle. A
-	 * peer that connects and never completes the handshake keeps its slot
-	 * in the global inflight limit, so it must be reaped. */
-	if (likely(!client->sv2c->hs_inflight))
-		client->got_msg = true;
-	/* Handshake ciphertext — already Noise-framed; do not re-encrypt. */
+	/* Handshake ciphertext — already Noise-framed; do not re-encrypt.
+	 * Completing Noise must not set got_msg; the idle reaper treats
+	 * hs_inflight, sv2_setup_time and sv2_has_channel as three phases. */
 	if (reply && reply_len) {
 		sender_send_t *ss = ckzalloc(sizeof(sender_send_t));
 
@@ -794,6 +795,25 @@ static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
 	return true;
 }
 
+/* Latch pre-session progress from an outbound plaintext frame. Open*.Success
+ * is queued (not returned) so the send path is the single observer. */
+static void sv2_note_outbound_progress(client_instance_t *client,
+				       const uint8_t *plain, int plainlen)
+{
+	uint8_t mt;
+
+	if (plainlen < SV2_FRAME_HEADER_LEN)
+		return;
+	mt = plain[2];
+	if (mt == SV2_MSG_SETUP_CONNECTION_SUCCESS) {
+		if (!client->sv2_setup_time)
+			client->sv2_setup_time = time(NULL);
+	} else if (mt == SV2_MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS ||
+		   mt == SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS ||
+		   mt == SV2_MSG_ALLOCATE_MINING_JOB_TOKEN_SUCCESS)
+		client->sv2_has_channel = true;
+}
+
 /* Queue a plaintext SV2 frame for the owning sender shard. Encryption of the
  * outbound Noise CipherState happens only on that shard thread. */
 static void send_client_bin(cdata_t *cdata, client_instance_t *client,
@@ -805,6 +825,7 @@ static void send_client_bin(cdata_t *cdata, client_instance_t *client,
 		dealloc(plain);
 		return;
 	}
+	sv2_note_outbound_progress(client, plain, plainlen);
 	ss = ckzalloc(sizeof(sender_send_t));
 	ss->client = client;
 	ss->buf = (char *)plain;
@@ -1090,24 +1111,57 @@ outnoclient:
  * which keeps the instance lock held briefly and avoids allocating under it. */
 #define IDLE_REAP_BATCH 128
 
-/* Reap sockets that connected but have never delivered a complete message.
+/* True if this socket has outlived its pre-session deadline. timeout/why
+ * are populated on true (and on SV2 true-paths) for the reap log. */
+static bool client_pre_session_expired(const client_instance_t *client,
+				       time_t now_t, int *timeout,
+				       const char **why)
+{
+#ifdef HAVE_SV2
+	if (client->sv2) {
+		bool hs_inflight = client->sv2c && client->sv2c->hs_inflight;
+
+		if (likely(client->sv2_has_channel))
+			return false;
+		if (hs_inflight)
+			*why = "without completing Noise handshake";
+		else if (!client->sv2_setup_time)
+			*why = "without SetupConnection";
+		else
+			*why = client->sv2_jd ? "without allocating a job token" :
+						"without opening a channel";
+		return sv2_pre_session_expired(hs_inflight, client->sv2_setup_time,
+					       client->sv2_has_channel,
+					       client->accept_time, now_t, timeout);
+	}
+#endif
+	*timeout = IDLE_ACCEPT_TIMEOUT;
+	*why = "without a message";
+	if (likely(client->got_msg))
+		return false;
+	return now_t - client->accept_time > IDLE_ACCEPT_TIMEOUT;
+}
+
+/* Reap sockets that connected but have never become a real session.
  * A stratum_instance_t is only created once a whole message reaches the
  * stratifier, so these are invisible to the stratifier's unauthorised client
  * reaper while still holding an fd and a maxclients slot - and for SV2, a slot
  * in the global handshake inflight limit, which dropping the client releases
- * via sv2_conn_free. */
+ * via sv2_conn_free. SV2 is three-phase: Noise (10s from accept),
+ * SetupConnection (60s from accept), then channel/token (60s from Success). */
 static void reap_idle_clients(cdata_t *cdata)
 {
 	int64_t ids[IDLE_REAP_BATCH];
 	client_instance_t *client, *tmp;
 	time_t now_t = time(NULL);
-	int nids = 0, i;
+	int nids = 0, i, timeout;
+	const char *why;
 
 	ck_rlock(&cdata->lock);
 	HASH_ITER(hh, cdata->clients, client, tmp) {
-		if (likely(client->got_msg) || client->invalid)
+		if (client->invalid)
 			continue;
-		if (likely(now_t - client->accept_time <= IDLE_ACCEPT_TIMEOUT))
+		if (likely(!client_pre_session_expired(client, now_t, &timeout, &why)))
 			continue;
 		ids[nids++] = client->id;
 		if (unlikely(nids >= IDLE_REAP_BATCH))
@@ -1119,8 +1173,12 @@ static void reap_idle_clients(cdata_t *cdata)
 		client = ref_client_by_id(cdata, ids[i]);
 		if (unlikely(!client))
 			continue;
-		LOGNOTICE("Reaping client id %"PRId64" %s idle without a message for %d seconds",
-			  client->id, client->address_name, IDLE_ACCEPT_TIMEOUT);
+		if (!client_pre_session_expired(client, now_t, &timeout, &why)) {
+			dec_instance_ref(cdata, client);
+			continue;
+		}
+		LOGNOTICE("Reaping client id %"PRId64" %s idle %s for %d seconds",
+			  client->id, client->address_name, why, timeout);
 		invalidate_client(cdata, client);
 		dec_instance_ref(cdata, client);
 	}

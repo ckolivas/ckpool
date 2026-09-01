@@ -176,6 +176,29 @@ void sv2_handshake_release(void)
 	mutex_unlock(&g_hs_lock);
 }
 
+bool sv2_pre_session_expired(bool hs_inflight, time_t setup_time, bool has_channel,
+			     time_t accept_time, time_t now, int *timeout)
+{
+	int limit;
+	time_t start;
+
+	if (has_channel)
+		return false;
+	if (hs_inflight) {
+		limit = SV2_IDLE_HANDSHAKE_TIMEOUT;
+		start = accept_time;
+	} else if (!setup_time) {
+		limit = SV2_IDLE_SETUP_TIMEOUT;
+		start = accept_time;
+	} else {
+		limit = SV2_IDLE_CHANNEL_TIMEOUT;
+		start = setup_time;
+	}
+	if (timeout)
+		*timeout = limit;
+	return now - start > limit;
+}
+
 struct sv2_conn *sv2_conn_new(const struct sv2_noise_server_keys *keys)
 {
 	struct sv2_conn *c;

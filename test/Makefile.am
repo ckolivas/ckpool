@@ -9,9 +9,9 @@ sha256_SOURCES = sha256.c
 if HAVE_SV2
 AM_CPPFLAGS += @SV2_CFLAGS@
 check_PROGRAMS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit \
+	sv2_idle sv2_tx sv2_cb sv2_bridge
+TESTS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit sv2_idle \
 	sv2_tx sv2_cb sv2_bridge
-TESTS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit sv2_tx \
-	sv2_cb sv2_bridge
 # Codec is in libckpool.a — do not list src/sv2_codec.c here (same object
 # basename "sv2_codec.o" made test/.deps and src/.deps collide).
 sv2_codec_SOURCES = sv2_codec.c
@@ -41,4 +41,9 @@ sv2_hs_limit_SOURCES = sv2_hs_limit.c \
 	$(top_srcdir)/src/sv2_noise.c
 sv2_hs_limit_LDADD = $(top_srcdir)/src/libckpool.a @SV2_LIBS@
 sv2_hs_limit_CPPFLAGS = $(AM_CPPFLAGS) -DHAVE_SV2
+sv2_idle_SOURCES = sv2_idle.c \
+	$(top_srcdir)/src/sv2_conn.c \
+	$(top_srcdir)/src/sv2_noise.c
+sv2_idle_LDADD = $(top_srcdir)/src/libckpool.a @SV2_LIBS@
+sv2_idle_CPPFLAGS = $(AM_CPPFLAGS) -DHAVE_SV2
 endif
