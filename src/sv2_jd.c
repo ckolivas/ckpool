@@ -172,7 +172,7 @@ struct sv2_jd_token {
 	int64_t client_id;
 	char user_identifier[SV2_MAX_STR_LEN + 1];
 	time_t created;
-	bool declared;		/* checkBlock accepted */
+	bool declared;		/* checkBlock accepted; material is then immutable */
 	uint32_t version;
 	uint16_t wtxid_count;
 	/*
@@ -1089,28 +1089,16 @@ static uint8_t *error_declare(uint32_t request_id, const char *code, size_t *rep
 }
 
 /*
- * Mark token declared and attach rebuild material. Takes ownership of pend
- * coinbase/wtxid buffers. block may be NULL if coalesced (no stored full block).
+ * Steal pending rebuild material onto tok. tok must not already hold
+ * coinbase/tx pointers (fresh or previously undeclared).
  */
-static bool token_accept_declare_locked(struct sv2_jd_pending *pend,
-					uint8_t enonce_used)
+static void token_steal_declare_locked(struct sv2_jd_token *tok,
+				       struct sv2_jd_pending *pend,
+				       uint8_t enonce_used)
 {
-	struct sv2_jd_token *tok;
-
-	tok = find_token_locked(pend->token, pend->token_len);
-	if (!tok || tok->client_id != pend->client_id)
-		return false;
-	if (!pending_txs_complete(pend))
-		pending_fill_from_cache_locked(pend);
-	if (!pending_txs_complete(pend))
-		return false;
 	tok->declared = true;
 	tok->version = pend->version;
 	tok->enonce_len = enonce_used;
-	dealloc(tok->coinbase_tx_prefix);
-	dealloc(tok->coinbase_tx_suffix);
-	dealloc(tok->wtxid_list);
-	free_tx_snapshot(tok->tx_raws, tok->tx_lens, tok->wtxid_count);
 	tok->wtxid_count = pend->wtxid_count;
 	tok->coinbase_tx_prefix = pend->coinbase_tx_prefix;
 	tok->coinbase_tx_prefix_len = pend->coinbase_tx_prefix_len;
@@ -1124,7 +1112,73 @@ static bool token_accept_declare_locked(struct sv2_jd_pending *pend,
 	pend->wtxid_list = NULL;
 	pend->tx_raws = NULL;
 	pend->tx_lens = NULL;
-	return true;
+}
+
+/* Caller holds jd_lock. New random token bytes not already in the table. */
+static void token_fill_unique_locked(struct sv2_jd_token *tok)
+{
+	tok->token_len = SV2_JD_TOKEN_BYTES;
+	do {
+		fill_random(tok->token, SV2_JD_TOKEN_BYTES);
+	} while (find_token_locked(tok->token, tok->token_len));
+}
+
+/*
+ * Bind this declare to an immutable reconstruction token.
+ *
+ * First success on an Allocate token writes material in place. A later
+ * declare that reuses those bytes mints a new token so the previous
+ * generation's coinbase/txs stay available for retained custom jobs.
+ * Success returns the bound token via pend->token. 0 ok, 1 bad token, 2 busy.
+ */
+static int token_accept_declare_locked(struct sv2_jd_pending *pend,
+				       uint8_t enonce_used)
+{
+	struct sv2_jd_token *parent, *tok;
+
+	expire_old_tokens_locked(time(NULL));
+	parent = find_token_locked(pend->token, pend->token_len);
+	if (!parent || parent->client_id != pend->client_id)
+		return 1;
+	if (!pending_txs_complete(pend))
+		pending_fill_from_cache_locked(pend);
+	if (!pending_txs_complete(pend))
+		return 1;
+	if (!parent->declared) {
+		token_steal_declare_locked(parent, pend, enonce_used);
+		return 0;
+	}
+
+	while (jd_token_count >= SV2_JD_MAX_TOKENS_GLOBAL &&
+	       free_oldest_undeclared_global_locked())
+		;
+	if (jd_token_count >= SV2_JD_MAX_TOKENS_GLOBAL) {
+		LOGNOTICE("SV2 JD declare token table full client %"PRId64
+			  " — not replacing declared material", pend->client_id);
+		return 2;
+	}
+
+	tok = ckzalloc(sizeof(*tok));
+	token_fill_unique_locked(tok);
+	tok->client_id = parent->client_id;
+	snprintf(tok->user_identifier, sizeof(tok->user_identifier), "%s",
+		 parent->user_identifier);
+	tok->created = time(NULL);
+	tok->has_payout = parent->has_payout;
+	if (parent->payout_script && parent->payout_script_len) {
+		tok->payout_script_len = parent->payout_script_len;
+		tok->payout_script = ckalloc(parent->payout_script_len);
+		memcpy(tok->payout_script, parent->payout_script,
+		       parent->payout_script_len);
+	}
+	token_steal_declare_locked(tok, pend, enonce_used);
+	HASH_ADD(hh, jd_tokens, token, SV2_JD_TOKEN_BYTES, tok);
+	jd_token_count++;
+	pend->token_len = tok->token_len;
+	memcpy(pend->token, tok->token, tok->token_len);
+	LOGINFO("SV2 JD declare minted new token client %"PRId64" (prior declared)",
+		pend->client_id);
+	return 0;
 }
 
 static uint8_t *success_declare(struct sv2_jd_pending *pend, size_t *replylen)
@@ -1135,6 +1189,7 @@ static uint8_t *success_declare(struct sv2_jd_pending *pend, size_t *replylen)
 
 	memset(&ok, 0, sizeof(ok));
 	ok.request_id = pend->request_id;
+	/* Bound reconstruction token for this generation (may be newly minted). */
 	ok.new_mining_job_token_len = pend->token_len;
 	memcpy(ok.new_mining_job_token, pend->token, pend->token_len);
 	if (!sv2_encode_declare_mining_job_success(pbuf, sizeof(pbuf), &plen, &ok))
@@ -1213,9 +1268,12 @@ static uint8_t *try_coalesce_declare(struct sv2_jd_pending *pend, size_t *replyl
 	ensure_lock();
 	mutex_lock(&jd_lock);
 	if (coalesce_lookup_locked(thash2, &enonce_used, now)) {
-		if (!token_accept_declare_locked(pend, enonce_used)) {
+		int rc = token_accept_declare_locked(pend, enonce_used);
+
+		if (rc) {
 			mutex_unlock(&jd_lock);
-			return error_declare(pend->request_id, "invalid-mining-job-token",
+			return error_declare(pend->request_id,
+					     rc == 2 ? "busy" : "invalid-mining-job-token",
 					     replylen);
 		}
 		hit = true;
@@ -1372,10 +1430,13 @@ static uint8_t *finalize_declare_check(struct sv2_jd_pending *pend, size_t *repl
 
 		ensure_lock();
 		mutex_lock(&jd_lock);
-		if (!token_accept_declare_locked(pend, enonce_used)) {
+		int rc = token_accept_declare_locked(pend, enonce_used);
+
+		if (rc) {
 			mutex_unlock(&jd_lock);
 			checkblock_end();
-			return error_declare(pend->request_id, "invalid-mining-job-token",
+			return error_declare(pend->request_id,
+					     rc == 2 ? "busy" : "invalid-mining-job-token",
 					     replylen);
 		}
 		if (tip_stable)
@@ -1467,9 +1528,12 @@ static uint8_t *session_accept_declare_skip_check(struct sv2_jd_pending *pend,
 
 	ensure_lock();
 	mutex_lock(&jd_lock);
-	if (!token_accept_declare_locked(pend, enonce_used)) {
+	int rc = token_accept_declare_locked(pend, enonce_used);
+
+	if (rc) {
 		mutex_unlock(&jd_lock);
-		return error_declare(pend->request_id, "invalid-mining-job-token",
+		return error_declare(pend->request_id,
+				     rc == 2 ? "busy" : "invalid-mining-job-token",
 				     replylen);
 	}
 	mutex_unlock(&jd_lock);
