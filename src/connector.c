@@ -81,8 +81,9 @@ struct client_instance {
 	/* Is this the parent passthrough client */
 	bool passthrough;
 
-	/* Linked list of shares in redirector mode.*/
+	/* Linked list of in-flight mining.submit ids in redirector mode. */
 	share_t *shares;
+	int nshares;
 
 	/* Has this client already been told to redirect */
 	bool redirected;
@@ -205,6 +206,8 @@ struct connector_data {
 	redirect_t *redirects;
 	/* What redirect we're currently up to */
 	int redirect;
+	/* In-flight mining.submit records across all redirector clients */
+	int redirector_shares;
 
 	/* Pending sends to the upstream server */
 	ckmsgq_t *upstream_sends;
@@ -300,8 +303,12 @@ static void __recycle_client(cdata_t *cdata, client_instance_t *client)
 	share_t *share, *tmp;
 
 	dealloc(client->buf);
-	DL_FOREACH_SAFE(client->shares, share, tmp)
-	    dealloc(share);
+	DL_FOREACH_SAFE(client->shares, share, tmp) {
+		cdata->redirector_shares--;
+		dealloc(share);
+	}
+	if (cdata->redirector_shares < 0)
+		cdata->redirector_shares = 0;
 #ifdef HAVE_SV2
 	if (client->sv2c) {
 		sv2_conn_free(client->sv2c);
@@ -652,11 +659,47 @@ static void drop_all_clients(cdata_t *cdata)
 
 static void send_client(cdata_t *cdata, int64_t id, char *buf);
 
-/* Look for shares being submitted via a redirector and add them to a linked
- * list for looking up the responses. */
-static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yyjson_mut_val *val)
+#define REDIR_SHARE_TTL		120
+#define REDIR_SHARE_MAX_CLIENT	64
+#define REDIR_SHARE_MAX_GLOBAL	4096
+
+/* Caller holds cdata wlock. */
+static void __unlink_redir_share(cdata_t *cdata, client_instance_t *client,
+				 share_t *share)
+{
+	DL_DELETE(client->shares, share);
+	if (client->nshares > 0)
+		client->nshares--;
+	if (cdata->redirector_shares > 0)
+		cdata->redirector_shares--;
+	dealloc(share);
+}
+
+/* Caller holds cdata wlock. List is FIFO (append-to-tail); stop at the first
+ * record still inside the TTL. */
+static void __expire_redir_shares(cdata_t *cdata, client_instance_t *client,
+				  time_t now)
 {
 	share_t *share, *tmp;
+
+	DL_FOREACH_SAFE(client->shares, share, tmp) {
+		if (now <= share->submitted + REDIR_SHARE_TTL)
+			break;
+		__unlink_redir_share(cdata, client, share);
+	}
+}
+
+static void __free_redir_shares(cdata_t *cdata, client_instance_t *client)
+{
+	while (client->shares)
+		__unlink_redir_share(cdata, client, client->shares);
+}
+
+/* Track an in-flight mining.submit id so an accepted result can qualify a
+ * redirect. Caller has already checked method == "mining.submit". */
+static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yyjson_mut_val *val)
+{
+	share_t *share;
 	time_t now;
 	int64_t id;
 
@@ -664,26 +707,31 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yy
 		LOGNOTICE("Failed to find redirector share id");
 		return;
 	}
-	share = ckzalloc(sizeof(share_t));
 	now = time(NULL);
-	share->submitted = now;
-	share->id = id;
 
-	LOGINFO("Redirector adding client %"PRId64" share id: %"PRId64, client->id, id);
-
-	/* We use the cdata lock instead of a separate lock since this function
-	 * is called infrequently. */
 	ck_wlock(&cdata->lock);
-	DL_APPEND(client->shares, share);
-
-	/* Age old shares. */
-	DL_FOREACH_SAFE(client->shares, share, tmp) {
-		if (now > share->submitted + 120) {
-			DL_DELETE(client->shares, share);
-			dealloc(share);
+	__expire_redir_shares(cdata, client, now);
+	DL_FOREACH(client->shares, share) {
+		if (share->id == id) {
+			ck_wunlock(&cdata->lock);
+			return;
 		}
 	}
+	while (client->nshares >= REDIR_SHARE_MAX_CLIENT && client->shares)
+		__unlink_redir_share(cdata, client, client->shares);
+	if (cdata->redirector_shares >= REDIR_SHARE_MAX_GLOBAL) {
+		ck_wunlock(&cdata->lock);
+		return;
+	}
+	share = ckzalloc(sizeof(share_t));
+	share->submitted = now;
+	share->id = id;
+	DL_APPEND(client->shares, share);
+	client->nshares++;
+	cdata->redirector_shares++;
 	ck_wunlock(&cdata->lock);
+
+	LOGINFO("Redirector adding client %"PRId64" share id: %"PRId64, client->id, id);
 }
 
 /* The stratifier trusts client_id, address and server as connector generated.
@@ -943,8 +991,13 @@ reparse:
 			strip_reserved_keys(root, false);
 			yyjson_mut_obj_add_sint(doc, root, "client_id", passthrough_id);
 		} else {
-			if (ckpool.redirector && !client->redirected && strstr(client->buf, "mining.submit"))
-				parse_redirector_share(cdata, client, root);
+			if (ckpool.redirector && !client->redirected) {
+				const char *method = yyjson_mut_get_str(
+					yyjson_mut_obj_get(root, "method"));
+
+				if (method && !safecmp(method, "mining.submit"))
+					parse_redirector_share(cdata, client, root);
+			}
 			strip_reserved_keys(root, true);
 			yyjson_mut_obj_add_sint(doc, root, "client_id", client->id);
 			yyjson_mut_obj_add_str(doc, root, "address", client->address_name);
@@ -1184,6 +1237,19 @@ static void reap_idle_clients(cdata_t *cdata)
 	}
 }
 
+static void expire_redirector_shares(cdata_t *cdata)
+{
+	client_instance_t *client, *tmp;
+	time_t now_t = time(NULL);
+
+	ck_wlock(&cdata->lock);
+	HASH_ITER(hh, cdata->clients, client, tmp) {
+		if (client->shares)
+			__expire_redir_shares(cdata, client, now_t);
+	}
+	ck_wunlock(&cdata->lock);
+}
+
 /* Waits on fds ready to read on from the list stored in conn_instance and
  * handles the incoming messages */
 static void *receiver(void *arg)
@@ -1232,6 +1298,8 @@ static void *receiver(void *arg)
 		if (now_t != last_reap) {
 			last_reap = now_t;
 			reap_idle_clients(cdata);
+			if (ckpool.redirector)
+				expire_redirector_shares(cdata);
 		}
 		if (unlikely(ret < 1)) {
 			if (unlikely(ret == -1)) {
@@ -1512,13 +1580,14 @@ static void redirect_client(client_instance_t *client)
 }
 
 /* Look for accepted shares in redirector mode to know we can redirect this
- * client to a protected server. */
+ * client to a protected server. Any matching in-flight id is dropped, accepted
+ * or not, so rejected replies cannot pin the list. */
 static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, const char *buf)
 {
 	yyjson_doc *doc = yyjson_read(buf, strlen(buf), 0);
-	share_t *share, *found = NULL;
-	yyjson_val *val;
-	bool ret = false;
+	share_t *share, *tmp;
+	yyjson_val *val, *res_val;
+	bool ret = false, found = false, result = false;
 	int64_t id;
 
 	if (!doc) {
@@ -1532,54 +1601,42 @@ static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, co
 		goto out;
 	}
 
-	ck_rlock(&cdata->lock);
-	DL_FOREACH(client->shares, share) {
+	res_val = yyjson_obj_get(val, "result");
+	if (!yyjson_is_bool(res_val)) {
+		yyjson_val *err_val = yyjson_obj_get(val, "error");
+
+		if (unlikely(!(yyjson_is_null(res_val) && err_val && !yyjson_is_null(err_val)))) {
+			LOGINFO("Failed to find result in trs share");
+			goto out;
+		}
+		result = false;
+	} else
+		result = yyjson_get_bool(res_val);
+	if (!yyjson_is_null(yyjson_obj_get(val, "error"))) {
+		LOGINFO("Got error for trs share");
+		result = false;
+	}
+
+	ck_wlock(&cdata->lock);
+	__expire_redir_shares(cdata, client, time(NULL));
+	DL_FOREACH_SAFE(client->shares, share, tmp) {
 		if (share->id == id) {
 			LOGDEBUG("Found matching share %"PRId64" in trs for client %"PRId64,
 				 id, client->id);
-			found = share;
+			__unlink_redir_share(cdata, client, share);
+			found = true;
 			break;
 		}
 	}
-	ck_runlock(&cdata->lock);
-
-	if (found) {
-		bool result = false;
-
-		{
-			yyjson_val *res_val = yyjson_obj_get(val, "result");
-
-			if (!yyjson_is_bool(res_val)) {
-				yyjson_val *err_val = yyjson_obj_get(val, "error");
-
-				if (unlikely(!(yyjson_is_null(res_val) && err_val && !yyjson_is_null(err_val)))) {
-					LOGINFO("Failed to find result in trs share");
-					goto out;
-				}
-				result = false;
-			} else
-				result = yyjson_get_bool(res_val);
-		}
-		if (!yyjson_is_null(yyjson_obj_get(val, "error"))) {
-			LOGINFO("Got error for trs share");
-			goto out;
-		}
-		if (!result) {
-			LOGDEBUG("Rejected trs share");
-			goto out;
-		}
+	if (found && result) {
 		LOGNOTICE("Found accepted share for client %"PRId64" - redirecting",
 			   client->id);
+		__free_redir_shares(cdata, client);
 		ret = true;
-
-		/* Clear the list now since we don't need it any more */
-		ck_wlock(&cdata->lock);
-		DL_FOREACH_SAFE(client->shares, share, found) {
-			DL_DELETE(client->shares, share);
-			dealloc(share);
-		}
-		ck_wunlock(&cdata->lock);
 	}
+	ck_wunlock(&cdata->lock);
+	if (found && !result)
+		LOGDEBUG("Rejected trs share");
 out:
 	yyjson_doc_free(doc);
 	return ret;
