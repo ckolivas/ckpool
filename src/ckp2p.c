@@ -3159,36 +3159,11 @@ static void *p2p_acceptor(void __maybe_unused *arg)
 	return NULL;
 }
 
-static void _hash_p2ppeer(p2p_conn_t *conn, const char *url)
-{
-	peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
-
-	p2ppeer->conn = conn;
-	sprintf(p2ppeer->url, "%s", url);
-	HASH_ADD_STR(p2ppeers, url, p2ppeer);
-}
-
-static int setup_p2purl_slot(int slot, char *urlstr)
-{
-	connsock_t *cs;
-	p2p_conn_t *conn;
-
-	ckpool.p2purl[slot] = urlstr;
-	cs = ckpool.p2pcs[slot] = ckzalloc(sizeof(connsock_t));
-	if (!extract_sockaddr(urlstr, &cs->url, &cs->port)) {
-		LOGEMERG("Failed to extract address from p2purl %s", urlstr);
-		return -1;
-	}
-	conn = ckpool.p2pconn[slot] = ckp2p_connect(cs->url, cs->port, slot);
-	_hash_p2ppeer(conn, urlstr);
-	return 0;
-}
-
 int prepare_ckp2p(void)
 {
 	pthread_t pthread;
-	char **orig_url;
-	int i, p2purls, orig_n, nprio, cap, slot;
+	connsock_t *cs;
+	int i, p2purls;
 
 	cklock_init(&curblock.lock);
 	load_blocks_txt();
@@ -3232,34 +3207,37 @@ int prepare_ckp2p(void)
 		ASPRINTF(&ckpool.externalip, "127.0.0.1:%d", externalport);
 	}
 
-	orig_url = ckpool.p2purl;
-	orig_n = ckpool.p2purls;
-	if (orig_n > ckpool.maxclients * 4 / 3) {
-		orig_n = ckpool.maxclients * 4 / 3;
-		LOGWARNING("Limiting peers to %d", orig_n);
+	if (ckpool.p2purls > ckpool.maxclients * 4 / 3) {
+		ckpool.p2purls = ckpool.maxclients * 4 / 3;
+		LOGWARNING("Limiting peers to %d", ckpool.p2purls);
 	}
-	nprio = ckpool.prioclients + 1;
-	if (nprio > orig_n)
-		nprio = orig_n;
-	cap = orig_n + ckpool.ckp2peers;
-	if (cap < 1)
-		cap = 1;
-
-	/* Layout: prio peers, then ckp2peers, then remaining p2purl. */
-	ckpool.p2purl = ckzalloc(sizeof(char *) * cap);
-	ckpool.p2pconn = ckzalloc(sizeof(p2p_conn_t *) * cap);
-	ckpool.p2pcs = ckzalloc(sizeof(connsock_t *) * cap);
-
-	for (i = 0; i < nprio; i++) {
-		if (setup_p2purl_slot(i, orig_url[i]))
+	p2purls = total_conns = ckpool.p2purls;
+	ckpool.p2pconn = ckzalloc(sizeof(p2p_conn_t *) * ckpool.p2purls);
+	ckpool.p2pcs = ckzalloc(sizeof(connsock_t *) * ckpool.p2purls);
+	for (i = 0 ; i < ckpool.p2purls ; i++) {
+		ckpool.p2pcs[i] = ckzalloc(sizeof(connsock_t));
+		cs = ckpool.p2pcs[i];
+		if (!extract_sockaddr(ckpool.p2purl[i], &cs->url, &cs->port)) {
+			LOGEMERG("Failed to extract address from p2purl %s", ckpool.p2purl[i]);
 			return -1;
+		}
 	}
+
+	for (i = 0 ; i < p2purls ; i++) {
+		cs = ckpool.p2pcs[i];
+		p2p_conn_t *conn = ckpool.p2pconn[i] = ckp2p_connect(cs->url, cs->port, i);
+		peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+		p2ppeer->conn = conn;
+		sprintf(p2ppeer->url, "%s", ckpool.p2purl[i]);
+		HASH_ADD_STR(p2ppeers, url, p2ppeer);
+	}
+	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
 
 	p2p_udp_set_magic(netdefs[0].magic);
 	p2p_udp_set_genesis(netdefs[0].genesis);
-	p2p_udp_init(externalport);
+	if (p2p_udp_init(externalport) >= 0)
+		create_pthread(&pthread, p2p_udp_receiver, NULL);
 
-	slot = nprio;
 	for (i = 0; i < ckpool.ckp2peers; i++) {
 		char *url = NULL, *portstr = NULL;
 		p2p_conn_t *conn;
@@ -3282,33 +3260,24 @@ int prepare_ckp2p(void)
 		conn = ckp2p_connect(url, portstr, -1);
 		conn->udp = true;
 		conn->ckp2p_peer = true;
-		conn->peer = slot;
 		if (!p2p_udp_fill_dst(conn, url, port))
 			LOGWARNING("Failed to resolve ckp2peer %s", ckpool.ckp2peer[i]);
 		p2p_udp_canon_ip_str(url, key, sizeof(key));
-		ASPRINTF(&ckpool.p2purl[slot], "%s:%s", conn->host, conn->charport);
-		ckpool.p2pconn[slot] = conn;
-		_hash_p2ppeer(conn, ckpool.p2purl[slot]);
+		ck_wlock(&peerlock);
+		_append_conn(conn);
+		{
+			peerlist_t *p2ppeer = conn->p2ppeer = ckalloc(sizeof(peerlist_t));
+
+			p2ppeer->conn = conn;
+			sprintf(p2ppeer->url, "%s:%s", conn->host, conn->charport);
+			HASH_ADD_STR(p2ppeers, url, p2ppeer);
+		}
+		ck_wunlock(&peerlock);
 		ckp2p_client_set(key, P2P_XPORT_UDP, conn);
 		LOGWARNING("ckp2p set up prio UDP peer %d - %s:%s", conn->peer, url, portstr);
 		free(url);
 		free(portstr);
-		slot++;
 	}
-
-	for (i = nprio; i < orig_n; i++) {
-		if (setup_p2purl_slot(slot, orig_url[i]))
-			return -1;
-		slot++;
-	}
-
-	ckpool.p2purls = total_conns = slot;
-	if (orig_url)
-		dealloc(orig_url);
-	LOGWARNING("ckp2p finished attempting bitcoin node connections.");
-
-	if (p2p_udp_fd() >= 0)
-		create_pthread(&pthread, p2p_udp_receiver, NULL);
 
 	num_threads = sysconf(_SC_NPROCESSORS_ONLN);
 	p2p_readers = create_ckmsgqs("p2pread", &p2p_reader, num_threads);
