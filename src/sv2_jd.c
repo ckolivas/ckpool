@@ -9,7 +9,9 @@
  *   DeclareMiningJob → local payout check → request missing txs →
  *     first OK on this JD session: queue checkBlock worker (off creceiver);
  *     later declares on the same session: skip IPC (local payout only)
- *   ProvideMissingTransactions.Success (fills tx cache)
+ *   ProvideMissingTransactions.Success (only for a pending request; matching
+ *     wtxids are copied onto the pending/token so cache eviction cannot drop
+ *     live reconstruction material)
  *
  * PushSolution / SetCustomMiningJob (mining path) come next.
  * checkBlock never runs on the connector creceiver thread (HOL block).
@@ -23,6 +25,7 @@
 #ifdef HAVE_SV2
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -153,6 +156,9 @@ struct sv2_jd_pending {
 	uint16_t coinbase_tx_suffix_len;
 	uint8_t *wtxid_list;	/* wtxid_count * 32 */
 	uint16_t wtxid_count;
+	/* Raw txs aligned with wtxid_list; NULL slots still missing. */
+	uint8_t **tx_raws;
+	uint32_t *tx_lens;
 	/* Positions still missing (shrunk as cache fills) */
 	uint16_t *missing;
 	uint16_t missing_count;
@@ -183,17 +189,16 @@ struct sv2_jd_token {
 	uint8_t *coinbase_tx_suffix;
 	uint16_t coinbase_tx_suffix_len;
 	uint8_t *wtxid_list;
+	/* Immutable raw txs for rebuild (not the assembled candidate block). */
+	uint8_t **tx_raws;
+	uint32_t *tx_lens;
 	uint8_t enonce_len;	/* enonce size that passed checkBlock */
-	/*
-	 * No copy of the checkBlock candidate is kept: PushSolution rebuilds
-	 * from the prefix/suffix/wtxid material above, so retaining the block
-	 * pinned up to SV2_JD_MAX_BLOCK_BYTES per token for the declared TTL
-	 * with nothing ever reading it.
-	 */
 };
 
 /* Forward decls (after struct; used before definition). */
 static void free_token_locked(struct sv2_jd_token *t);
+static void free_tx_snapshot(uint8_t **raws, uint32_t *lens, uint16_t count);
+static void free_jd_pending_fields(struct sv2_jd_pending *p);
 
 static struct sv2_jd_client *jd_clients;
 static struct sv2_jd_token *jd_tokens;
@@ -471,12 +476,7 @@ void sv2_jd_drop_client(int64_t client_id)
 	}
 	for (i = 0; i < pending_n; ) {
 		if (pending_declares[i].client_id == client_id) {
-			struct sv2_jd_pending *p = &pending_declares[i];
-
-			dealloc(p->coinbase_tx_prefix);
-			dealloc(p->coinbase_tx_suffix);
-			dealloc(p->wtxid_list);
-			dealloc(p->missing);
+			free_jd_pending_fields(&pending_declares[i]);
 			memmove(&pending_declares[i], &pending_declares[i + 1],
 				(pending_n - i - 1) * sizeof(*pending_declares));
 			pending_n--;
@@ -504,14 +504,8 @@ void sv2_jd_drop_all(void)
 		free_token_locked(t);
 		ntok++;
 	}
-	for (i = 0; i < pending_n; i++) {
-		struct sv2_jd_pending *p = &pending_declares[i];
-
-		dealloc(p->coinbase_tx_prefix);
-		dealloc(p->coinbase_tx_suffix);
-		dealloc(p->wtxid_list);
-		dealloc(p->missing);
-	}
+	for (i = 0; i < pending_n; i++)
+		free_jd_pending_fields(&pending_declares[i]);
 	pending_n = 0;
 	mutex_unlock(&jd_lock);
 	if (ncli || ntok)
@@ -528,6 +522,7 @@ static void free_token_locked(struct sv2_jd_token *t)
 	dealloc(t->payout_script);
 	dealloc(t->coinbase_tx_prefix);
 	dealloc(t->coinbase_tx_suffix);
+	free_tx_snapshot(t->tx_raws, t->tx_lens, t->wtxid_count);
 	dealloc(t->wtxid_list);
 	dealloc(t);
 }
@@ -618,10 +613,7 @@ static void expire_old_tokens_locked(time_t now)
 
 			LOGINFO("SV2 JD expiring stale pending declare client %"PRId64
 				" req=%u", p->client_id, p->request_id);
-			dealloc(p->coinbase_tx_prefix);
-			dealloc(p->coinbase_tx_suffix);
-			dealloc(p->wtxid_list);
-			dealloc(p->missing);
+			free_jd_pending_fields(p);
 			memmove(&pending_declares[i], &pending_declares[i + 1],
 				(pending_n - i - 1) * sizeof(*pending_declares));
 			pending_n--;
@@ -794,52 +786,6 @@ static bool derive_coinbase_enonce_len(const uint8_t *prefix, uint16_t prefix_le
 	return true;
 }
 
-/*
- * Bitcoin txid = SHA256d of non-witness serialization.
- * Handles both legacy and BIP144 witness forms.
- */
-/*
- * Snapshot wtxid → raw txs under jd_lock (caller may run without lock after).
- * On success *raws and *lens are ckalloc'd arrays of count entries (raws[i] copied).
- */
-static bool snapshot_txs_from_cache(const uint8_t *wtxid_list, uint16_t count,
-				    uint8_t ***raws_out, uint32_t **lens_out)
-{
-	uint8_t **raws;
-	uint32_t *lens;
-	uint16_t i;
-
-	*raws_out = NULL;
-	*lens_out = NULL;
-	if (!count)
-		return true;
-	raws = ckzalloc(sizeof(uint8_t *) * count);
-	lens = ckzalloc(sizeof(uint32_t) * count);
-
-	ensure_lock();
-	mutex_lock(&jd_lock);
-	for (i = 0; i < count; i++) {
-		struct sv2_tx_cache_ent *e = cache_get(wtxid_list + (size_t)i * 32);
-
-		if (!e) {
-			mutex_unlock(&jd_lock);
-			for (i = 0; i < count; i++)
-				dealloc(raws[i]);
-			dealloc(raws);
-			dealloc(lens);
-			return false;
-		}
-		lens[i] = e->raw_len;
-		raws[i] = ckalloc(e->raw_len);
-		memcpy(raws[i], e->raw, e->raw_len);
-	}
-	mutex_unlock(&jd_lock);
-
-	*raws_out = raws;
-	*lens_out = lens;
-	return true;
-}
-
 static void free_tx_snapshot(uint8_t **raws, uint32_t *lens, uint16_t count)
 {
 	uint16_t i;
@@ -852,10 +798,128 @@ static void free_tx_snapshot(uint8_t **raws, uint32_t *lens, uint16_t count)
 	dealloc(lens);
 }
 
+struct wtxid_ord {
+	const uint8_t *h;
+	uint16_t idx;
+};
+
+static int wtxid_ord_cmp(const void *a, const void *b)
+{
+	const struct wtxid_ord *x = a, *y = b;
+
+	return memcmp(x->h, y->h, 32);
+}
+
+static void pending_alloc_tx_slots(struct sv2_jd_pending *p)
+{
+	if (!p || !p->wtxid_count || p->tx_raws)
+		return;
+	p->tx_raws = ckzalloc(sizeof(uint8_t *) * p->wtxid_count);
+	p->tx_lens = ckzalloc(sizeof(uint32_t) * p->wtxid_count);
+}
+
+/* Caller holds jd_lock. Copy any still-empty slots from the global cache. */
+static void pending_fill_from_cache_locked(struct sv2_jd_pending *p)
+{
+	uint16_t i;
+
+	if (!p || !p->tx_raws)
+		return;
+	for (i = 0; i < p->wtxid_count; i++) {
+		struct sv2_tx_cache_ent *e;
+
+		if (p->tx_raws[i])
+			continue;
+		e = cache_get(p->wtxid_list + (size_t)i * 32);
+		if (!e)
+			continue;
+		p->tx_lens[i] = e->raw_len;
+		p->tx_raws[i] = ckalloc(e->raw_len);
+		memcpy(p->tx_raws[i], e->raw, e->raw_len);
+	}
+}
+
+static uint16_t pending_collect_missing(const struct sv2_jd_pending *p,
+					uint16_t *missing, uint16_t max_missing)
+{
+	uint16_t i, n = 0;
+
+	if (!p || !p->wtxid_count)
+		return 0;
+	for (i = 0; i < p->wtxid_count && n < max_missing; i++) {
+		if (!p->tx_raws || !p->tx_raws[i])
+			missing[n++] = i;
+	}
+	return n;
+}
+
+static bool pending_txs_complete(const struct sv2_jd_pending *p)
+{
+	uint16_t i;
+
+	if (!p)
+		return false;
+	if (!p->wtxid_count)
+		return true;
+	if (!p->tx_raws)
+		return false;
+	for (i = 0; i < p->wtxid_count; i++) {
+		if (!p->tx_raws[i])
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Accept only txs whose sha256d matches a wtxid on this pending. Also insert
+ * those into the global cache for later declares. Caller holds jd_lock.
+ */
+static void pending_store_matching_txs(struct sv2_jd_pending *p,
+				       uint8_t **txs, uint32_t *lens, uint16_t ntx)
+{
+	struct wtxid_ord *ord, key, *hit;
+	uint16_t i, j;
+	uint8_t hash[32];
+
+	if (!p || !p->wtxid_count || !p->wtxid_list || !p->tx_raws || !txs)
+		return;
+	ord = ckalloc(sizeof(*ord) * p->wtxid_count);
+	for (i = 0; i < p->wtxid_count; i++) {
+		ord[i].h = p->wtxid_list + (size_t)i * 32;
+		ord[i].idx = i;
+	}
+	qsort(ord, p->wtxid_count, sizeof(*ord), wtxid_ord_cmp);
+
+	for (i = 0; i < ntx; i++) {
+		if (!txs[i] || !lens[i])
+			continue;
+		gen_hash((uchar *)txs[i], hash, (int)lens[i]);
+		key.h = hash;
+		key.idx = 0;
+		hit = bsearch(&key, ord, p->wtxid_count, sizeof(*ord), wtxid_ord_cmp);
+		if (!hit)
+			continue;
+		cache_put_tx(txs[i], lens[i]);
+		j = (uint16_t)(hit - ord);
+		while (j > 0 && !memcmp(ord[j - 1].h, hash, 32))
+			j--;
+		for (; j < p->wtxid_count && !memcmp(ord[j].h, hash, 32); j++) {
+			uint16_t idx = ord[j].idx;
+
+			if (p->tx_raws[idx])
+				continue;
+			p->tx_lens[idx] = lens[i];
+			p->tx_raws[idx] = ckalloc(lens[i]);
+			memcpy(p->tx_raws[idx], txs[i], lens[i]);
+		}
+	}
+	dealloc(ord);
+}
+
 /*
  * Assemble candidate block for checkBlock.
  * Coinbase = prefix || zero_enonce[enonce_len] || suffix
- * Txs follow wtxid order from cache (snapshotted under lock).
+ * Txs follow wtxid order from the pending's own copies (not the global cache).
  * Returns ckalloc'd block; *out_len set. NULL on failure.
  */
 static uint8_t *assemble_candidate_block(const struct sv2_jd_pending *pend,
@@ -870,14 +934,16 @@ static uint8_t *assemble_candidate_block(const struct sv2_jd_pending *pend,
 	uint8_t (*txids)[32];
 	uint8_t merkle[32];
 	uint32_t le;
-	uint8_t **tx_raws = NULL;
-	uint32_t *tx_lens = NULL;
+	uint8_t **tx_raws;
+	uint32_t *tx_lens;
 
 	*out_len = 0;
 	if (!stratifier_sv2_tip_for_jd(&tip_ver, &tip_ntime, &tip_nbits, prevhash_hdr)) {
 		LOGINFO("SV2 JD no tip available for checkBlock");
 		return NULL;
 	}
+	if (!pending_txs_complete(pend))
+		return NULL;
 
 	/* Policy: rough size before assembling (weight ≈ 4*vsize; use raw bytes) */
 	{
@@ -888,9 +954,8 @@ static uint8_t *assemble_candidate_block(const struct sv2_jd_pending *pend,
 			return NULL;
 	}
 
-	if (!snapshot_txs_from_cache(pend->wtxid_list, pend->wtxid_count,
-				     &tx_raws, &tx_lens))
-		return NULL;
+	tx_raws = pend->tx_raws;
+	tx_lens = pend->tx_lens;
 
 	coinbase_len = pend->coinbase_tx_prefix_len + enonce_len +
 		       pend->coinbase_tx_suffix_len;
@@ -906,7 +971,6 @@ static uint8_t *assemble_candidate_block(const struct sv2_jd_pending *pend,
 	if (!sv2_bitcoin_txid(coinbase, coinbase_len, txids[0])) {
 		dealloc(coinbase);
 		dealloc(txids);
-		free_tx_snapshot(tx_raws, tx_lens, pend->wtxid_count);
 		return NULL;
 	}
 
@@ -915,7 +979,6 @@ static uint8_t *assemble_candidate_block(const struct sv2_jd_pending *pend,
 		if (!sv2_bitcoin_txid(tx_raws[i], tx_lens[i], txids[1 + i])) {
 			dealloc(coinbase);
 			dealloc(txids);
-			free_tx_snapshot(tx_raws, tx_lens, pend->wtxid_count);
 			return NULL;
 		}
 		body_len += tx_lens[i];
@@ -926,7 +989,6 @@ static uint8_t *assemble_candidate_block(const struct sv2_jd_pending *pend,
 	total = 80 + sv2_compact_size_len((uint64_t)ntx) + body_len;
 	if (total > SV2_JD_MAX_BLOCK_BYTES) {
 		dealloc(coinbase);
-		free_tx_snapshot(tx_raws, tx_lens, pend->wtxid_count);
 		return NULL;
 	}
 	block = ckalloc(total);
@@ -955,7 +1017,6 @@ static uint8_t *assemble_candidate_block(const struct sv2_jd_pending *pend,
 		memcpy(p, tx_raws[i], tx_lens[i]);
 		p += tx_lens[i];
 	}
-	free_tx_snapshot(tx_raws, tx_lens, pend->wtxid_count);
 	*out_len = (size_t)(p - block);
 	return block;
 }
@@ -1039,21 +1100,30 @@ static bool token_accept_declare_locked(struct sv2_jd_pending *pend,
 	tok = find_token_locked(pend->token, pend->token_len);
 	if (!tok || tok->client_id != pend->client_id)
 		return false;
+	if (!pending_txs_complete(pend))
+		pending_fill_from_cache_locked(pend);
+	if (!pending_txs_complete(pend))
+		return false;
 	tok->declared = true;
 	tok->version = pend->version;
-	tok->wtxid_count = pend->wtxid_count;
 	tok->enonce_len = enonce_used;
 	dealloc(tok->coinbase_tx_prefix);
 	dealloc(tok->coinbase_tx_suffix);
 	dealloc(tok->wtxid_list);
+	free_tx_snapshot(tok->tx_raws, tok->tx_lens, tok->wtxid_count);
+	tok->wtxid_count = pend->wtxid_count;
 	tok->coinbase_tx_prefix = pend->coinbase_tx_prefix;
 	tok->coinbase_tx_prefix_len = pend->coinbase_tx_prefix_len;
 	tok->coinbase_tx_suffix = pend->coinbase_tx_suffix;
 	tok->coinbase_tx_suffix_len = pend->coinbase_tx_suffix_len;
 	tok->wtxid_list = pend->wtxid_list;
+	tok->tx_raws = pend->tx_raws;
+	tok->tx_lens = pend->tx_lens;
 	pend->coinbase_tx_prefix = NULL;
 	pend->coinbase_tx_suffix = NULL;
 	pend->wtxid_list = NULL;
+	pend->tx_raws = NULL;
+	pend->tx_lens = NULL;
 	return true;
 }
 
@@ -1078,11 +1148,14 @@ static void free_jd_pending_fields(struct sv2_jd_pending *p)
 		return;
 	dealloc(p->coinbase_tx_prefix);
 	dealloc(p->coinbase_tx_suffix);
+	free_tx_snapshot(p->tx_raws, p->tx_lens, p->wtxid_count);
 	dealloc(p->wtxid_list);
 	dealloc(p->missing);
 	p->coinbase_tx_prefix = NULL;
 	p->coinbase_tx_suffix = NULL;
 	p->wtxid_list = NULL;
+	p->tx_raws = NULL;
+	p->tx_lens = NULL;
 	p->missing = NULL;
 }
 
@@ -1471,6 +1544,8 @@ static uint8_t *start_declare_validation(struct sv2_jd_pending *pend_src,
 	pend_src->coinbase_tx_prefix = NULL;
 	pend_src->coinbase_tx_suffix = NULL;
 	pend_src->wtxid_list = NULL;
+	pend_src->tx_raws = NULL;
+	pend_src->tx_lens = NULL;
 	pend_src->missing = NULL;
 
 	pthread_once(&jd_validate_once, jd_validate_q_init);
@@ -1482,19 +1557,6 @@ static uint8_t *start_declare_validation(struct sv2_jd_pending *pend_src,
 	LOGDEBUG("SV2 JD checkBlock queued client %"PRId64" req=%u (first-session)",
 		 pend_src->client_id, pend_src->request_id);
 	return NULL;
-}
-
-/* Build missing list from cache; returns count. Fills missing[] (caller-owned max). */
-static uint16_t collect_missing(const uint8_t *wtxid_list, uint16_t wtxid_count,
-				uint16_t *missing, uint16_t max_missing)
-{
-	uint16_t i, n = 0;
-
-	for (i = 0; i < wtxid_count && n < max_missing; i++) {
-		if (!cache_get(wtxid_list + (size_t)i * 32))
-			missing[n++] = i;
-	}
-	return n;
 }
 
 static uint8_t *handle_setup(struct sv2_jd_client *c, const uint8_t *payload,
@@ -2204,6 +2266,7 @@ static uint8_t *handle_declare(struct sv2_jd_client *c, const uint8_t *payload,
 	decl.coinbase_tx_suffix = NULL;
 	decl.wtxid_list = NULL;
 	sv2_declare_mining_job_free(&decl); /* free excess only */
+	pending_alloc_tx_slots(&pend_local);
 
 	/*
 	 * No getrawtransaction prefetch: declare lists *wtxids*, but Core's
@@ -2215,17 +2278,15 @@ static uint8_t *handle_declare(struct sv2_jd_client *c, const uint8_t *payload,
 	 */
 	ensure_lock();
 	mutex_lock(&jd_lock);
-	nmiss = collect_missing(pend_local.wtxid_list, pend_local.wtxid_count,
-				missing, SV2_MAX_JD_TXNS);
+	pending_fill_from_cache_locked(&pend_local);
+	nmiss = pending_collect_missing(&pend_local, missing, SV2_MAX_JD_TXNS);
 
 	if (nmiss > 0) {
 		struct sv2_provide_missing_transactions pm;
 
 		if (!pending_may_add_locked(c->client_id)) {
 			mutex_unlock(&jd_lock);
-			dealloc(pend_local.coinbase_tx_prefix);
-			dealloc(pend_local.coinbase_tx_suffix);
-			dealloc(pend_local.wtxid_list);
+			free_jd_pending_fields(&pend_local);
 			LOGNOTICE("SV2 JD pending declare cap client %"PRId64
 				  " (global=%d per_client max=%d)",
 				  c->client_id, SV2_JD_MAX_PENDING_GLOBAL,
@@ -2263,13 +2324,11 @@ static uint8_t *handle_declare(struct sv2_jd_client *c, const uint8_t *payload,
 	}
 	mutex_unlock(&jd_lock);
 
-	/* All txs cached (or coinbase-only) — checkBlock async off creceiver */
+	/* All txs on the pending (or coinbase-only) — checkBlock off creceiver */
 	{
 		uint8_t *ret = start_declare_validation(&pend_local, replylen);
 
-		dealloc(pend_local.coinbase_tx_prefix);
-		dealloc(pend_local.coinbase_tx_suffix);
-		dealloc(pend_local.wtxid_list);
+		free_jd_pending_fields(&pend_local);
 		return ret;
 	}
 }
@@ -2281,7 +2340,8 @@ static uint8_t *handle_provide_missing_success(struct sv2_jd_client *c,
 	struct sv2_provide_missing_transactions_success ok;
 	struct sv2_jd_pending pend_copy;
 	bool found = false;
-	uint16_t i;
+	uint16_t nstill;
+	uint16_t still[SV2_MAX_JD_TXNS];
 	int pi;
 
 	if (!c->setup_ok)
@@ -2289,13 +2349,10 @@ static uint8_t *handle_provide_missing_success(struct sv2_jd_client *c,
 	if (!sv2_decode_provide_missing_transactions_success(payload, len, &ok))
 		return NULL;
 
-	/* Cache provided txs */
+	memset(&pend_copy, 0, sizeof(pend_copy));
 	ensure_lock();
 	mutex_lock(&jd_lock);
-	for (i = 0; i < ok.tx_count; i++)
-		cache_put_tx(ok.transactions[i], ok.tx_lens[i]);
-
-	/* Find matching pending declare */
+	/* Correlate first: unsolicited success must not mutate the cache. */
 	for (pi = 0; pi < pending_n; pi++) {
 		if (pending_declares[pi].client_id == c->client_id &&
 		    pending_declares[pi].request_id == ok.request_id &&
@@ -2310,75 +2367,63 @@ static uint8_t *handle_provide_missing_success(struct sv2_jd_client *c,
 			break;
 		}
 	}
+	if (!found) {
+		mutex_unlock(&jd_lock);
+		LOGINFO("SV2 JD ProvideMissing success with no pending declare client %"PRId64
+			" req=%u", c->client_id, ok.request_id);
+		sv2_provide_missing_tx_success_free(&ok);
+		return NULL;
+	}
+	pending_store_matching_txs(&pend_copy, ok.transactions, ok.tx_lens, ok.tx_count);
+	nstill = pending_collect_missing(&pend_copy, still, SV2_MAX_JD_TXNS);
 	mutex_unlock(&jd_lock);
 	sv2_provide_missing_tx_success_free(&ok);
 
-	if (!found) {
-		LOGINFO("SV2 JD ProvideMissing success with no pending declare client %"PRId64
-			" req=%u", c->client_id, ok.request_id);
-		return NULL;
-	}
+	if (nstill > 0) {
+		struct sv2_provide_missing_transactions pm;
+		uint8_t pbuf[65536];
+		size_t plen = 0;
 
-	/* Re-check missing under cache */
-	{
-		uint16_t still[SV2_MAX_JD_TXNS];
-		uint16_t nstill;
+		dealloc(pend_copy.missing);
+		pend_copy.missing = ckalloc(sizeof(uint16_t) * nstill);
+		memcpy(pend_copy.missing, still, sizeof(uint16_t) * nstill);
+		pend_copy.missing_count = nstill;
+		pend_copy.awaiting_missing = true;
 
 		ensure_lock();
 		mutex_lock(&jd_lock);
-		nstill = collect_missing(pend_copy.wtxid_list, pend_copy.wtxid_count,
-					 still, SV2_MAX_JD_TXNS);
+		/*
+		 * Re-queue after providing more txs. Cap is soft here:
+		 * this pending was already removed from the list, so
+		 * allow re-insert even at the limit (same declare).
+		 */
+		pending_declares = ckrealloc(pending_declares,
+					     (pending_n + 1) * sizeof(*pending_declares));
+		pending_declares[pending_n++] = pend_copy;
 		mutex_unlock(&jd_lock);
 
-		if (nstill > 0) {
-			struct sv2_provide_missing_transactions pm;
-			uint8_t pbuf[65536];
-			size_t plen = 0;
-
-			dealloc(pend_copy.missing);
-			pend_copy.missing = ckalloc(sizeof(uint16_t) * nstill);
-			memcpy(pend_copy.missing, still, sizeof(uint16_t) * nstill);
-			pend_copy.missing_count = nstill;
-			pend_copy.awaiting_missing = true;
-
+		memset(&pm, 0, sizeof(pm));
+		pm.request_id = pend_copy.request_id;
+		pm.unknown_count = nstill;
+		pm.unknown_tx_position_list = still;
+		if (!sv2_encode_provide_missing_transactions(pbuf, sizeof(pbuf),
+							     &plen, &pm)) {
 			ensure_lock();
 			mutex_lock(&jd_lock);
-			/*
-			 * Re-queue after providing more txs. Cap is soft here:
-			 * this pending was already removed from the list, so
-			 * allow re-insert even at the limit (same declare).
-			 */
-			pending_declares = ckrealloc(pending_declares,
-						     (pending_n + 1) * sizeof(*pending_declares));
-			pending_declares[pending_n++] = pend_copy;
+			remove_pending_declare_locked(c->client_id,
+						      pend_copy.request_id);
 			mutex_unlock(&jd_lock);
-
-			memset(&pm, 0, sizeof(pm));
-			pm.request_id = pend_copy.request_id;
-			pm.unknown_count = nstill;
-			pm.unknown_tx_position_list = still;
-			if (!sv2_encode_provide_missing_transactions(pbuf, sizeof(pbuf),
-								     &plen, &pm)) {
-				ensure_lock();
-				mutex_lock(&jd_lock);
-				remove_pending_declare_locked(c->client_id,
-							      pend_copy.request_id);
-				mutex_unlock(&jd_lock);
-				return error_declare(pend_copy.request_id, "internal-error",
-						     replylen);
-			}
-			return reply_frame(SV2_MSG_PROVIDE_MISSING_TRANSACTIONS, pbuf, plen,
-					   replylen);
+			return error_declare(pend_copy.request_id, "internal-error",
+					     replylen);
 		}
+		return reply_frame(SV2_MSG_PROVIDE_MISSING_TRANSACTIONS, pbuf, plen,
+				   replylen);
 	}
 
 	{
 		uint8_t *ret = start_declare_validation(&pend_copy, replylen);
 
-		dealloc(pend_copy.coinbase_tx_prefix);
-		dealloc(pend_copy.coinbase_tx_suffix);
-		dealloc(pend_copy.wtxid_list);
-		dealloc(pend_copy.missing);
+		free_jd_pending_fields(&pend_copy);
 		return ret;
 	}
 }
@@ -2436,20 +2481,21 @@ static bool snapshot_token_for_rebuild_locked(struct sv2_jd_token *tok,
 	snap->wtxid_count = tok->wtxid_count;
 	if (!tok->wtxid_count)
 		return true;
+	if (!tok->tx_raws || !tok->tx_lens) {
+		free_rebuild_snap(snap);
+		return false;
+	}
 
 	snap->tx_raws = ckzalloc(sizeof(uint8_t *) * tok->wtxid_count);
 	snap->tx_lens = ckzalloc(sizeof(uint32_t) * tok->wtxid_count);
 	for (i = 0; i < tok->wtxid_count; i++) {
-		struct sv2_tx_cache_ent *e =
-			cache_get(tok->wtxid_list + (size_t)i * 32);
-
-		if (!e) {
+		if (!tok->tx_raws[i] || !tok->tx_lens[i]) {
 			free_rebuild_snap(snap);
 			return false;
 		}
-		snap->tx_lens[i] = e->raw_len;
-		snap->tx_raws[i] = ckalloc(e->raw_len);
-		memcpy(snap->tx_raws[i], e->raw, e->raw_len);
+		snap->tx_lens[i] = tok->tx_lens[i];
+		snap->tx_raws[i] = ckalloc(tok->tx_lens[i]);
+		memcpy(snap->tx_raws[i], tok->tx_raws[i], tok->tx_lens[i]);
 	}
 	return true;
 }
