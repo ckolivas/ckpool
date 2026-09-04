@@ -70,6 +70,7 @@ struct sv2_jd_stats {
 	int tokens;
 	int tx_cache;
 	uint64_t tx_cache_bytes;
+	uint64_t token_snapshot_bytes;
 	int pending_declares;
 };
 

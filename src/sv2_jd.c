@@ -62,6 +62,8 @@
 #define SV2_JD_TOKEN_TTL_UNDECLARED_SECS	7200	/* 2h unused/queued */
 #define SV2_JD_TOKEN_TTL_DECLARED_SECS	3600	/* 1h after checkBlock OK */
 #define SV2_JD_MAX_TOKENS_GLOBAL	4096
+#define SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_GLOBAL	(512ULL << 20) /* 512 MiB */
+#define SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_CLIENT	(64ULL << 20)  /* 64 MiB */
 #define SV2_JD_DEFAULT_ENONCE_LEN	8
 #define SV2_JD_MAX_BLOCK_BYTES		(4u * 1024u * 1024u)
 #define SV2_JD_MAX_CACHE_TXS		65536
@@ -159,6 +161,7 @@ struct sv2_jd_pending {
 	/* Raw txs aligned with wtxid_list; NULL slots still missing. */
 	uint8_t **tx_raws;
 	uint32_t *tx_lens;
+	uint64_t tx_bytes;
 	/* Positions still missing (shrunk as cache fills) */
 	uint16_t *missing;
 	uint16_t missing_count;
@@ -192,6 +195,8 @@ struct sv2_jd_token {
 	/* Immutable raw txs for rebuild (not the assembled candidate block). */
 	uint8_t **tx_raws;
 	uint32_t *tx_lens;
+	/* All heap material retained by this declaration (budget accounting). */
+	uint64_t snapshot_bytes;
 	uint8_t enonce_len;	/* enonce size that passed checkBlock */
 };
 
@@ -210,6 +215,7 @@ static mutex_t jd_lock;
 static int jd_token_count;
 static int tx_cache_count;
 static uint64_t tx_cache_bytes;
+static uint64_t jd_token_snapshot_bytes;
 static int jd_coalesce_count;
 /* In-flight checkBlock calls (global); not under jd_lock during IPC wait. */
 static mutex_t jd_cb_lock;
@@ -519,6 +525,10 @@ static void free_token_locked(struct sv2_jd_token *t)
 		return;
 	HASH_DEL(jd_tokens, t);
 	jd_token_count--;
+	if (jd_token_snapshot_bytes >= t->snapshot_bytes)
+		jd_token_snapshot_bytes -= t->snapshot_bytes;
+	else
+		jd_token_snapshot_bytes = 0;
 	dealloc(t->payout_script);
 	dealloc(t->coinbase_tx_prefix);
 	dealloc(t->coinbase_tx_suffix);
@@ -819,12 +829,25 @@ static void pending_alloc_tx_slots(struct sv2_jd_pending *p)
 }
 
 /* Caller holds jd_lock. Copy any still-empty slots from the global cache. */
-static void pending_fill_from_cache_locked(struct sv2_jd_pending *p)
+static bool pending_tx_bytes_add(struct sv2_jd_pending *p, uint32_t raw_len)
+{
+	if (!p || raw_len > SV2_JD_MAX_BLOCK_BYTES ||
+	    p->tx_bytes > SV2_JD_MAX_BLOCK_BYTES - raw_len)
+		return false;
+	p->tx_bytes += raw_len;
+	return true;
+}
+
+static bool pending_fill_from_cache_locked(struct sv2_jd_pending *p)
 {
 	uint16_t i;
 
-	if (!p || !p->tx_raws)
-		return;
+	if (!p)
+		return false;
+	if (!p->wtxid_count)
+		return true;
+	if (!p->tx_raws)
+		return false;
 	for (i = 0; i < p->wtxid_count; i++) {
 		struct sv2_tx_cache_ent *e;
 
@@ -833,10 +856,13 @@ static void pending_fill_from_cache_locked(struct sv2_jd_pending *p)
 		e = cache_get(p->wtxid_list + (size_t)i * 32);
 		if (!e)
 			continue;
+		if (!pending_tx_bytes_add(p, e->raw_len))
+			return false;
 		p->tx_lens[i] = e->raw_len;
 		p->tx_raws[i] = ckalloc(e->raw_len);
 		memcpy(p->tx_raws[i], e->raw, e->raw_len);
 	}
+	return true;
 }
 
 static uint16_t pending_collect_missing(const struct sv2_jd_pending *p,
@@ -870,19 +896,36 @@ static bool pending_txs_complete(const struct sv2_jd_pending *p)
 	return true;
 }
 
+static bool pending_rebuild_size_ok(const struct sv2_jd_pending *p,
+				    uint8_t enonce_len)
+{
+	uint64_t total;
+
+	if (!p)
+		return false;
+	total = 80 + sv2_compact_size_len((uint64_t)p->wtxid_count + 1) +
+		p->coinbase_tx_prefix_len + enonce_len +
+		p->coinbase_tx_suffix_len + p->tx_bytes;
+	return total <= SV2_JD_MAX_BLOCK_BYTES;
+}
+
 /*
  * Accept only txs whose sha256d matches a wtxid on this pending. Also insert
  * those into the global cache for later declares. Caller holds jd_lock.
  */
-static void pending_store_matching_txs(struct sv2_jd_pending *p,
+static bool pending_store_matching_txs(struct sv2_jd_pending *p,
 				       uint8_t **txs, uint32_t *lens, uint16_t ntx)
 {
 	struct wtxid_ord *ord, key, *hit;
 	uint16_t i, j;
 	uint8_t hash[32];
 
-	if (!p || !p->wtxid_count || !p->wtxid_list || !p->tx_raws || !txs)
-		return;
+	if (!p)
+		return false;
+	if (!p->wtxid_count)
+		return true;
+	if (!p->wtxid_list || !p->tx_raws || !txs || !lens)
+		return false;
 	ord = ckalloc(sizeof(*ord) * p->wtxid_count);
 	for (i = 0; i < p->wtxid_count; i++) {
 		ord[i].h = p->wtxid_list + (size_t)i * 32;
@@ -908,12 +951,60 @@ static void pending_store_matching_txs(struct sv2_jd_pending *p,
 
 			if (p->tx_raws[idx])
 				continue;
+			if (!pending_tx_bytes_add(p, lens[i])) {
+				dealloc(ord);
+				return false;
+			}
 			p->tx_lens[idx] = lens[i];
 			p->tx_raws[idx] = ckalloc(lens[i]);
 			memcpy(p->tx_raws[idx], txs[i], lens[i]);
 		}
 	}
 	dealloc(ord);
+	return true;
+}
+
+static uint64_t pending_snapshot_bytes(const struct sv2_jd_pending *p)
+{
+	uint64_t bytes;
+
+	if (!p)
+		return 0;
+	bytes = p->tx_bytes + p->coinbase_tx_prefix_len +
+		p->coinbase_tx_suffix_len + (uint64_t)p->wtxid_count * 32;
+	if (p->wtxid_count)
+		bytes += (uint64_t)p->wtxid_count *
+			(sizeof(*p->tx_raws) + sizeof(*p->tx_lens));
+	return bytes;
+}
+
+/* Caller holds jd_lock. */
+static uint64_t token_snapshot_client_bytes_locked(int64_t client_id)
+{
+	struct sv2_jd_token *t, *tmp;
+	uint64_t bytes = 0;
+
+	HASH_ITER(hh, jd_tokens, t, tmp) {
+		if (t->client_id == client_id)
+			bytes += t->snapshot_bytes;
+	}
+	return bytes;
+}
+
+/* Caller holds jd_lock. */
+static bool token_snapshot_may_add_locked(int64_t client_id, uint64_t bytes)
+{
+	uint64_t client_bytes;
+
+	if (bytes > SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_GLOBAL ||
+	    jd_token_snapshot_bytes >
+		SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_GLOBAL - bytes)
+		return false;
+	client_bytes = token_snapshot_client_bytes_locked(client_id);
+	if (bytes > SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_CLIENT ||
+	    client_bytes > SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_CLIENT - bytes)
+		return false;
+	return true;
 }
 
 /*
@@ -1094,9 +1185,11 @@ static uint8_t *error_declare(uint32_t request_id, const char *code, size_t *rep
  */
 static void token_steal_declare_locked(struct sv2_jd_token *tok,
 				       struct sv2_jd_pending *pend,
-				       uint8_t enonce_used)
+				       uint8_t enonce_used, uint64_t snapshot_bytes)
 {
 	tok->declared = true;
+	/* The declared TTL starts when reconstruction material is installed. */
+	tok->created = time(NULL);
 	tok->version = pend->version;
 	tok->enonce_len = enonce_used;
 	tok->wtxid_count = pend->wtxid_count;
@@ -1107,11 +1200,14 @@ static void token_steal_declare_locked(struct sv2_jd_token *tok,
 	tok->wtxid_list = pend->wtxid_list;
 	tok->tx_raws = pend->tx_raws;
 	tok->tx_lens = pend->tx_lens;
+	tok->snapshot_bytes = snapshot_bytes;
+	jd_token_snapshot_bytes += snapshot_bytes;
 	pend->coinbase_tx_prefix = NULL;
 	pend->coinbase_tx_suffix = NULL;
 	pend->wtxid_list = NULL;
 	pend->tx_raws = NULL;
 	pend->tx_lens = NULL;
+	pend->tx_bytes = 0;
 }
 
 /* Caller holds jd_lock. New random token bytes not already in the table. */
@@ -1129,23 +1225,36 @@ static void token_fill_unique_locked(struct sv2_jd_token *tok)
  * First success on an Allocate token writes material in place. A later
  * declare that reuses those bytes mints a new token so the previous
  * generation's coinbase/txs stay available for retained custom jobs.
- * Success returns the bound token via pend->token. 0 ok, 1 bad token, 2 busy.
+ * Success returns the bound token via pend->token.
+ * 0 ok, 1 bad token/material, 2 busy, 3 oversized reconstruction.
  */
 static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 				       uint8_t enonce_used)
 {
 	struct sv2_jd_token *parent, *tok;
+	uint64_t snapshot_bytes;
 
 	expire_old_tokens_locked(time(NULL));
 	parent = find_token_locked(pend->token, pend->token_len);
 	if (!parent || parent->client_id != pend->client_id)
 		return 1;
-	if (!pending_txs_complete(pend))
-		pending_fill_from_cache_locked(pend);
+	if (!pending_txs_complete(pend) && !pending_fill_from_cache_locked(pend))
+		return 1;
 	if (!pending_txs_complete(pend))
 		return 1;
+	if (!pending_rebuild_size_ok(pend, enonce_used))
+		return 3;
+	snapshot_bytes = pending_snapshot_bytes(pend);
+	if (!token_snapshot_may_add_locked(pend->client_id, snapshot_bytes)) {
+		LOGNOTICE("SV2 JD declare snapshot budget full client %"PRId64
+			  " add=%"PRIu64" client=%"PRIu64" global=%"PRIu64,
+			  pend->client_id, snapshot_bytes,
+			  token_snapshot_client_bytes_locked(pend->client_id),
+			  jd_token_snapshot_bytes);
+		return 2;
+	}
 	if (!parent->declared) {
-		token_steal_declare_locked(parent, pend, enonce_used);
+		token_steal_declare_locked(parent, pend, enonce_used, snapshot_bytes);
 		return 0;
 	}
 
@@ -1163,7 +1272,6 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	tok->client_id = parent->client_id;
 	snprintf(tok->user_identifier, sizeof(tok->user_identifier), "%s",
 		 parent->user_identifier);
-	tok->created = time(NULL);
 	tok->has_payout = parent->has_payout;
 	if (parent->payout_script && parent->payout_script_len) {
 		tok->payout_script_len = parent->payout_script_len;
@@ -1171,7 +1279,7 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 		memcpy(tok->payout_script, parent->payout_script,
 		       parent->payout_script_len);
 	}
-	token_steal_declare_locked(tok, pend, enonce_used);
+	token_steal_declare_locked(tok, pend, enonce_used, snapshot_bytes);
 	HASH_ADD(hh, jd_tokens, token, SV2_JD_TOKEN_BYTES, tok);
 	jd_token_count++;
 	pend->token_len = tok->token_len;
@@ -1179,6 +1287,15 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	LOGINFO("SV2 JD declare minted new token client %"PRId64" (prior declared)",
 		pend->client_id);
 	return 0;
+}
+
+static const char *token_accept_error(int rc)
+{
+	if (rc == 2)
+		return "busy";
+	if (rc == 3)
+		return "invalid-template";
+	return "invalid-mining-job-token";
 }
 
 static uint8_t *success_declare(struct sv2_jd_pending *pend, size_t *replylen)
@@ -1211,6 +1328,7 @@ static void free_jd_pending_fields(struct sv2_jd_pending *p)
 	p->wtxid_list = NULL;
 	p->tx_raws = NULL;
 	p->tx_lens = NULL;
+	p->tx_bytes = 0;
 	p->missing = NULL;
 }
 
@@ -1272,8 +1390,7 @@ static uint8_t *try_coalesce_declare(struct sv2_jd_pending *pend, size_t *replyl
 
 		if (rc) {
 			mutex_unlock(&jd_lock);
-			return error_declare(pend->request_id,
-					     rc == 2 ? "busy" : "invalid-mining-job-token",
+			return error_declare(pend->request_id, token_accept_error(rc),
 					     replylen);
 		}
 		hit = true;
@@ -1435,8 +1552,7 @@ static uint8_t *finalize_declare_check(struct sv2_jd_pending *pend, size_t *repl
 		if (rc) {
 			mutex_unlock(&jd_lock);
 			checkblock_end();
-			return error_declare(pend->request_id,
-					     rc == 2 ? "busy" : "invalid-mining-job-token",
+			return error_declare(pend->request_id, token_accept_error(rc),
 					     replylen);
 		}
 		if (tip_stable)
@@ -1532,8 +1648,7 @@ static uint8_t *session_accept_declare_skip_check(struct sv2_jd_pending *pend,
 
 	if (rc) {
 		mutex_unlock(&jd_lock);
-		return error_declare(pend->request_id,
-				     rc == 2 ? "busy" : "invalid-mining-job-token",
+		return error_declare(pend->request_id, token_accept_error(rc),
 				     replylen);
 	}
 	mutex_unlock(&jd_lock);
@@ -2342,7 +2457,13 @@ static uint8_t *handle_declare(struct sv2_jd_client *c, const uint8_t *payload,
 	 */
 	ensure_lock();
 	mutex_lock(&jd_lock);
-	pending_fill_from_cache_locked(&pend_local);
+	if (!pending_fill_from_cache_locked(&pend_local)) {
+		mutex_unlock(&jd_lock);
+		free_jd_pending_fields(&pend_local);
+		LOGNOTICE("SV2 JD DeclareMiningJob transaction bytes exceed policy "
+			  "client %"PRId64" req=%u", c->client_id, req_id);
+		return error_declare(req_id, "invalid-template", replylen);
+	}
 	nmiss = pending_collect_missing(&pend_local, missing, SV2_MAX_JD_TXNS);
 
 	if (nmiss > 0) {
@@ -2438,7 +2559,16 @@ static uint8_t *handle_provide_missing_success(struct sv2_jd_client *c,
 		sv2_provide_missing_tx_success_free(&ok);
 		return NULL;
 	}
-	pending_store_matching_txs(&pend_copy, ok.transactions, ok.tx_lens, ok.tx_count);
+	if (!pending_store_matching_txs(&pend_copy, ok.transactions, ok.tx_lens,
+					ok.tx_count)) {
+		mutex_unlock(&jd_lock);
+		sv2_provide_missing_tx_success_free(&ok);
+		free_jd_pending_fields(&pend_copy);
+		LOGNOTICE("SV2 JD ProvideMissing transaction bytes exceed policy "
+			  "client %"PRId64" req=%u", c->client_id,
+			  pend_copy.request_id);
+		return error_declare(pend_copy.request_id, "invalid-template", replylen);
+	}
 	nstill = pending_collect_missing(&pend_copy, still, SV2_MAX_JD_TXNS);
 	mutex_unlock(&jd_lock);
 	sv2_provide_missing_tx_success_free(&ok);
@@ -2902,6 +3032,7 @@ void sv2_jd_get_stats(struct sv2_jd_stats *out)
 	out->tokens = jd_token_count;
 	out->tx_cache = tx_cache_count;
 	out->tx_cache_bytes = tx_cache_bytes;
+	out->token_snapshot_bytes = jd_token_snapshot_bytes;
 	out->pending_declares = pending_n;
 	mutex_unlock(&jd_lock);
 	mutex_lock(&jd_cb_lock);
@@ -2928,12 +3059,14 @@ char *sv2_jd_stats_json(void)
 		 "\"coalesce_hit\":%"PRIu64",\"provide_missing\":%"PRIu64","
 		 "\"push_solution\":%"PRIu64","
 		 "\"tokens\":%d,\"tx_cache\":%d,\"tx_cache_bytes\":%"PRIu64","
+		 "\"token_snapshot_bytes\":%"PRIu64","
 		 "\"pending_declares\":%d}",
 		 st.allocate_ok, st.allocate_rate_limited,
 		 st.declare_ok, st.declare_error, st.declare_rate_limited,
 		 st.checkblock_busy, st.checkblock_fail, st.checkblock_inflight,
 		 st.coalesce_hit, st.provide_missing, st.push_solution,
-		 st.tokens, st.tx_cache, st.tx_cache_bytes, st.pending_declares);
+		 st.tokens, st.tx_cache, st.tx_cache_bytes, st.token_snapshot_bytes,
+		 st.pending_declares);
 	return s;
 }
 

@@ -117,6 +117,8 @@ struct client_instance {
 	bool sv2_jd;
 	/* Per-connection Noise + reassembly (connector-owned). */
 	struct sv2_conn *sv2c;
+	/* Connector phase fields below are protected by cdata->lock. */
+	bool sv2_noise_done;
 	/* Set when SetupConnection.Success is queued; 0 until then. */
 	time_t sv2_setup_time;
 	/* Mining: Open*Channel.Success. JD: AllocateMiningJobToken.Success. */
@@ -710,6 +712,13 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yy
 	now = time(NULL);
 
 	ck_wlock(&cdata->lock);
+	/* Only an accepted share from an already-authorised client may grant
+	 * access to a protected redirect. This check must be under the same lock
+	 * as the authorisation transition and share-list mutation. */
+	if (!client->authorised || client->redirected) {
+		ck_wunlock(&cdata->lock);
+		return;
+	}
 	__expire_redir_shares(cdata, client, now);
 	DL_FOREACH(client->shares, share) {
 		if (share->id == id) {
@@ -788,9 +797,14 @@ static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
 		dealloc(frame_lens);
 		return false;
 	}
+	if (sv2_conn_ready(client->sv2c)) {
+		ck_wlock(&cdata->lock);
+		client->sv2_noise_done = true;
+		ck_wunlock(&cdata->lock);
+	}
 	/* Handshake ciphertext — already Noise-framed; do not re-encrypt.
 	 * Completing Noise must not set got_msg; the idle reaper treats
-	 * hs_inflight, sv2_setup_time and sv2_has_channel as three phases. */
+	 * sv2_noise_done, sv2_setup_time and sv2_has_channel as three phases. */
 	if (reply && reply_len) {
 		sender_send_t *ss = ckzalloc(sizeof(sender_send_t));
 
@@ -845,7 +859,7 @@ static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
 
 /* Latch pre-session progress from an outbound plaintext frame. Open*.Success
  * is queued (not returned) so the send path is the single observer. */
-static void sv2_note_outbound_progress(client_instance_t *client,
+static void sv2_note_outbound_progress(cdata_t *cdata, client_instance_t *client,
 				       const uint8_t *plain, int plainlen)
 {
 	uint8_t mt;
@@ -853,6 +867,7 @@ static void sv2_note_outbound_progress(client_instance_t *client,
 	if (plainlen < SV2_FRAME_HEADER_LEN)
 		return;
 	mt = plain[2];
+	ck_wlock(&cdata->lock);
 	if (mt == SV2_MSG_SETUP_CONNECTION_SUCCESS) {
 		if (!client->sv2_setup_time)
 			client->sv2_setup_time = time(NULL);
@@ -860,6 +875,7 @@ static void sv2_note_outbound_progress(client_instance_t *client,
 		   mt == SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS ||
 		   mt == SV2_MSG_ALLOCATE_MINING_JOB_TOKEN_SUCCESS)
 		client->sv2_has_channel = true;
+	ck_wunlock(&cdata->lock);
 }
 
 /* Queue a plaintext SV2 frame for the owning sender shard. Encryption of the
@@ -873,7 +889,7 @@ static void send_client_bin(cdata_t *cdata, client_instance_t *client,
 		dealloc(plain);
 		return;
 	}
-	sv2_note_outbound_progress(client, plain, plainlen);
+	sv2_note_outbound_progress(cdata, client, plain, plainlen);
 	ss = ckzalloc(sizeof(sender_send_t));
 	ss->client = client;
 	ss->buf = (char *)plain;
@@ -991,7 +1007,7 @@ reparse:
 			strip_reserved_keys(root, false);
 			yyjson_mut_obj_add_sint(doc, root, "client_id", passthrough_id);
 		} else {
-			if (ckpool.redirector && !client->redirected) {
+			if (ckpool.redirector) {
 				const char *method = yyjson_mut_get_str(
 					yyjson_mut_obj_get(root, "method"));
 
@@ -1006,7 +1022,9 @@ reparse:
 
 		/* This peer has delivered a complete, parseable message so it
 		 * is speaking the protocol and is no longer reapable as idle. */
+		ck_wlock(&cdata->lock);
 		client->got_msg = true;
+		ck_wunlock(&cdata->lock);
 
 		/* Do not send messages of clients we've already dropped. We
 		 * do this unlocked as the occasional false negative can be
@@ -1164,15 +1182,16 @@ outnoclient:
  * which keeps the instance lock held briefly and avoids allocating under it. */
 #define IDLE_REAP_BATCH 128
 
-/* True if this socket has outlived its pre-session deadline. timeout/why
- * are populated on true (and on SV2 true-paths) for the reap log. */
+/* True if this socket has outlived its pre-session deadline. Caller holds
+ * cdata->lock so event-worker phase transitions cannot race this snapshot.
+ * timeout/why are populated on true (and on SV2 true-paths) for the reap log. */
 static bool client_pre_session_expired(const client_instance_t *client,
 				       time_t now_t, int *timeout,
 				       const char **why)
 {
 #ifdef HAVE_SV2
 	if (client->sv2) {
-		bool hs_inflight = client->sv2c && client->sv2c->hs_inflight;
+		bool hs_inflight = !client->sv2_noise_done;
 
 		if (likely(client->sv2_has_channel))
 			return false;
@@ -1223,10 +1242,15 @@ static void reap_idle_clients(cdata_t *cdata)
 	ck_runlock(&cdata->lock);
 
 	for (i = 0; i < nids; i++) {
+		bool expired;
+
 		client = ref_client_by_id(cdata, ids[i]);
 		if (unlikely(!client))
 			continue;
-		if (!client_pre_session_expired(client, now_t, &timeout, &why)) {
+		ck_rlock(&cdata->lock);
+		expired = client_pre_session_expired(client, now_t, &timeout, &why);
+		ck_runlock(&cdata->lock);
+		if (!expired) {
 			dec_instance_ref(cdata, client);
 			continue;
 		}
@@ -1561,8 +1585,15 @@ static void redirect_client(client_instance_t *client)
 	char *buf;
 	int num;
 
-	/* Set the redirected boool to only try redirecting them once */
+	/* Latch once under the same lock used by redirect/share state. */
+	ck_wlock(&cdata->lock);
+	if (client->redirected || !client->authorised) {
+		ck_wunlock(&cdata->lock);
+		return;
+	}
 	client->redirected = true;
+	__free_redir_shares(cdata, client);
+	ck_wunlock(&cdata->lock);
 
 	num = add_redirect(cdata, client);
 	doc = yyjson_mut_pack("{snsss[ssi]}", "id", "method", "client.reconnect",
@@ -1618,6 +1649,10 @@ static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, co
 	}
 
 	ck_wlock(&cdata->lock);
+	if (!client->authorised || client->redirected) {
+		ck_wunlock(&cdata->lock);
+		goto out;
+	}
 	__expire_redir_shares(cdata, client, time(NULL));
 	DL_FOREACH_SAFE(client->shares, share, tmp) {
 		if (share->id == id) {
@@ -1698,7 +1733,14 @@ static void send_client(cdata_t *cdata, const int64_t id, char *buf)
 			free(buf);
 			return;
 		}
-		if (ckpool.redirector && !client->redirected && client->authorised) {
+		if (ckpool.redirector) {
+			bool redirectable;
+
+			ck_rlock(&cdata->lock);
+			redirectable = client->authorised && !client->redirected;
+			ck_runlock(&cdata->lock);
+			if (!redirectable)
+				goto queue_send;
 			/* If clients match the IP of clients that have already
 			 * been whitelisted as finding valid shares then
 			 * redirect them immediately. */
@@ -1709,6 +1751,7 @@ static void send_client(cdata_t *cdata, const int64_t id, char *buf)
 		}
 	}
 
+queue_send:
 	sender_send = ckzalloc(sizeof(sender_send_t));
 	sender_send->client = client;
 	sender_send->buf = buf;
@@ -1997,12 +2040,20 @@ static void client_yymessage_processor(yyjson_mut_doc *doc)
 
 	/* Flag redirector clients once they've been authorised */
 	if (ckpool.redirector && (client = ref_client_by_id(cdata, client_id))) {
-		if (!client->redirected && !client->authorised) {
-			yyjson_mut_val *method_val = yyjson_mut_obj_get(root, "node.method");
-			const char *method = yyjson_mut_get_str(method_val);
+		yyjson_mut_val *method_val = yyjson_mut_obj_get(root, "node.method");
+		const char *method = yyjson_mut_get_str(method_val);
 
-			if (!safecmp(method, stratum_msgs[SM_AUTHRESULT]))
-				client->authorised = true;
+		if (!safecmp(method, stratum_msgs[SM_AUTHRESULT])) {
+			bool authorised = yyjson_mut_is_true(
+				yyjson_mut_obj_get(root, "result"));
+
+			ck_wlock(&cdata->lock);
+			/* No request predating this transition may qualify as an
+			 * accepted post-authorisation share. */
+			__free_redir_shares(cdata, client);
+			if (!client->redirected)
+				client->authorised = authorised;
+			ck_wunlock(&cdata->lock);
 		}
 		dec_instance_ref(cdata, client);
 	}
