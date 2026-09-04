@@ -1222,9 +1222,9 @@ static void token_fill_unique_locked(struct sv2_jd_token *tok)
 /*
  * Bind this declare to an immutable reconstruction token.
  *
- * First success on an Allocate token writes material in place. A later
- * declare that reuses those bytes mints a new token so the previous
- * generation's coinbase/txs stay available for retained custom jobs.
+ * First success on an Allocate token writes material in place. An identical
+ * redeclare reuses that immutable snapshot; a changed redeclare mints a new
+ * token so the previous generation stays available for retained custom jobs.
  * Success returns the bound token via pend->token.
  * 0 ok, 1 bad token/material, 2 busy, 3 oversized reconstruction.
  */
@@ -1238,8 +1238,30 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	parent = find_token_locked(pend->token, pend->token_len);
 	if (!parent || parent->client_id != pend->client_id)
 		return 1;
+	/* An identical redeclare on the token already owning this immutable
+	 * reconstruction snapshot needs no new generation. The parent's enonce
+	 * length is the value that actually passed checkBlock; a later skip-check
+	 * derivation need not reproduce it to reuse the same material. */
+	if (parent->declared && parent->version == pend->version &&
+	    parent->coinbase_tx_prefix_len == pend->coinbase_tx_prefix_len &&
+	    parent->coinbase_tx_suffix_len == pend->coinbase_tx_suffix_len &&
+	    parent->wtxid_count == pend->wtxid_count &&
+	    (!parent->coinbase_tx_prefix_len ||
+	     !memcmp(parent->coinbase_tx_prefix, pend->coinbase_tx_prefix,
+		     parent->coinbase_tx_prefix_len)) &&
+	    (!parent->coinbase_tx_suffix_len ||
+	     !memcmp(parent->coinbase_tx_suffix, pend->coinbase_tx_suffix,
+		     parent->coinbase_tx_suffix_len)) &&
+	    (!parent->wtxid_count ||
+	     !memcmp(parent->wtxid_list, pend->wtxid_list,
+		     (size_t)parent->wtxid_count * 32))) {
+		parent->created = time(NULL);
+		LOGDEBUG("SV2 JD identical redeclare reused token client %"PRId64,
+			 pend->client_id);
+		return 0;
+	}
 	if (!pending_txs_complete(pend) && !pending_fill_from_cache_locked(pend))
-		return 1;
+		return 3;
 	if (!pending_txs_complete(pend))
 		return 1;
 	if (!pending_rebuild_size_ok(pend, enonce_used))

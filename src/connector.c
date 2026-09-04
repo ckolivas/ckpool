@@ -544,19 +544,15 @@ static void stratifier_drop_id(const int64_t id)
 	send_proc(ckpool.stratifier, buf);
 }
 
-/* Client must hold a reference count */
-static int drop_client(cdata_t *cdata, client_instance_t *client)
+/* Complete the side effects after __drop_client has atomically invalidated and
+ * unhashed a client under cdata->lock. Client must hold a reference count. */
+static int finish_drop_client(cdata_t *cdata, client_instance_t *client, int fd)
 {
 	bool passthrough = client->passthrough, remote = client->remote;
 	char address_name[INET6_ADDRSTRLEN];
 	int64_t client_id = client->id;
-	int fd = -1;
 
 	strcpy(address_name, client->address_name);
-	ck_wlock(&cdata->lock);
-	fd = __drop_client(cdata, client);
-	ck_wunlock(&cdata->lock);
-
 	if (fd > -1) {
 		if (passthrough) {
 			LOGNOTICE("Connector dropped passthrough %"PRId64" %s",
@@ -596,12 +592,12 @@ static void stratifier_drop_client(const client_instance_t *client)
  * regularly but keep the instances in a linked list until their ref count
  * drops to zero when we can remove them lazily. Client must hold a reference
  * count. */
-static int invalidate_client(cdata_t *cdata, client_instance_t *client)
+static int finish_invalidate_client(cdata_t *cdata, client_instance_t *client,
+				    int ret)
 {
-	client_instance_t *tmp;
-	int ret;
+	client_instance_t *dead, *tmp;
 
-	ret = drop_client(cdata, client);
+	ret = finish_drop_client(cdata, client, ret);
 	if ((!ckpool.passthrough || ckpool.node) && !client->passthrough)
 		stratifier_drop_client(client);
 	if (ckpool.passthrough)
@@ -610,21 +606,31 @@ static int invalidate_client(cdata_t *cdata, client_instance_t *client)
 	/* Cull old unused clients lazily when there are no more reference
 	 * counts for them. */
 	ck_wlock(&cdata->lock);
-	DL_FOREACH_SAFE2(cdata->dead_clients, client, tmp, dead_next) {
-		if (!client->ref) {
-			DL_DELETE2(cdata->dead_clients, client, dead_prev, dead_next);
-			LOGINFO("Connector recycling client %"PRId64, client->id);
+	DL_FOREACH_SAFE2(cdata->dead_clients, dead, tmp, dead_next) {
+		if (!dead->ref) {
+			DL_DELETE2(cdata->dead_clients, dead, dead_prev, dead_next);
+			LOGINFO("Connector recycling client %"PRId64, dead->id);
 			/* We only close the client fd once we're sure there
 			 * are no references to it left to prevent fds being
 			 * reused on new and old clients. */
-			nolinger_socket(client->fd);
-			Close(client->fd);
-			__recycle_client(cdata, client);
+			nolinger_socket(dead->fd);
+			Close(dead->fd);
+			__recycle_client(cdata, dead);
 		}
 	}
 	ck_wunlock(&cdata->lock);
 
 	return ret;
+}
+
+static int invalidate_client(cdata_t *cdata, client_instance_t *client)
+{
+	int ret;
+
+	ck_wlock(&cdata->lock);
+	ret = __drop_client(cdata, client);
+	ck_wunlock(&cdata->lock);
+	return finish_invalidate_client(cdata, client, ret);
 }
 
 static void drop_all_clients(cdata_t *cdata)
@@ -1247,16 +1253,27 @@ static void reap_idle_clients(cdata_t *cdata)
 		client = ref_client_by_id(cdata, ids[i]);
 		if (unlikely(!client))
 			continue;
-		ck_rlock(&cdata->lock);
+		int fd = -1;
+
+		/* The final phase check and invalidation are one atomic operation
+		 * against event-worker progress updates. */
+		ck_wlock(&cdata->lock);
 		expired = client_pre_session_expired(client, now_t, &timeout, &why);
-		ck_runlock(&cdata->lock);
+		if (expired)
+			fd = __drop_client(cdata, client);
+		ck_wunlock(&cdata->lock);
 		if (!expired) {
+			dec_instance_ref(cdata, client);
+			continue;
+		}
+		/* A concurrent invalidator may have won before the write lock. */
+		if (fd < 0) {
 			dec_instance_ref(cdata, client);
 			continue;
 		}
 		LOGNOTICE("Reaping client id %"PRId64" %s idle %s for %d seconds",
 			  client->id, client->address_name, why, timeout);
-		invalidate_client(cdata, client);
+		finish_invalidate_client(cdata, client, fd);
 		dec_instance_ref(cdata, client);
 	}
 }
@@ -2048,11 +2065,14 @@ static void client_yymessage_processor(yyjson_mut_doc *doc)
 				yyjson_mut_obj_get(root, "result"));
 
 			ck_wlock(&cdata->lock);
-			/* No request predating this transition may qualify as an
-			 * accepted post-authorisation share. */
-			__free_redir_shares(cdata, client);
-			if (!client->redirected)
-				client->authorised = authorised;
+			/* Only pre-authorisation request IDs are unsafe. Preserve
+			 * in-flight submits across a successful re-authorisation. */
+			if (!client->authorised && authorised)
+				__free_redir_shares(cdata, client);
+			/* Once any worker authorises successfully, a later failed
+			 * re-authentication must not revoke redirect eligibility. */
+			if (!client->redirected && authorised)
+				client->authorised = true;
 			ck_wunlock(&cdata->lock);
 		}
 		dec_instance_ref(cdata, client);
