@@ -1,10 +1,15 @@
 AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)
 LDADD = $(top_srcdir)/src/libckpool.a
 
-check_PROGRAMS = sha256
-TESTS = sha256
+check_PROGRAMS = sha256 validate_address
+TESTS = sha256 validate_address
 
 sha256_SOURCES = sha256.c
+
+# Exercise address validation with a local RPC stub; no bitcoind is contacted.
+validate_address_SOURCES = validate_address.c $(top_srcdir)/src/bitcoin.c \
+	$(top_srcdir)/src/yyjson.c $(top_srcdir)/src/yyjson_util.c
+validate_address_CPPFLAGS = $(AM_CPPFLAGS)
 
 if HAVE_SV2
 AM_CPPFLAGS += @SV2_CFLAGS@

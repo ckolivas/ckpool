@@ -34,9 +34,10 @@ static bool check_required_rule(const char* rule)
  * bitcoind to see if it's a valid address */
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit)
 {
+	yyjson_mut_doc *reqdoc;
 	yyjson_doc *doc;
 	yyjson_val *root, *res_val, *valid_val, *tmp_val;
-	char rpc_req[128];
+	char *rpc_req;
 	bool ret = false;
 
 	if (unlikely(!address)) {
@@ -44,8 +45,18 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		return ret;
 	}
 
-	snprintf(rpc_req, 128, "{\"method\": \"validateaddress\", \"params\": [\"%s\"]}\n", address);
+	/* The address can be an untrusted mining username. Escape it as one
+	 * complete JSON string: interpolation and truncation can make bitcoind
+	 * validate a different address from the one we subsequently decode. */
+	reqdoc = yyjson_mut_pack("{ss,s[s]}", "method", "validateaddress", "params", address);
+	if (unlikely(!reqdoc))
+		return false;
+	rpc_req = yyjson_mut_write(reqdoc, YYJSON_WRITE_NEWLINE_AT_END, NULL);
+	yyjson_mut_doc_free(reqdoc);
+	if (unlikely(!rpc_req))
+		return false;
 	doc = yyjson_rpc_response(cs, rpc_req);
+	dealloc(rpc_req);
 	if (!doc) {
 		/* May get a parse error with an invalid address */
 		LOGNOTICE("%s:%s Failed to get valid json response to validate_address %s",
