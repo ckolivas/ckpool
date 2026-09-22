@@ -14,9 +14,11 @@ validate_address_CPPFLAGS = $(AM_CPPFLAGS)
 if HAVE_SV2
 AM_CPPFLAGS += @SV2_CFLAGS@
 check_PROGRAMS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit \
-	sv2_idle sv2_tx sv2_cb sv2_bridge
+	sv2_idle sv2_tx sv2_cb sv2_bridge sv2_groups
 TESTS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit sv2_idle \
-	sv2_tx sv2_cb sv2_bridge
+	sv2_tx sv2_cb sv2_bridge sv2_groups
+sv2_groups_SOURCES = sv2_groups.c $(top_srcdir)/src/sv2_strat.c
+sv2_groups_CPPFLAGS = $(AM_CPPFLAGS)
 # Codec is in libckpool.a — do not list src/sv2_codec.c here (same object
 # basename "sv2_codec.o" made test/.deps and src/.deps collide).
 sv2_codec_SOURCES = sv2_codec.c

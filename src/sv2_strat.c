@@ -25,6 +25,14 @@
 #include "sv2_types.h"
 #include "sv2_work.h"
 
+/* Nonce lengths are fixed at startup. Standard channels share nonce1length;
+ * extended channels share nonce1length + nonce2length (the full pool space).
+ * Spec 5.2.3 requires separate groups for these unequal full extranonce sizes,
+ * and reserves their IDs in the same namespace as mining channel IDs. */
+#define SV2_STANDARD_GROUP_ID	0
+#define SV2_EXTENDED_GROUP_ID	1
+#define SV2_FIRST_CHANNEL_ID	2
+
 struct sv2_client {
 	UT_hash_handle hh;
 	int64_t client_id;
@@ -364,7 +372,7 @@ static struct sv2_client *client_get(int64_t client_id, bool create)
 	if (!c && create) {
 		c = ckzalloc(sizeof(*c));
 		c->client_id = client_id;
-		c->next_channel_id = 1;
+		c->next_channel_id = SV2_FIRST_CHANNEL_ID;
 		c->refs = 1; /* hashed */
 		HASH_ADD_I64(sv2_clients, client_id, c);
 	}
@@ -382,6 +390,20 @@ static void client_put(struct sv2_client *c)
 	mutex_lock(&sv2_lock);
 	client_unref_locked(c);
 	mutex_unlock(&sv2_lock);
+}
+
+/* Zero marks exhaustion: never wrap into group IDs or reuse channel IDs. */
+static uint32_t alloc_channel_id(struct sv2_client *c)
+{
+	uint32_t id;
+
+	ensure_lock();
+	mutex_lock(&sv2_lock);
+	id = c->next_channel_id;
+	if (id)
+		c->next_channel_id++;
+	mutex_unlock(&sv2_lock);
+	return id;
 }
 
 void sv2_strat_drop_client(int64_t client_id)
@@ -962,9 +984,15 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 
 	floor = server_diff_floor(c->server);
 	choose_channel_diff(o.nominal_hash_rate, o.max_target, floor, &diff);
-	ch_id = c->next_channel_id++;
-	if (!ch_id)
-		ch_id = c->next_channel_id++;
+	ch_id = alloc_channel_id(c);
+	if (!ch_id) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "channel-id-exhausted");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	ch = ckzalloc(sizeof(*ch));
 	ch->client_id = c->client_id;
@@ -1011,7 +1039,7 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	}
 	ok.extranonce_prefix_len = ch->enonce1_len;
 	memcpy(ok.extranonce_prefix, ch->enonce1, ch->enonce1_len);
-	ok.group_channel_id = 0;
+	ok.group_channel_id = SV2_STANDARD_GROUP_ID;
 	mutex_unlock(&sv2_lock);
 
 	if (!sv2_encode_open_standard_channel_success(pbuf, sizeof(pbuf), &plen, &ok)) {
@@ -1322,9 +1350,15 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	}
 	/* Give full pool enonce2 space when client min is smaller (more headroom). */
 
-	ch_id = c->next_channel_id++;
-	if (!ch_id)
-		ch_id = c->next_channel_id++;
+	ch_id = alloc_channel_id(c);
+	if (!ch_id) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "channel-id-exhausted");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	ch = ckzalloc(sizeof(*ch));
 	ch->client_id = c->client_id;
@@ -1369,7 +1403,7 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	ok.extranonce_size = ch->extranonce_size;
 	ok.extranonce_prefix_len = ch->enonce1_len;
 	memcpy(ok.extranonce_prefix, ch->enonce1, ch->enonce1_len);
-	ok.group_channel_id = 0;
+	ok.group_channel_id = SV2_EXTENDED_GROUP_ID;
 	mutex_unlock(&sv2_lock);
 
 	if (!sv2_encode_open_extended_channel_success(pbuf, sizeof(pbuf), &plen, &ok)) {
