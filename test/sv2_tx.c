@@ -282,6 +282,21 @@ static void test_merkle(void)
 	expect(!memcmp(root, want, 32), "path fold reproduces the tree root");
 }
 
+static void test_merkle_u256_wire_order(void)
+{
+	static const uint8_t raw[32] = {
+		0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13,
+		0x20, 0x21, 0x22, 0x23, 0x30, 0x31, 0x32, 0x33,
+		0x40, 0x41, 0x42, 0x43, 0x50, 0x51, 0x52, 0x53,
+		0x60, 0x61, 0x62, 0x63, 0x70, 0x71, 0x72, 0x73,
+	};
+	uint8_t wire[32];
+
+	sv2_merkle_root_to_u256_le(raw, wire);
+	expect(!memcmp(raw, wire, 32),
+	       "SV2 U256 merkle root preserves raw digest byte order");
+}
+
 /*
  * nbits → difficulty. The byte order matters more than the arithmetic: the
  * little-endian bytes of a wire header fed to libckpool's diff_from_nbits()
@@ -317,6 +332,7 @@ int main(void)
 	test_witness_tx();
 	test_walk_sequence();
 	test_merkle();
+	test_merkle_u256_wire_order();
 	test_nbits_diff();
 
 	if (failures) {
