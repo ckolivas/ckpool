@@ -36,7 +36,7 @@ libckpool_a_SOURCES = libckpool.c sha2.c sha256_arm_shani.c sha256_code_release
 libckpool_a_LIBADD = $(native_objs)
 
 bin_PROGRAMS = ckpool ckpmsg notifier
-ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
+ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c stratifier_stats.h connector.c \
 		 yyjson.c yyjson_util.c
 ckpool_LDADD = libckpool.a @LIBS@ @CAPNP_LIBS@ @SV2_LIBS@
 

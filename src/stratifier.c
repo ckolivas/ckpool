@@ -33,6 +33,7 @@
 #include "bitcoin.h"
 #include "sha2.h"
 #include "stratifier.h"
+#include "stratifier_stats.h"
 #include "uthash.h"
 #include "utlist.h"
 #include "connector.h"
@@ -255,7 +256,9 @@ struct stratum_instance {
 
 	int64_t diff; /* Current diff */
 	int64_t old_diff; /* Previous diff */
+	int64_t start_diff; /* Pool-assigned initial diff, before client suggestions */
 	int64_t diff_change_job_id; /* Last job_id we changed diff */
+	bool has_accepted_share; /* Protected by pool uastats_lock */
 
 	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
 
@@ -3969,6 +3972,7 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 		if (client->suggest_diff > client->diff)
 			client->diff = client->old_diff = client->suggest_diff;
 	}
+	client->start_diff = client->diff;
 	tv_time(&client->ldc);
 	/* Points to ckp sdata in ckpool mode, but is changed later in proxy
 	 * mode . */
@@ -6457,6 +6461,22 @@ static double time_bias(const double tdiff, const double period)
 	return 1.0 - 1.0 / exp(dexp);
 }
 
+/* Caller holds the pool uastats_lock. Only an accepted share establishes a
+ * client's difficulty for reject accounting; stale work is not sufficient. */
+static void account_client_share(pool_stats_t *stats, stratum_instance_t *client,
+				 const double diff, const bool valid)
+{
+	if (valid) {
+		client->has_accepted_share = true;
+		stats->unaccounted_shares++;
+		stats->unaccounted_diff_shares += diff;
+	} else {
+		double reject_diff = client->has_accepted_share ? diff : client->start_diff;
+
+		stats->unaccounted_rejects = add_reject_diff(stats->unaccounted_rejects, reject_diff);
+	}
+}
+
 /* Needs to be entered with client holding a ref count. */
 static void add_submit(stratum_instance_t *client, const double diff, const bool valid,
 		       const bool submit)
@@ -6469,11 +6489,7 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 	tv_t now_t;
 
 	mutex_lock(&ckp_sdata->uastats_lock);
-	if (valid) {
-		ckp_sdata->stats.unaccounted_shares++;
-		ckp_sdata->stats.unaccounted_diff_shares += diff;
-	} else
-		ckp_sdata->stats.unaccounted_rejects += diff;
+	account_client_share(&ckp_sdata->stats, client, diff, valid);
 	mutex_unlock(&ckp_sdata->uastats_lock);
 
 	/* Count only accepted and stale rejects in diff calculation. */
@@ -10206,7 +10222,7 @@ out_status:
 			mutex_lock(&sdata->stats_lock);
 			stats->accounted_shares += unaccounted_shares;
 			stats->accounted_diff_shares += unaccounted_diff_shares;
-			stats->accounted_rejects += unaccounted_rejects;
+			stats->accounted_rejects = add_rejects(stats->accounted_rejects, unaccounted_rejects);
 
 			decay_time(&stats->sps1, unaccounted_shares, per_tdiff, MIN1);
 			decay_time(&stats->sps5, unaccounted_shares, per_tdiff, MIN5);

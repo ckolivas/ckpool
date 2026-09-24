@@ -1,10 +1,16 @@
 AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)
 LDADD = $(top_srcdir)/src/libckpool.a
 
-check_PROGRAMS = sha256 validate_address
-TESTS = sha256 validate_address
+check_PROGRAMS = sha256 validate_address reject_stats
+TESTS = sha256 validate_address reject_stats
 
 sha256_SOURCES = sha256.c
+# Include the stratifier to exercise its actual per-client accounting path;
+# discard unrelated server entry points and their dependencies when linking.
+reject_stats_SOURCES = reject_stats.c
+reject_stats_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/ipc/mining
+reject_stats_CFLAGS = $(AM_CFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections
+reject_stats_LDFLAGS = -Wl,--gc-sections
 
 # Exercise address validation with a local RPC stub; no bitcoind is contacted.
 validate_address_SOURCES = validate_address.c $(top_srcdir)/src/bitcoin.c \
