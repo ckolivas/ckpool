@@ -258,7 +258,7 @@ struct stratum_instance {
 	int64_t old_diff; /* Previous diff */
 	int64_t start_diff; /* Pool-assigned initial diff, before client suggestions */
 	int64_t diff_change_job_id; /* Last job_id we changed diff */
-	bool has_accepted_share; /* Protected by pool uastats_lock */
+	double max_accepted_diff; /* Highest accepted assigned diff; pool uastats_lock */
 
 	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
 
@@ -6461,17 +6461,20 @@ static double time_bias(const double tdiff, const double period)
 	return 1.0 - 1.0 / exp(dexp);
 }
 
-/* Caller holds the pool uastats_lock. Only an accepted share establishes a
- * client's difficulty for reject accounting; stale work is not sufficient. */
+/* Caller holds the pool uastats_lock. Bound reject accounting by the highest
+ * assigned difficulty actually met by an accepted share, not its PoW diff.
+ * Suggestions and stale work cannot raise this cap. */
 static void account_client_share(pool_stats_t *stats, stratum_instance_t *client,
 				 const double diff, const bool valid)
 {
 	if (valid) {
-		client->has_accepted_share = true;
+		if (diff > client->max_accepted_diff)
+			client->max_accepted_diff = diff;
 		stats->unaccounted_shares++;
 		stats->unaccounted_diff_shares += diff;
 	} else {
-		double reject_diff = client->has_accepted_share ? diff : client->start_diff;
+		double reject_diff = client->max_accepted_diff > 0 ?
+			MIN(diff, client->max_accepted_diff) : client->start_diff;
 
 		stats->unaccounted_rejects = add_reject_diff(stats->unaccounted_rejects, reject_diff);
 	}
