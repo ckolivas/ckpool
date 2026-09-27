@@ -65,6 +65,10 @@ void sv2_merkle_root_from_path(const uint8_t coinbase_txid[32],
 			       const uint8_t (*path)[32], int steps,
 			       uint8_t root[32]);
 
+/* A SHA256d digest is already the little-endian byte representation required
+ * by the SV2 U256 merkle_root field. */
+void sv2_merkle_root_to_u256_le(const uint8_t raw_hash[32], uint8_t out[32]);
+
 /*
  * Network difficulty of an nbits value held as a host-order U32 — the form SV2
  * carries it in, and the form that goes little-endian into a wire header.
