@@ -103,12 +103,40 @@ static void test_client_rejects(void)
 	assert(stats.unaccounted_rejects == INT64_MAX);
 }
 
+#ifdef HAVE_SV2
+static void test_queued_custom_tip(void)
+{
+	sdata_t sdata = {0};
+	workbase_t wb = {0};
+	int64_t queued_job = 100;
+
+	cklock_init(&sdata.workbase_lock);
+	sdata.current_workbase = &wb;
+	sdata.blockchange_id = wb.id = queued_job;
+	assert(sv2_custom_job_current(&sdata, queued_job));
+	/* A fee update while queued preserves validity. A new tip does not. */
+	wb.id++;
+	assert(sv2_custom_job_current(&sdata, queued_job));
+	sdata.blockchange_id = ++wb.id;
+	assert(!sv2_custom_job_current(&sdata, queued_job));
+	assert(sv2_custom_job_current(&sdata, wb.id));
+	assert(!sv2_custom_job_current(&sdata, 0));
+	assert(!sv2_custom_job_current(&sdata, wb.id + 1));
+	sdata.current_workbase = NULL;
+	assert(!sv2_custom_job_current(&sdata, wb.id));
+	cklock_destroy(&sdata.workbase_lock);
+}
+#endif
+
 int main(void)
 {
 	int64_t pending = 0, total = 0;
 	int i;
 
 	test_client_rejects();
+#ifdef HAVE_SV2
+	test_queued_custom_tip();
+#endif
 	assert(add_reject_diff(100, 42) == 142);
 	assert(add_reject_diff(100, 42.5) == 142);
 	assert(add_reject_diff(100, 0) == 100);

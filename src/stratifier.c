@@ -7442,6 +7442,21 @@ double stratifier_sv2_network_diff(void)
 	return nd;
 }
 
+/* Queued custom work keeps its own coinbase, but not permission to credit a
+ * previous tip. Same-tip template refreshes remain valid, as for pool shares. */
+static bool sv2_custom_job_current(sdata_t *sdata, int64_t workbase_id)
+{
+	bool current;
+
+	if (!sdata || workbase_id <= 0)
+		return false;
+	ck_rlock(&sdata->workbase_lock);
+	current = sdata->current_workbase && workbase_id >= sdata->blockchange_id &&
+		workbase_id <= sdata->current_workbase->id;
+	ck_runlock(&sdata->workbase_lock);
+	return current;
+}
+
 bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 				  const unsigned char hash[32], double sdiff, double job_diff,
 				  char *errbuf, size_t errbufsz,
@@ -7457,6 +7472,11 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 		*network_diff_met = false;
 	if (errbuf && errbufsz)
 		errbuf[0] = '\0';
+	if (!sv2_custom_job_current(sdata, workbase_id)) {
+		if (errbuf && errbufsz)
+			snprintf(errbuf, errbufsz, "stale-share");
+		return false;
+	}
 	client = ref_instance_by_id(sdata, instance_id);
 	if (!client || !client->authorised) {
 		if (errbuf)
@@ -7473,12 +7493,6 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 		LOGINFO("SV2 user %s worker %s client %s new best diff %lf",
 			user->username, worker->workername, client->identity, sdiff);
 		check_best_diff(sdata, user, worker, sdiff, client);
-	}
-	if (!wb_id) {
-		ck_rlock(&sdata->workbase_lock);
-		if (sdata->current_workbase)
-			wb_id = sdata->current_workbase->id;
-		ck_runlock(&sdata->workbase_lock);
 	}
 	diff = job_diff;
 	if (sdiff >= diff) {
