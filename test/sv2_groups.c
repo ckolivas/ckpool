@@ -318,6 +318,36 @@ static void check_custom_validation(void)
 	custom_test = false;
 }
 
+static void check_admission_limits(void)
+{
+	struct sv2_client *c;
+	unsigned int i;
+
+	c = client_get(77, true);
+	mutex_lock(&sv2_lock);
+	for (i = 0; i < SV2_MAX_SHARES_CLIENT; i++)
+		require(reserve_share_locked(c, sizeof(struct sv2_share_job)), "share reservation");
+	require(!reserve_share_locked(c, sizeof(struct sv2_share_job)), "client share count cap");
+	mutex_unlock(&sv2_lock);
+	sv2_strat_drop_client(77);
+	for (i = 0; i < SV2_MAX_SHARES_CLIENT; i++)
+		release_share(c, sizeof(struct sv2_share_job));
+	require(!sv2_queued_shares && !sv2_queued_share_bytes, "drop drains reservations");
+	mutex_lock(&sv2_lock);
+	require(reserve_share_locked(c, SV2_MAX_SHARE_BYTES_CLIENT), "byte budget boundary");
+	require(!reserve_share_locked(c, 1), "client share byte cap");
+	mutex_unlock(&sv2_lock);
+	release_share(c, SV2_MAX_SHARE_BYTES_CLIENT);
+	client_put(c);
+
+	for (i = 0; i < SV2_MAX_CHANNELS_CLIENT / 8; i++)
+		check_connection(1, true);
+	c = client_get(1, false);
+	require(!alloc_channel_id(c), "channel admission cap");
+	client_put(c);
+	sv2_strat_drop_all();
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -334,6 +364,7 @@ int main(void)
 	check_job_targets(false);
 	check_job_targets(true);
 	check_custom_validation();
+	check_admission_limits();
 	puts("sv2_groups: all OK");
 	return 0;
 }

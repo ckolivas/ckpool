@@ -32,10 +32,19 @@
 #define SV2_STANDARD_GROUP_ID	0
 #define SV2_EXTENDED_GROUP_ID	1
 #define SV2_FIRST_CHANNEL_ID	2
+/* Post-handshake admission limits, independent of socket send queues. */
+#define SV2_MAX_CHANNELS_CLIENT	256
+#define SV2_MAX_CHANNELS_GLOBAL	4096
+#define SV2_MAX_SHARES_CLIENT	256
+#define SV2_MAX_SHARES_GLOBAL	8192
+#define SV2_MAX_SHARE_BYTES_CLIENT (4u << 20)
+#define SV2_MAX_SHARE_BYTES_GLOBAL (64u << 20)
 
 struct sv2_client {
 	UT_hash_handle hh;
 	int64_t client_id;
+	unsigned int queued_shares;
+	size_t queued_share_bytes;
 	bool setup_ok;
 	uint32_t flags;
 	uint32_t next_channel_id;
@@ -87,6 +96,8 @@ struct sv2_custom_job {
  * only decodes/looks up job and enqueues; hashing runs on sprocessor.
  */
 struct sv2_share_job {
+	struct sv2_client *owner;
+	size_t charged_bytes;
 	int64_t connector_id;
 	int64_t instance_id;
 	int64_t workbase_id;
@@ -161,6 +172,8 @@ struct sv2_channel {
 	tv_t batch_start;
 };
 
+static unsigned int sv2_queued_shares;
+static size_t sv2_queued_share_bytes;
 static struct sv2_client *sv2_clients;
 static struct sv2_channel *sv2_channels;
 static mutex_t sv2_lock;
@@ -405,13 +418,21 @@ static void client_put(struct sv2_client *c)
 /* Zero marks exhaustion: never wrap into group IDs or reuse channel IDs. */
 static uint32_t alloc_channel_id(struct sv2_client *c)
 {
-	uint32_t id;
+	struct sv2_channel *ch, *tmp;
+	unsigned int count = 0;
+	uint32_t id = 0;
 
 	ensure_lock();
 	mutex_lock(&sv2_lock);
-	id = c->next_channel_id;
-	if (id)
-		c->next_channel_id++;
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id == c->client_id)
+			count++;
+	}
+	if (count < SV2_MAX_CHANNELS_CLIENT && HASH_COUNT(sv2_channels) < SV2_MAX_CHANNELS_GLOBAL) {
+		id = c->next_channel_id;
+		if (id)
+			c->next_channel_id++;
+	}
 	mutex_unlock(&sv2_lock);
 	return id;
 }
@@ -1002,7 +1023,7 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	if (!ch_id) {
 		memset(&err, 0, sizeof(err));
 		err.request_id = o.request_id;
-		snprintf(err.error_code, sizeof(err.error_code), "channel-id-exhausted");
+		snprintf(err.error_code, sizeof(err.error_code), "channel-limit-reached");
 		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
 			return NULL;
 		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
@@ -1096,11 +1117,41 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	return NULL;
 }
 
+/* Reserve before allocating/copying job material. Caller holds sv2_lock. */
+static bool reserve_share_locked(struct sv2_client *c, size_t bytes)
+{
+	if (c->queued_shares >= SV2_MAX_SHARES_CLIENT ||
+	    sv2_queued_shares >= SV2_MAX_SHARES_GLOBAL ||
+	    bytes > SV2_MAX_SHARE_BYTES_CLIENT - c->queued_share_bytes ||
+	    bytes > SV2_MAX_SHARE_BYTES_GLOBAL - sv2_queued_share_bytes)
+		return false;
+	c->queued_shares++;
+	c->queued_share_bytes += bytes;
+	sv2_queued_shares++;
+	sv2_queued_share_bytes += bytes;
+	c->refs++;
+	return true;
+}
+
+static void release_share(struct sv2_client *c, size_t bytes)
+{
+	if (!c)
+		return;
+	mutex_lock(&sv2_lock);
+	c->queued_shares--;
+	c->queued_share_bytes -= bytes;
+	sv2_queued_shares--;
+	sv2_queued_share_bytes -= bytes;
+	client_unref_locked(c);
+	mutex_unlock(&sv2_lock);
+}
+
 static void free_share_job(struct sv2_share_job *job)
 {
 	if (!job)
 		return;
 	free_custom_job(job->custom);
+	release_share(job->owner, job->charged_bytes);
 	dealloc(job);
 }
 
@@ -1271,7 +1322,7 @@ static uint8_t *handle_submit_standard(struct sv2_client *c, const uint8_t *payl
 	struct sv2_share_job *job;
 	int64_t instance_id = 0, workbase_id = 0;
 	double ch_diff = 0;
-	bool ok_job = false;
+	bool ok_job = false, reserved;
 	uint32_t job_version = 0;
 	bool version_rolling = false;
 
@@ -1301,7 +1352,15 @@ static uint8_t *handle_submit_standard(struct sv2_client *c, const uint8_t *payl
 		return submit_error_reply(sub.channel_id, sub.sequence_number,
 					  "invalid-share", replylen);
 
+	mutex_lock(&sv2_lock);
+	reserved = reserve_share_locked(c, sizeof(*job));
+	mutex_unlock(&sv2_lock);
+	if (!reserved)
+		return submit_error_reply(sub.channel_id, sub.sequence_number,
+					  "too-many-submissions", replylen);
 	job = ckzalloc(sizeof(*job));
+	job->owner = c;
+	job->charged_bytes = sizeof(*job);
 	job->connector_id = c->client_id;
 	job->instance_id = instance_id;
 	job->workbase_id = workbase_id;
@@ -1369,7 +1428,7 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	if (!ch_id) {
 		memset(&err, 0, sizeof(err));
 		err.request_id = o.request_id;
-		snprintf(err.error_code, sizeof(err.error_code), "channel-id-exhausted");
+		snprintf(err.error_code, sizeof(err.error_code), "channel-limit-reached");
 		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
 			return NULL;
 		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
@@ -1729,7 +1788,8 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 	uint16_t en_sz = 0;
 	bool ok_job = false, is_custom = false;
 	uint32_t job_version = 0;
-	bool version_rolling = false;
+	bool version_rolling = false, reserved = false;
+	size_t charge = sizeof(struct sv2_share_job);
 	uint8_t en1_snap[16];
 	uint8_t en1_len = 0;
 
@@ -1759,7 +1819,14 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 			en1_len = sizeof(en1_snap);
 		if (en1_len)
 			memcpy(en1_snap, ch->enonce1, en1_len);
-		if (ok_job && is_custom && cj_slot) {
+		/* Reject cheap errors before copying a possibly 64 KiB coinbase. */
+		if (ok_job && sub.extranonce_len == en_sz &&
+		    sv2_submit_version_ok(sub.base.version, job_version, version_rolling)) {
+			if (is_custom && cj_slot)
+				charge += sizeof(*cj_slot) + cj_slot->coinbase_tx_outputs_len;
+			reserved = reserve_share_locked(c, charge);
+		}
+		if (reserved && is_custom && cj_slot) {
 			cj_copy = ckzalloc(sizeof(*cj_copy));
 			*cj_copy = *cj_slot;
 			cj_copy->token_pinned = sv2_jd_pin_token(cj_copy->token, cj_copy->token_len);
@@ -1791,13 +1858,19 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
 					  "invalid-share", replylen);
 	}
+	if (!reserved)
+		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
+					  "too-many-submissions", replylen);
 	if (is_custom && (!cj_copy || !cj_copy->token_pinned)) {
 		free_custom_job(cj_copy);
+		release_share(c, charge);
 		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
 					  "invalid-job-id", replylen);
 	}
 
 	job = ckzalloc(sizeof(*job));
+	job->owner = c;
+	job->charged_bytes = charge;
 	job->connector_id = c->client_id;
 	job->instance_id = instance_id;
 	job->workbase_id = workbase_id;
