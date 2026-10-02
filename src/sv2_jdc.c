@@ -1361,6 +1361,34 @@ static void custom_failed_locked(int delay)
 	sess.retry_after = time(NULL) + delay;
 }
 
+/* Validate untrusted positions and wire size before allocating a reply. */
+static bool missing_reply_size(const struct sv2_jdc_template *t,
+			       const struct sv2_provide_missing_transactions *req,
+			       size_t *size)
+{
+	uint8_t seen[(SV2_MAX_JD_TXNS + 7) / 8] = {0};
+	size_t need = 6;
+	unsigned int i;
+
+	*size = 0;
+	if (t->txns < 0 || t->txns > SV2_MAX_JD_TXNS || req->unknown_count > t->txns)
+		return false;
+	for (i = 0; i < req->unknown_count; i++) {
+		unsigned int pos = req->unknown_tx_position_list[i];
+		uint32_t len;
+
+		if (pos >= (unsigned int)t->txns || (seen[pos / 8] & (1u << (pos % 8))))
+			return false;
+		seen[pos / 8] |= 1u << (pos % 8);
+		len = t->txn[pos].len;
+		if (len > SV2_MAX_TX_BYTES || 3u + len > SV2_MAX_JD_PAYLOAD - need)
+			return false;
+		need += 3u + len;
+	}
+	*size = need;
+	return true;
+}
+
 /* Reply to ProvideMissingTransactions with the raw bytes of the positions the
  * JDS is missing, in the order it asked for them. */
 static void sess_provide_missing(const uint8_t *pay, uint32_t plen)
@@ -1390,15 +1418,10 @@ static void sess_provide_missing(const uint8_t *pay, uint32_t plen)
 			  req.request_id);
 		goto out;
 	}
-	/* Positions index the wtxid list we sent, so anything outside it means
-	 * the JDS and we disagree about the declare — abandon it. */
-	for (i = 0; i < req.unknown_count; i++) {
-		if (req.unknown_tx_position_list[i] >= t->txns) {
-			LOGWARNING("JDC ProvideMissingTransactions position %u outside "
-				   "our %d transactions", req.unknown_tx_position_list[i],
-				   t->txns);
-			goto out;
-		}
+	if (!missing_reply_size(t, &req, &need)) {
+		LOGWARNING("JDC invalid or oversized ProvideMissingTransactions req=%u",
+			   req.request_id);
+		goto out;
 	}
 
 	memset(&rep, 0, sizeof(rep));
@@ -1418,7 +1441,6 @@ static void sess_provide_missing(const uint8_t *pay, uint32_t plen)
 		rep.transactions = txs;
 		rep.tx_lens = lens;
 	}
-	need = sv2_provide_missing_tx_success_encoded_size(&rep);
 	buf = ckalloc(need);
 	if (!sv2_encode_provide_missing_transactions_success(buf, need, &elen, &rep)) {
 		LOGWARNING("JDC failed to encode %u missing transactions (%zu bytes)",
