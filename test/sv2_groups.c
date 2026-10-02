@@ -94,6 +94,8 @@ void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen
 	free(plain);
 }
 
+static bool drop_during_open;
+
 bool stratifier_sv2_open_session(int64_t __maybe_unused connector_id,
 		uint32_t __maybe_unused channel_id, const char __maybe_unused *user_identity,
 		const char __maybe_unused *address, int __maybe_unused server,
@@ -101,6 +103,8 @@ bool stratifier_sv2_open_session(int64_t __maybe_unused connector_id,
 		double __maybe_unused diff, int64_t *out_instance_id)
 {
 	*out_instance_id = ++sessions;
+	if (drop_during_open)
+		sv2_strat_drop_client(connector_id);
 	return true;
 }
 
@@ -348,6 +352,28 @@ static void check_admission_limits(void)
 	sv2_strat_drop_all();
 }
 
+static void check_open_disconnect(bool extended)
+{
+	uint8_t payload[512], target[32], *p = payload;
+	unsigned int before;
+
+	check_connection(1, false);
+	memset(target, 0xff, sizeof(target));
+	sv2_write_u32(&p, 99);
+	sv2_write_str0_255(&p, "worker");
+	sv2_write_f32(&p, 0);
+	sv2_write_u256(&p, target);
+	if (extended)
+		sv2_write_u16(&p, 0);
+	before = success_count;
+	drop_during_open = true;
+	send_request(extended ? SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL :
+		     SV2_MSG_OPEN_STANDARD_MINING_CHANNEL, payload, p - payload, false);
+	drop_during_open = false;
+	require(!sessions && !sv2_channels && !sv2_clients && success_count == before,
+		"disconnect during authentication leaves no orphan session or channel");
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -365,6 +391,8 @@ int main(void)
 	check_job_targets(true);
 	check_custom_validation();
 	check_admission_limits();
+	check_open_disconnect(false);
+	check_open_disconnect(true);
 	puts("sv2_groups: all OK");
 	return 0;
 }

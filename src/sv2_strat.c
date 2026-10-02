@@ -999,6 +999,16 @@ static uint8_t *handle_setup(struct sv2_client *c, const uint8_t *payload,
 	return reply_frame(SV2_MSG_SETUP_CONNECTION_SUCCESS, false, pbuf, plen, replylen);
 }
 
+/* The authentication call runs without sv2_lock and may race a disconnect.
+ * Revalidate the exact client object before publishing its new session. */
+static bool client_live_locked(const struct sv2_client *c)
+{
+	struct sv2_client *live;
+
+	HASH_FIND_I64(sv2_clients, &c->client_id, live);
+	return live == c;
+}
+
 static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payload,
 				     uint32_t len, size_t *replylen)
 {
@@ -1063,6 +1073,13 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	 */
 	ensure_lock();
 	mutex_lock(&sv2_lock);
+	if (!client_live_locked(c)) {
+		mutex_unlock(&sv2_lock);
+		stratifier_sv2_close_session(instance_id);
+		mutex_destroy(&ch->publish_lock);
+		dealloc(ch);
+		return NULL;
+	}
 	ch->refs = 2;
 	HASH_ADD(hh, sv2_channels, key, sizeof(ch->key), ch);
 	memset(&ok, 0, sizeof(ok));
@@ -1465,6 +1482,13 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	/* refs = 2: table pin + open-handler pin (see handle_open_standard). */
 	ensure_lock();
 	mutex_lock(&sv2_lock);
+	if (!client_live_locked(c)) {
+		mutex_unlock(&sv2_lock);
+		stratifier_sv2_close_session(instance_id);
+		mutex_destroy(&ch->publish_lock);
+		dealloc(ch);
+		return NULL;
+	}
 	ch->refs = 2;
 	HASH_ADD(hh, sv2_channels, key, sizeof(ch->key), ch);
 	memset(&ok, 0, sizeof(ok));
