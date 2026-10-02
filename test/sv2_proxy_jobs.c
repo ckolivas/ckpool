@@ -58,6 +58,22 @@ int main(void)
 		assert(sv2_proxy_accept_batch(&sp, &ok, 9));
 		assert(!sp.pending && !sp.unanswered);
 	}
+	{
+		struct sv2_proxy_job *old, *current;
+
+		old = sv2_proxy_job_slot(&sp, 7);
+		old->version = 1;
+		old->coinb1 = ckalloc(1);
+		sv2_proxy_job_slot(&sp, 8)->version = 2;
+		current = sv2_proxy_job_slot(&sp, 7);
+		current->version = 3;
+		assert(sv2_proxy_find_job(&sp, 7) == current);
+		assert(current->version == 3 && !current->coinb1);
+		sv2_proxy_invalidate_jobs(&sp, current);
+		assert(!sv2_proxy_find_job(&sp, 8));
+		assert(sv2_proxy_find_job(&sp, 7) == current);
+		sv2_proxy_invalidate_jobs(&sp, NULL);
+	}
 	puts("sv2_proxy_jobs: all OK");
 	return 0;
 }

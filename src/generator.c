@@ -3349,13 +3349,36 @@ out:
 
 static struct sv2_proxy_job *sv2_proxy_job_slot(struct sv2_proxy *sp, uint32_t job_id)
 {
-	struct sv2_proxy_job *job = &sp->jobs[sp->job_head];
+	struct sv2_proxy_job *job = NULL;
+	int i;
 
-	sp->job_head = (sp->job_head + 1) % SV2_PROXY_JOBS;
+	/* IDs may be reused after invalidation. Never leave an older same-ID
+	 * slot ahead of the replacement in lookup order. */
+	for (i = 0; i < SV2_PROXY_JOBS; i++) {
+		if (sp->jobs[i].valid && sp->jobs[i].job_id == job_id) {
+			job = &sp->jobs[i];
+			break;
+		}
+	}
+	if (!job) {
+		job = &sp->jobs[sp->job_head];
+		sp->job_head = (sp->job_head + 1) % SV2_PROXY_JOBS;
+	}
 	sv2_proxy_job_clear(job);
 	job->job_id = job_id;
 	job->valid = true;
 	return job;
+}
+
+/* SetNewPrevHash invalidates every other queued job, even on the same tip. */
+static void sv2_proxy_invalidate_jobs(struct sv2_proxy *sp, struct sv2_proxy_job *keep)
+{
+	int i;
+
+	for (i = 0; i < SV2_PROXY_JOBS; i++) {
+		if (&sp->jobs[i] != keep)
+			sv2_proxy_job_clear(&sp->jobs[i]);
+	}
 }
 
 static struct sv2_proxy_job *sv2_proxy_find_job(struct sv2_proxy *sp, uint32_t job_id)
@@ -3859,15 +3882,14 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		struct sv2_proxy_job *job;
 		const char *implausible = NULL;
 		enum sv2_tip_rel rel;
-		bool custom_tip;
 
 		if (!sv2_decode_set_new_prev_hash(pay, pl, &p))
 			break;
 		/* Spec: unknown job_id is a protocol error — fail closed without
 		 * mutating tip (avoids silent non-clean work on a new tip). */
 		job = sv2_proxy_find_job(sp, p.job_id);
-		if (!job) {
-			LOGWARNING("SV2 proxy %d SetNewPrevHash job %u not found — reconnecting",
+		if (!job || !job->future) {
+			LOGWARNING("SV2 proxy %d SetNewPrevHash job %u is not a queued future job — reconnecting",
 				   proxi->id, p.job_id);
 			sp->want_reconnect = true;
 			break;
@@ -3876,14 +3898,11 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		sp->nbits = p.nbits;
 		sp->snph_min_ntime = p.min_ntime;
 		sp->have_prevhash = true;
-		/*
-		 * ckpool's JDS drops a channel's custom jobs as soon as its own tip
-		 * moves (channel_clear_custom_locked), so custom work only outlives
-		 * a SetNewPrevHash that repeats the tip it was declared on.
-		 */
-		custom_tip = sp->have_custom_prev &&
-			     !memcmp(sp->custom_prev, p.prev_hash, 32);
-		sp->have_custom_prev = custom_tip;
+		sv2_proxy_invalidate_jobs(sp, job);
+		if (sp->have_custom_prev) {
+			sp->have_custom_prev = false;
+			sv2_jdc_custom_dropped("SetNewPrevHash invalidated custom work");
+		}
 		/*
 		 * Where the pool's tip sits relative to our own chain is what the
 		 * whole arbiter turns on, and only the JD client knows: it owns the
@@ -3896,16 +3915,6 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 					 &implausible);
 		LOGNOTICE("SV2 proxy %d new prevhash for job %u nbits=0x%08x (%s)",
 			  proxi->id, p.job_id, p.nbits, sv2_tip_rel_str(rel));
-		if (custom_tip) {
-			/*
-			 * The pool has repeated the tip our custom work is on. It is
-			 * not a work change, and handing miners pool work for it
-			 * would cost them the declared job for nothing.
-			 */
-			LOGINFO("SV2 proxy %d not notifying pool job %u: custom work is "
-				"live on this tip", proxi->id, p.job_id);
-			break;
-		}
 		switch (rel) {
 			case SV2_TIP_AHEAD:
 				/*
@@ -3945,9 +3954,8 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 						   "no local template to declare");
 				break;
 		}
-		/* Activate the referenced job, flushing only a tip miners are not
-		 * already working on. */
-		sv2_proxy_send_job(proxi, job, sv2_proxy_want_clean(sp, p.prev_hash));
+		/* All previous jobs are invalid, including same-tip work. */
+		sv2_proxy_send_job(proxi, job, true);
 		break;
 	}
 	case SV2_MSG_SET_CUSTOM_MINING_JOB_SUCCESS: {
