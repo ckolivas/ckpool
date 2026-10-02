@@ -72,6 +72,7 @@ enum sv2_work_src {
 
 /* Snapshot of an accepted custom job for share reconstruction */
 struct sv2_custom_job {
+	unsigned int refs; /* group slots share immutable material under sv2_lock */
 	bool token_pinned;
 	uint32_t job_id;
 	uint32_t version;
@@ -265,7 +266,7 @@ static void channel_put(struct sv2_channel *ch)
 
 static void free_custom_job(struct sv2_custom_job *cj)
 {
-	if (!cj)
+	if (!cj || --cj->refs)
 		return;
 	if (cj->token_pinned)
 		sv2_jd_unpin_token(cj->token, cj->token_len);
@@ -1544,11 +1545,12 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	struct sv2_set_custom_mining_job req;
 	struct sv2_set_custom_mining_job_success ok;
 	struct sv2_set_custom_mining_job_error err;
-	struct sv2_channel *ch;
-	struct sv2_custom_job *cj;
+	struct sv2_channel *ch, *tmp, *members[SV2_MAX_CHANNELS_CLIENT];
+	unsigned int nmembers = 0, n;
+	struct sv2_custom_job *cj = NULL;
 	uint8_t pbuf[128];
 	size_t plen = 0;
-	uint32_t job_id;
+	uint32_t job_id = 0;
 	int64_t wb_id = 0;
 	uint32_t tip_mintime, tip_nbits;
 	int tip_height;
@@ -1572,18 +1574,32 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 		goto err;
 	}
 
-	ch = channel_find_ref(c->client_id, req.channel_id);
-	if (!ch || ch->standard || !ch->instance_id) {
-		/* Spec: extended or group only; standard ignored/rejected */
+	/* Group membership is fixed by channel kind and full extranonce size.
+	 * Take all references together so an error never installs a partial group. */
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id != c->client_id || ch->standard || !ch->instance_id)
+			continue;
+		if (req.channel_id == ch->channel_id || req.channel_id == SV2_EXTENDED_GROUP_ID) {
+			ch->refs++;
+			members[nmembers++] = ch;
+		}
+	}
+	mutex_unlock(&sv2_lock);
+	if (!nmembers) {
+		/* A group containing only standard channels is a no-op (5.3.18). */
+		if (req.channel_id == SV2_STANDARD_GROUP_ID) {
+			sv2_set_custom_mining_job_free(&req);
+			return NULL;
+		}
 		snprintf(ecode, sizeof(ecode), "invalid-channel-id");
-		channel_put(ch);
 		goto err;
 	}
+	ch = members[0];
 
 	if (!req.mining_job_token_len ||
 	    !sv2_jd_token_is_declared(req.mining_job_token, req.mining_job_token_len)) {
 		snprintf(ecode, sizeof(ecode), "invalid-mining-job-token");
-		channel_put(ch);
 		goto err;
 	}
 	/* Spec §6.4.3: coinbase outputs must fund Allocate payout script. */
@@ -1592,7 +1608,6 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 					      req.coinbase_tx_outputs,
 					      req.coinbase_tx_outputs_len)) {
 		snprintf(ecode, sizeof(ecode), "invalid-coinbase-tx-outputs");
-		channel_put(ch);
 		goto err;
 	}
 
@@ -1600,22 +1615,18 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	if (!stratifier_sv2_custom_tip(tip_prev, &tip_nbits, &tip_mintime,
 				      &tip_height, &wb_id)) {
 		snprintf(ecode, sizeof(ecode), "validation-unavailable");
-		channel_put(ch);
 		goto err;
 	}
 	if (memcmp(req.prev_hash, tip_prev, 32)) {
 		snprintf(ecode, sizeof(ecode), "stale-prev-hash");
-		channel_put(ch);
 		goto err;
 	}
 	if (req.min_ntime < tip_mintime || (uint64_t)req.min_ntime > (uint64_t)time(NULL) + 7200) {
 		snprintf(ecode, sizeof(ecode), "invalid-ntime");
-		channel_put(ch);
 		goto err;
 	}
 	if (req.nbits != tip_nbits) {
 		snprintf(ecode, sizeof(ecode), "invalid-nbits");
-		channel_put(ch);
 		goto err;
 	}
 	{
@@ -1631,22 +1642,20 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 		    memcmp(height, req.coinbase_prefix, hlen) ||
 		    (size_t)req.coinbase_prefix_len + ch->enonce1_len + ch->extranonce_size > 100) {
 			snprintf(ecode, sizeof(ecode), "invalid-coinbase-prefix");
-			channel_put(ch);
 			goto err;
 		}
 	}
 	if (!sv2_jd_custom_matches(&req, ch->enonce1_len + ch->extranonce_size)) {
 		snprintf(ecode, sizeof(ecode), "invalid-custom-job");
-		channel_put(ch);
 		goto err;
 	}
 
 	if (!sv2_jd_pin_token(req.mining_job_token, req.mining_job_token_len)) {
 		snprintf(ecode, sizeof(ecode), "invalid-mining-job-token");
-		channel_put(ch);
 		goto err;
 	}
 	cj = ckzalloc(sizeof(*cj));
+	cj->refs = 1;
 	cj->token_pinned = true;
 	cj->version = req.version;
 	memcpy(cj->prev_hash, req.prev_hash, 32);
@@ -1669,22 +1678,48 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	cj->token_len = req.mining_job_token_len;
 	memcpy(cj->token, req.mining_job_token, req.mining_job_token_len);
 
-	mutex_lock(&ch->publish_lock);
-	ensure_lock();
+	for (n = 0; n < nmembers; n++)
+		mutex_lock(&members[n]->publish_lock);
 	mutex_lock(&sv2_lock);
-	/*
-	 * Do not wipe previous custom job_ids — JDC rotates SetCustom every few
-	 * seconds while in-flight shares still reference the prior job_id.
-	 * Ring slots retain custom material until overwritten (SV2_JOB_RING).
-	 */
-	job_id = ++ch->job_seq;
-	if (!job_id)
-		job_id = ++ch->job_seq;
+	if (!client_live_locked(c)) {
+		mutex_unlock(&sv2_lock);
+		for (n = nmembers; n > 0; n--)
+			mutex_unlock(&members[n - 1]->publish_lock);
+		snprintf(ecode, sizeof(ecode), "invalid-channel-id");
+		goto err;
+	}
+	/* One identifier applies to every extended member of a group. Advance
+	 * beyond each member's allocator and avoid retained IDs on wraparound. */
+	for (n = 0; n < nmembers; n++) {
+		if (members[n]->job_seq > job_id)
+			job_id = members[n]->job_seq;
+	}
+	while (42) {
+		bool used = false;
+
+		if (!++job_id)
+			job_id++;
+		for (n = 0; n < nmembers && !used; n++) {
+			for (i = 0; i < SV2_JOB_RING; i++) {
+				if (members[n]->jobs[i].used && members[n]->jobs[i].job_id == job_id) {
+					used = true;
+					break;
+				}
+			}
+		}
+		if (!used)
+			break;
+	}
 	cj->job_id = job_id;
-	ch->work_src = SV2_WORK_CUSTOM;
-	/* SetCustomMiningJob: BIP320 bits may be rolled (pool mask). */
-	channel_note_job_locked(ch, job_id, wb_id, true, cj, cj->version,
-				ckpool.version_mask != 0);
+	cj->refs = nmembers;
+	for (n = 0; n < nmembers; n++) {
+		ch = members[n];
+		ch->job_seq = job_id;
+		ch->work_src = SV2_WORK_CUSTOM;
+		channel_note_job_locked(ch, job_id, wb_id, true, cj, cj->version,
+					ckpool.version_mask != 0);
+	}
+	cj = NULL; /* the group slots own the shared material and its token pin */
 	mutex_unlock(&sv2_lock);
 
 	memset(&ok, 0, sizeof(ok));
@@ -1695,14 +1730,19 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	if (sv2_encode_set_custom_mining_job_success(pbuf, sizeof(pbuf), &plen, &ok))
 		queue_frame(c->client_id, SV2_MSG_SET_CUSTOM_MINING_JOB_SUCCESS, true,
 			    pbuf, plen);
-	mutex_unlock(&ch->publish_lock);
-	channel_put(ch);
+	for (n = nmembers; n > 0; n--)
+		mutex_unlock(&members[n - 1]->publish_lock);
+	for (n = 0; n < nmembers; n++)
+		channel_put(members[n]);
 	LOGNOTICE("SV2 SetCustomMiningJob ok client %"PRId64" ch=%u job=%u",
 		  c->client_id, ok.channel_id, job_id);
 	*replylen = 0;
 	return NULL;
 
 err:
+	free_custom_job(cj);
+	for (n = 0; n < nmembers; n++)
+		channel_put(members[n]);
 	sv2_set_custom_mining_job_free(&req);
 	memset(&err, 0, sizeof(err));
 	err.channel_id = err_ch;
@@ -1853,6 +1893,7 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 		if (reserved && is_custom && cj_slot) {
 			cj_copy = ckzalloc(sizeof(*cj_copy));
 			*cj_copy = *cj_slot;
+			cj_copy->refs = 1;
 			cj_copy->token_pinned = sv2_jd_pin_token(cj_copy->token, cj_copy->token_len);
 			if (cj_slot->coinbase_tx_outputs_len) {
 				cj_copy->coinbase_tx_outputs =

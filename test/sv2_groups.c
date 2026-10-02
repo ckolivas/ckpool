@@ -304,6 +304,40 @@ static void check_custom_validation(void)
 	require(validate_custom_share(ch->custom, zeros, 4, zeros, 8,
 		req.min_ntime, 0, req.version, hash, &diff, error, sizeof(error)),
 		"accepted large coinbase hashes successfully");
+	/* Group requests install one shared ID/material on extended members.
+	 * Standard members are ignored and invalid group requests change none. */
+	{
+		struct sv2_channel *member, *tmp;
+		uint32_t group_job;
+		unsigned int count = 0, before;
+		uint8_t payload[65536];
+		size_t len;
+
+		req.channel_id = SV2_EXTENDED_GROUP_ID;
+		check_custom_request(&req, true);
+		group_job = ch->active_job_id;
+		HASH_ITER(hh, sv2_channels, member, tmp) {
+			if (member->standard) {
+				require(!member->custom, "standard channel ignores group custom job");
+				continue;
+			}
+			require(member->active_job_id == group_job && member->custom == ch->custom,
+				"extended group shares job ID and immutable material");
+			count++;
+		}
+		require(count == 4 && ch->custom->refs == count, "group material references");
+		req.nbits++;
+		check_custom_request(&req, false);
+		req.nbits--;
+		require(ch->active_job_id == group_job, "invalid group request is atomic");
+		req.channel_id = SV2_STANDARD_GROUP_ID;
+		before = custom_successes;
+		require(sv2_encode_set_custom_mining_job(payload, sizeof(payload), &len, &req),
+			"encode standard group custom request");
+		send_request(SV2_MSG_SET_CUSTOM_MINING_JOB, payload, len, false);
+		require(custom_successes == before, "standard-only group ignored");
+		req.channel_id = ch->channel_id;
+	}
 	req.min_ntime = 0;
 	check_custom_request(&req, false);
 	req.min_ntime = time(NULL) + 7201;
