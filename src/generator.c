@@ -2918,6 +2918,10 @@ static bool sv2_proxy_setup(proxy_instance_t *proxi, connsock_t *cs)
 			dealloc(f);
 			return false;
 		}
+		if (fr.extension_type & SV2_EXTENSION_MASK) {
+			dealloc(f);
+			continue;
+		}
 		pay = f + SV2_FRAME_HEADER_LEN;
 		if (fr.msg_type == SV2_MSG_SETUP_CONNECTION_SUCCESS) {
 			struct sv2_setup_connection_success ok;
@@ -3000,6 +3004,10 @@ static bool sv2_proxy_open(proxy_instance_t *proxi, connsock_t *cs)
 		if (!sv2_decode_header(f, fl, &fr)) {
 			dealloc(f);
 			return false;
+		}
+		if (fr.extension_type & SV2_EXTENSION_MASK) {
+			dealloc(f);
+			continue;
 		}
 		pay = f + SV2_FRAME_HEADER_LEN;
 		if (fr.msg_type == SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS) {

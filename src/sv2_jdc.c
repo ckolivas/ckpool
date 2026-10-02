@@ -1036,6 +1036,10 @@ static bool sess_setup(void)
 			dealloc(f);
 			return false;
 		}
+		if (fr.extension_type & SV2_EXTENSION_MASK) {
+			dealloc(f);
+			continue;
+		}
 		pay = f + SV2_FRAME_HEADER_LEN;
 		if (fr.msg_type == SV2_MSG_SETUP_CONNECTION_SUCCESS) {
 			struct sv2_setup_connection_success ok;
@@ -1732,7 +1736,8 @@ static void sess_handle_frame(const uint8_t *frame, size_t flen)
 	const uint8_t *pay;
 	uint32_t plen;
 
-	if (!sv2_decode_header(frame, flen, &fr))
+	if (!sv2_decode_header(frame, flen, &fr) ||
+	    (fr.extension_type & SV2_EXTENSION_MASK))
 		return;
 	if (fr.msg_length > SV2_MAX_JD_PAYLOAD ||
 	    flen < SV2_FRAME_HEADER_LEN + fr.msg_length)

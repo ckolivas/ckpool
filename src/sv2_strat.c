@@ -625,20 +625,19 @@ static int target_cmp_le(const uint8_t a[32], const uint8_t b[32])
 }
 
 /*
- * True if a wire f32 is finite. Screened by bit pattern deliberately: ckpool
+ * True if a wire hashrate is finite and nonnegative (excluding negative zero). Screened by bit pattern deliberately: ckpool
  * unmasks FE_INVALID, and on x86-64 both (double)f and isfinite(f) compile to
  * SSE ops that raise #IA — and so SIGFPE — when f is a *signalling* NaN. A
  * guard written as isfinite(f) faults on exactly the input it exists to
  * reject, so an untrusted f32 must never reach the FPU until it is known
- * finite. Sign is not considered; ordered comparisons are safe once the value
- * cannot be NaN.
+ * finite. Test the sign bit too, since negative zero is forbidden by spec 3.2.
  */
-static bool wire_f32_finite(float f)
+static bool wire_f32_hashrate_valid(float f)
 {
 	uint32_t bits;
 
 	memcpy(&bits, &f, sizeof(bits));
-	return (bits & 0x7f800000u) != 0x7f800000u;
+	return !(bits & 0x80000000u) && (bits & 0x7f800000u) != 0x7f800000u;
 }
 
 /*
@@ -683,7 +682,7 @@ static void choose_channel_diff(float nominal_hr, const uint8_t max_target[32],
 		mindiff = floor;
 
 	/* Wire f32 is untrusted — reject non-finite / negative before math. */
-	if (wire_f32_finite(nominal_hr) && nominal_hr > 0.0f)
+	if (wire_f32_hashrate_valid(nominal_hr) && nominal_hr > 0.0f)
 		hr = (double)nominal_hr;
 	else
 		hr = 0.0;
@@ -972,7 +971,8 @@ static uint8_t *handle_setup(struct sv2_client *c, const uint8_t *payload,
 	 * client, so refuse it when no version mask is configured.
 	 */
 	{
-		uint32_t bad_flags = 0;
+		uint32_t bad_flags = sc.flags & ~(SV2_FLAG_REQUIRES_STANDARD_JOBS |
+			SV2_FLAG_REQUIRES_WORK_SELECTION | SV2_FLAG_REQUIRES_VERSION_ROLLING);
 
 		if ((sc.flags & SV2_FLAG_REQUIRES_WORK_SELECTION) && !sv2_jd_enabled())
 			bad_flags |= SV2_FLAG_REQUIRES_WORK_SELECTION;
@@ -1027,6 +1027,14 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 		return NULL;
 	if (!sv2_decode_open_standard_channel(payload, len, &o))
 		return NULL;
+	if (!wire_f32_hashrate_valid(o.nominal_hash_rate)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-nominal-hashrate");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	floor = server_diff_floor(c->server);
 	choose_channel_diff(o.nominal_hash_rate, o.max_target, floor, &diff);
@@ -1424,6 +1432,14 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	}
 	if (!sv2_decode_open_extended_channel(payload, len, &o))
 		return NULL;
+	if (!wire_f32_hashrate_valid(o.nominal_hash_rate)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-nominal-hashrate");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	floor = server_diff_floor(c->server);
 	choose_channel_diff(o.nominal_hash_rate, o.max_target, floor, &diff);
@@ -2092,7 +2108,7 @@ uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 			break;
 		}
 		/* Spec: no response when accepted; Error only when invalid. */
-		if (!wire_f32_finite(nom_hr) || nom_hr < 0.0f) {
+		if (!wire_f32_hashrate_valid(nom_hr)) {
 			memset(&uerr, 0, sizeof(uerr));
 			uerr.channel_id = ch_id;
 			snprintf(uerr.error_code, sizeof(uerr.error_code),

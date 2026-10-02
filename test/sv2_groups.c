@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include <stdio.h>
+#include <fenv.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -408,6 +409,69 @@ static void check_open_disconnect(bool extended)
 		"disconnect during authentication leaves no orphan session or channel");
 }
 
+static void check_protocol_validation(void)
+{
+	const uint32_t bad[] = {0x80000000, 0xbf800000, 0x7f800000, 0xff800000,
+		0x7fc00000, 0x7f800001};
+	struct sv2_client c = {0};
+	struct sv2_setup_connection sc = {0};
+	struct sv2_setup_connection_error err;
+	uint8_t payload[512], *p, *reply, target[32];
+	size_t len, rlen;
+	unsigned int i;
+	int traps;
+
+	ckpool.version_mask = 0;
+	sc.min_version = sc.max_version = 2;
+	sc.flags = UINT32_MAX;
+	require(sv2_encode_setup_connection(payload, sizeof(payload), &len, &sc), "encode flags");
+	reply = handle_setup(&c, payload, len, &rlen);
+	require(reply && !c.setup_ok && sv2_decode_setup_connection_error(reply + 6, rlen - 6, &err),
+		"unsupported setup flags rejected");
+	require(err.flags == (UINT32_MAX & ~SV2_FLAG_REQUIRES_STANDARD_JOBS), "all bad flags returned");
+	free(reply);
+	c.setup_ok = true;
+	memset(target, 0xff, sizeof(target));
+	traps = feenableexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		p = payload;
+		sv2_write_u32(&p, 1);
+		sv2_write_str0_255(&p, "worker");
+		sv2_write_u32(&p, bad[i]); /* Preserve signalling NaN bits without arithmetic. */
+		sv2_write_u256(&p, target);
+		reply = handle_open_standard(&c, payload, p - payload, &rlen);
+		require(reply && reply[2] == SV2_MSG_OPEN_MINING_CHANNEL_ERROR, "bad standard hashrate");
+		free(reply);
+		sv2_write_u16(&p, 0);
+		reply = handle_open_extended(&c, payload, p - payload, &rlen);
+		require(reply && reply[2] == SV2_MSG_OPEN_MINING_CHANNEL_ERROR, "bad extended hashrate");
+		free(reply);
+		{
+			struct sv2_client *live = client_get(1, true);
+			uint8_t *frame;
+			size_t flen;
+
+			live->setup_ok = true;
+			p = payload;
+			sv2_write_u32(&p, 1);
+			sv2_write_u32(&p, bad[i]);
+			sv2_write_u256(&p, target);
+			require(sv2_build_frame(SV2_CHANNEL_MSG_BIT, SV2_MSG_UPDATE_CHANNEL,
+				payload, p - payload, &frame, &flen), "encode invalid update");
+			reply = sv2_strat_handle_frame(1, frame, flen, &rlen);
+			require(reply && reply[2] == SV2_MSG_UPDATE_CHANNEL_ERROR, "bad update hashrate");
+			free(reply);
+			free(frame);
+			client_put(live);
+			sv2_strat_drop_client(1);
+		}
+	}
+	fedisableexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+	if (traps)
+		feenableexcept(traps);
+	require(!sessions && !sv2_channels, "invalid opens create no sessions");
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -427,6 +491,7 @@ int main(void)
 	check_admission_limits();
 	check_open_disconnect(false);
 	check_open_disconnect(true);
+	check_protocol_validation();
 	puts("sv2_groups: all OK");
 	return 0;
 }

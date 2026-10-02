@@ -1889,14 +1889,16 @@ static uint8_t *handle_setup(struct sv2_jd_client *c, const uint8_t *payload,
 	}
 	if (sc.min_version > 2 || sc.max_version < 2) {
 		memset(&err, 0, sizeof(err));
-		snprintf(err.error_code, sizeof(err.error_code), "unsupported-feature-flags");
+		snprintf(err.error_code, sizeof(err.error_code), "protocol-version-mismatch");
 		if (!sv2_encode_setup_connection_error(pbuf, sizeof(pbuf), &plen, &err))
 			return NULL;
 		return reply_frame(SV2_MSG_SETUP_CONNECTION_ERROR, pbuf, plen, replylen);
 	}
-	if (!(sc.flags & SV2_JD_FLAG_DECLARE_TX_DATA)) {
+	if (!(sc.flags & SV2_JD_FLAG_DECLARE_TX_DATA) ||
+	    (sc.flags & ~SV2_JD_FLAG_DECLARE_TX_DATA)) {
 		memset(&err, 0, sizeof(err));
-		err.flags = SV2_JD_FLAG_DECLARE_TX_DATA;
+		err.flags = (sc.flags & ~SV2_JD_FLAG_DECLARE_TX_DATA) |
+			((sc.flags & SV2_JD_FLAG_DECLARE_TX_DATA) ? 0 : SV2_JD_FLAG_DECLARE_TX_DATA);
 		snprintf(err.error_code, sizeof(err.error_code), "unsupported-feature-flags");
 		if (!sv2_encode_setup_connection_error(pbuf, sizeof(pbuf), &plen, &err))
 			return NULL;

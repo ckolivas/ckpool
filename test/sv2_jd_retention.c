@@ -338,6 +338,23 @@ int main(void)
 	check_custom_binding();
 	check_pinned_snapshot();
 	check_metadata_pressure();
+	{
+		struct sv2_jd_client c = {0};
+		struct sv2_setup_connection sc = {0};
+		struct sv2_setup_connection_error err;
+		uint8_t payload[512], *reply;
+		size_t len, rlen;
+
+		sc.protocol = SV2_PROTOCOL_JOB_DECLARATION;
+		sc.min_version = sc.max_version = 2;
+		sc.flags = UINT32_MAX;
+		assert(sv2_encode_setup_connection(payload, sizeof(payload), &len, &sc));
+		reply = handle_setup(&c, payload, len, &rlen);
+		assert(reply && !c.setup_ok);
+		assert(sv2_decode_setup_connection_error(reply + 6, rlen - 6, &err));
+		assert(err.flags == (UINT32_MAX & ~SV2_JD_FLAG_DECLARE_TX_DATA));
+		free(reply);
+	}
 	puts("sv2_jd_retention: all OK");
 	return 0;
 }
