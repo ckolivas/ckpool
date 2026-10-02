@@ -568,8 +568,7 @@ static void flush_success_batch(struct sv2_channel *ch)
 	count = ch->batch_count;
 	shares_sum = ch->batch_shares_sum;
 	ch->batch_count = 0;
-	/* Keep batch_last_seq as a session high-water mark so a post-flush
-	 * straggler with a lower seq cannot recede last_sequence_number. */
+	ch->batch_last_seq = 0;
 	ch->batch_shares_sum = 0;
 	memset(&ch->batch_start, 0, sizeof(ch->batch_start));
 	mutex_unlock(&sv2_lock);
@@ -600,9 +599,8 @@ static void note_share_success(struct sv2_channel *ch, uint32_t sequence_number,
 	if (!ch->batch_count)
 		copy_tv(&ch->batch_start, &now);
 	ch->batch_count++;
-	/* Highest accepted seq (sshareq can process shares out of order). */
-	if (sequence_number > ch->batch_last_seq)
-		ch->batch_last_seq = sequence_number;
+	/* Most recently accepted submission in this batch, including wraparound. */
+	ch->batch_last_seq = sequence_number;
 	ch->batch_shares_sum += share_diff ? share_diff : 1;
 	age = tvdiff(&now, &ch->batch_start);
 	if (ch->batch_count >= SV2_SUCCESS_BATCH_MAX || age >= SV2_SUCCESS_BATCH_SECS)
@@ -610,6 +608,32 @@ static void note_share_success(struct sv2_channel *ch, uint32_t sequence_number,
 	mutex_unlock(&sv2_lock);
 	if (do_flush)
 		flush_success_batch(ch);
+}
+
+/* Called on the connector's one-second tick, independent of new shares/jobs. */
+void sv2_strat_flush_aged_shares(void)
+{
+	struct sv2_channel *ch, *tmp, **list = NULL;
+	unsigned int n = 0, i;
+	tv_t now;
+
+	tv_time(&now);
+	ensure_lock();
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (!ch->batch_count || tvdiff(&now, &ch->batch_start) < SV2_SUCCESS_BATCH_SECS)
+			continue;
+		if (!list)
+			list = ckalloc(HASH_COUNT(sv2_channels) * sizeof(*list));
+		ch->refs++;
+		list[n++] = ch;
+	}
+	mutex_unlock(&sv2_lock);
+	for (i = 0; i < n; i++) {
+		flush_success_batch(list[i]);
+		channel_put(list[i]);
+	}
+	free(list);
 }
 
 /* Compare LE U256 targets: >0 if a is easier (larger) than b. */

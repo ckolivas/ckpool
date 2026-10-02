@@ -1339,6 +1339,9 @@ static void *receiver(void *arg)
 		if (now_t != last_reap) {
 			last_reap = now_t;
 			reap_idle_clients(cdata);
+#ifdef HAVE_SV2
+			sv2_strat_flush_aged_shares();
+#endif
 			if (ckpool.redirector)
 				expire_redirector_shares(cdata);
 		}

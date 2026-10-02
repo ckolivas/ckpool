@@ -51,6 +51,8 @@ void logmsg(int __maybe_unused loglevel, const char __maybe_unused *fmt, ...)
 {
 }
 
+static uint32_t ack_last_seq, ack_count;
+
 void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen)
 {
 	struct sv2_frame frame;
@@ -71,6 +73,8 @@ void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen
 
 		require(sv2_decode_submit_shares_success(p, end - p, &ack), "decode share ack");
 		acknowledged_diff += ack.new_shares_sum;
+		ack_last_seq = ack.last_sequence_number;
+		ack_count = ack.new_submits_accepted_count;
 		free(plain);
 		return;
 	}
@@ -472,6 +476,32 @@ static void check_protocol_validation(void)
 	require(!sessions && !sv2_channels, "invalid opens create no sessions");
 }
 
+static void check_batch_timer(void)
+{
+	struct sv2_channel *ch;
+
+	check_connection(1, true);
+	ch = channel_find_ref(1, SV2_FIRST_CHANNEL_ID);
+	acknowledged_diff = 0;
+	note_share_success(ch, UINT32_MAX, 100);
+	flush_success_batch(ch);
+	require(ack_last_seq == UINT32_MAX && ack_count == 1, "first sequence batch");
+	note_share_success(ch, 0, 200);
+	ch->batch_start.tv_sec -= 2;
+	sv2_strat_flush_aged_shares();
+	require(ack_last_seq == 0 && ack_count == 1 && acknowledged_diff == 300,
+		"aged batch flushes independently and sequence wraps");
+	require(!ch->batch_count && !ch->batch_shares_sum, "batch counters reset");
+	note_share_success(ch, 9, 300);
+	flush_success_batch(ch);
+	note_share_success(ch, 8, 400);
+	flush_success_batch(ch);
+	require(ack_last_seq == 8 && ack_count == 1 && acknowledged_diff == 1000,
+		"out of order worker completion reports its own batch");
+	channel_put(ch);
+	sv2_strat_drop_all();
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -492,6 +522,7 @@ int main(void)
 	check_open_disconnect(false);
 	check_open_disconnect(true);
 	check_protocol_validation();
+	check_batch_timer();
 	puts("sv2_groups: all OK");
 	return 0;
 }

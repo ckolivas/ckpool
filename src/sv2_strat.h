@@ -17,6 +17,9 @@
 uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 				size_t framelen, size_t *replylen);
 
+/* Periodic ACK flush, called even when no new shares or jobs arrive. */
+void sv2_strat_flush_aged_shares(void);
+
 /* Drop all SV2 channel state for a connector client id. */
 void sv2_strat_drop_client(int64_t client_id);
 
