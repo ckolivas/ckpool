@@ -135,6 +135,9 @@ struct sv2_jd_client {
 	int alloc_count;
 	time_t declare_window_start;
 	int declare_count;
+	time_t push_window;
+	unsigned int push_count;
+	bool push_pending;
 	/* refs: 1 while hashed; +1 per outstanding user outside the lock */
 	int refs;
 };
@@ -205,6 +208,7 @@ struct sv2_jd_token {
 	uint64_t snapshot_order; /* declaration order, not allocation time */
 	bool have_custom_commitment;
 	uint8_t coinbase_zero_txid[32], merkle_zero_root[32];
+	uint8_t coinbase_path[32][32], coinbase_path_len;
 	bool latest_snapshot;
 	uint8_t enonce_len;	/* enonce size that passed checkBlock */
 };
@@ -245,12 +249,16 @@ static pthread_once_t jd_validate_once = PTHREAD_ONCE_INIT;
 static ckmsgq_t *jd_submit_q;
 static pthread_once_t jd_submit_once = PTHREAD_ONCE_INIT;
 
+#define SV2_JD_PUSH_MAX_INFLIGHT 4
+#define SV2_JD_PUSH_RATE 4
+static unsigned int jd_push_inflight; /* under jd_lock */
+
 struct jd_submit_job {
-	uint8_t *block;
-	size_t blen;
-	int64_t client_id;
-	char who[SV2_MAX_STR_LEN + 1];
+	struct sv2_push_solution sol;
+	struct sv2_jd_client *client;
 };
+
+static void process_push_solution(struct jd_submit_job *job);
 
 /* Lightweight operator metrics (process lifetime). */
 static struct {
@@ -1247,8 +1255,9 @@ static void token_commit_custom(struct sv2_jd_token *tok)
 {
 	uint8_t *cb, (*txids)[32];
 	size_t len = tok->coinbase_tx_prefix_len + tok->enonce_len + tok->coinbase_tx_suffix_len;
-	unsigned int i;
+	unsigned int i, n;
 
+	tok->coinbase_path_len = 0;
 	tok->have_custom_commitment = false;
 	cb = ckzalloc(len ? len : 1);
 	memcpy(cb, tok->coinbase_tx_prefix, tok->coinbase_tx_prefix_len);
@@ -1264,7 +1273,18 @@ static void token_commit_custom(struct sv2_jd_token *tok)
 		if (!sv2_bitcoin_txid(tok->tx_raws[i], tok->tx_lens[i], txids[i + 1]))
 			goto out;
 	}
-	sv2_merkle_root_from_txids(txids, tok->wtxid_count + 1, tok->merkle_zero_root);
+	/* Cache the coinbase branch once; PushSolution need only hash its coinbase. */
+	for (n = tok->wtxid_count + 1; n > 1; n = (n + 1) / 2) {
+		memcpy(tok->coinbase_path[tok->coinbase_path_len++], txids[1], 32);
+		for (i = 0; i < n; i += 2) {
+			uint8_t pair[64];
+
+			memcpy(pair, txids[i], 32);
+			memcpy(pair + 32, txids[i + 1 < n ? i + 1 : i], 32);
+			gen_hash(pair, txids[i / 2], sizeof(pair));
+		}
+	}
+	memcpy(tok->merkle_zero_root, txids[0], 32);
 	tok->have_custom_commitment = true;
 out:
 	free(txids);
@@ -1733,17 +1753,7 @@ static void jd_validate_q_init(void)
  * solutions arriving together stay serialised as they were when inline. */
 static void jd_submit_process(struct jd_submit_job *job)
 {
-	bool accepted;
-
-	if (!job)
-		return;
-	accepted = stratifier_sv2_submit_block_bin(job->block, job->blen, 0,
-						   job->who[0] ? job->who : NULL);
-	LOGWARNING("SV2 JD PushSolution client %"PRId64" block %zu bytes %s "
-		   "(push_total=%"PRIu64")", job->client_id, job->blen,
-		   accepted ? "ACCEPTED" : "rejected/error", JD_STAT_GET(push_solution));
-	dealloc(job->block);
-	dealloc(job);
+	process_push_solution(job);
 }
 
 static void jd_submit_q_init(void)
@@ -2981,141 +2991,154 @@ static bool header_meets_nbits(const uint8_t *header80, uint32_t nbits)
 	return sdiff + 1e-9 >= ndiff;
 }
 
+/* tok is immutable and pinned by the caller. No transaction snapshot copy. */
+static bool solution_header(const struct sv2_jd_token *tok,
+			    const struct sv2_push_solution *sol, uint8_t header[80])
+{
+	uint8_t *cb, pair[64];
+	size_t len;
+	uint32_t le;
+	unsigned int i;
+
+	if (!tok->have_custom_commitment || sol->extranonce_len != tok->enonce_len)
+		return false;
+	len = tok->coinbase_tx_prefix_len + tok->enonce_len + tok->coinbase_tx_suffix_len;
+	cb = ckalloc(len);
+	memcpy(cb, tok->coinbase_tx_prefix, tok->coinbase_tx_prefix_len);
+	memcpy(cb + tok->coinbase_tx_prefix_len, sol->extranonce, tok->enonce_len);
+	memcpy(cb + tok->coinbase_tx_prefix_len + tok->enonce_len,
+	       tok->coinbase_tx_suffix, tok->coinbase_tx_suffix_len);
+	if (!sv2_bitcoin_txid(cb, len, pair)) {
+		free(cb);
+		return false;
+	}
+	free(cb);
+	for (i = 0; i < tok->coinbase_path_len; i++) {
+		memcpy(pair + 32, tok->coinbase_path[i], 32);
+		gen_hash(pair, pair, 64);
+	}
+	le = htole32(sol->version ? sol->version : tok->version);
+	memcpy(header, &le, 4);
+	memcpy(header + 4, sol->prev_hash, 32);
+	memcpy(header + 36, pair, 32);
+	le = htole32(sol->ntime);
+	memcpy(header + 68, &le, 4);
+	le = htole32(sol->nbits);
+	memcpy(header + 72, &le, 4);
+	le = htole32(sol->nonce);
+	memcpy(header + 76, &le, 4);
+	return true;
+}
+
+/* Caller holds jd_lock. Bound both queued requests and repeated cheap failures. */
+static bool reserve_push_locked(struct sv2_jd_client *c, time_t now)
+{
+	if (c->push_pending || jd_push_inflight >= SV2_JD_PUSH_MAX_INFLIGHT)
+		return false;
+	if (c->push_window != now) {
+		c->push_window = now;
+		c->push_count = 0;
+	}
+	if (c->push_count >= SV2_JD_PUSH_RATE)
+		return false;
+	c->push_count++;
+	c->push_pending = true;
+	c->refs++;
+	jd_push_inflight++;
+	return true;
+}
+
+static void release_push(struct sv2_jd_client *c)
+{
+	mutex_lock(&jd_lock);
+	c->push_pending = false;
+	jd_push_inflight--;
+	client_unref_locked(c);
+	mutex_unlock(&jd_lock);
+}
+
+static void process_push_solution(struct jd_submit_job *job)
+{
+	struct sv2_jd_client *c = job->client;
+	struct sv2_push_solution *sol = &job->sol;
+	struct sv2_jd_token **cands, *tok, *tmp;
+	uint32_t version, ntime, nbits;
+	uint8_t prev[32], header[80];
+	unsigned int n = 0, i;
+
+	/* Never trust a client's easy target when the pool has no template. */
+	if (!stratifier_sv2_tip_for_jd(&version, &ntime, &nbits, prev))
+		goto out;
+	mutex_lock(&jd_lock);
+	cands = ckalloc(sizeof(*cands) * (jd_token_count + 1));
+	HASH_ITER(hh, jd_tokens, tok, tmp) {
+		if (tok->client_id == c->client_id && tok->have_custom_commitment &&
+		    tok->coinbase_tx_prefix) {
+			tok->job_refs++;
+			cands[n++] = tok;
+		}
+	}
+	mutex_unlock(&jd_lock);
+	for (i = 0; i < n; i++) {
+		struct rebuild_snap snap;
+		uint8_t *block;
+		size_t blen;
+		bool have, accepted;
+
+		tok = cands[i];
+		if (!solution_header(tok, sol, header) || !header_meets_nbits(header, nbits))
+			continue;
+		mutex_lock(&jd_lock);
+		have = snapshot_token_for_rebuild_locked(tok, &snap);
+		mutex_unlock(&jd_lock);
+		if (!have)
+			continue;
+		block = assemble_solved_from_snap(&snap, sol->extranonce, sol->extranonce_len,
+						 sol->version, sol->ntime, sol->nonce, sol->nbits,
+						 sol->prev_hash, &blen);
+		free_rebuild_snap(&snap);
+		if (!block)
+			continue;
+		accepted = stratifier_sv2_submit_block_bin(block, blen, 0,
+							 tok->user_identifier);
+		LOGWARNING("SV2 JD PushSolution client %"PRId64" block %zu bytes %s",
+			   c->client_id, blen, accepted ? "ACCEPTED" : "rejected/error");
+		free(block);
+		break;
+	}
+	for (i = 0; i < n; i++)
+		sv2_jd_unpin_token(cands[i]->token, cands[i]->token_len);
+	free(cands);
+out:
+	release_push(c);
+	free(job);
+}
+
 static uint8_t *handle_push_solution(struct sv2_jd_client *c, const uint8_t *payload,
 				     uint32_t len, size_t *replylen)
 {
 	struct sv2_push_solution sol;
-	struct sv2_jd_token *tok, *tmp;
-	struct sv2_jd_token *cands[SV2_JD_PUSH_TOKEN_CANDIDATES];
-	int ncands = 0, i, j;
-	uint8_t *block = NULL;
-	size_t blen = 0;
-	bool solved = false;
-	char who[SV2_MAX_STR_LEN + 1];
+	struct jd_submit_job *job;
+	bool reserved;
 
 	*replylen = 0;
-	who[0] = '\0';
-	if (!c->setup_ok)
+	if (!c->setup_ok || !sv2_decode_push_solution(payload, len, &sol))
 		return NULL;
-	if (!sv2_decode_push_solution(payload, len, &sol))
-		return NULL;
-	/* Count on arrival, before hand-off, so the submit worker's log of the
-	 * running total cannot race ahead of the message it belongs to. */
 	JD_STAT_INC(push_solution);
-
-	/*
-	 * PushSolution carries no token. Snapshot several recent declared
-	 * tokens and pick the rebuild whose header meets nbits (correct
-	 * merkle/PoW). Wrong-template rebuilds fail the PoW check.
-	 */
-	ensure_lock();
 	mutex_lock(&jd_lock);
-	HASH_ITER(hh, jd_tokens, tok, tmp) {
-		if (tok->client_id != c->client_id || !tok->declared ||
-		    !tok->coinbase_tx_prefix)
-			continue;
-		/* Allocation timestamps can change on reissue; use declaration order. */
-		if (ncands < SV2_JD_PUSH_TOKEN_CANDIDATES) {
-			cands[ncands++] = tok;
-		} else if (tok->snapshot_order > cands[ncands - 1]->snapshot_order) {
-			cands[ncands - 1] = tok;
-		} else
-			continue;
-		for (i = ncands - 1; i > 0; i--) {
-			if (cands[i]->snapshot_order <= cands[i - 1]->snapshot_order)
-				break;
-			tok = cands[i];
-			cands[i] = cands[i - 1];
-			cands[i - 1] = tok;
-		}
+	reserved = reserve_push_locked(c, time(NULL));
+	mutex_unlock(&jd_lock);
+	if (!reserved)
+		return NULL;
+	pthread_once(&jd_submit_once, jd_submit_q_init);
+	if (!jd_submit_q) {
+		release_push(c);
+		return NULL;
 	}
-	/* Copy snaps under lock so tokens cannot vanish mid-rebuild. */
-	{
-		struct rebuild_snap snaps[SV2_JD_PUSH_TOKEN_CANDIDATES];
-		int nsnaps = 0;
-		char whos[SV2_JD_PUSH_TOKEN_CANDIDATES][SV2_MAX_STR_LEN + 1];
-
-		uint32_t pow_nbits = sol.nbits;
-		uint32_t t_ver, t_ntime, t_nbits;
-		uint8_t t_prev[32];
-
-		/*
-		 * Gate the proof of work on our own tip's nbits, not the value
-		 * the client sent: sol.nbits is attacker chosen, and an easy one
-		 * makes any non-solution pass this check and be submitted to
-		 * bitcoind for free. nbits only moves on a retarget boundary so
-		 * ours is stable across ordinary tip changes. Fall back to the
-		 * client's value only if we somehow have no tip to compare with.
-		 */
-		if (stratifier_sv2_tip_for_jd(&t_ver, &t_ntime, &t_nbits, t_prev)) {
-			if (unlikely(t_nbits != sol.nbits)) {
-				LOGNOTICE("SV2 JD PushSolution client %"PRId64" nbits %08x "
-					  "differs from pool tip %08x, testing against tip",
-					  c->client_id, sol.nbits, t_nbits);
-			}
-			pow_nbits = t_nbits;
-		}
-
-		memset(snaps, 0, sizeof(snaps));
-		for (i = 0; i < ncands; i++) {
-			if (!snapshot_token_for_rebuild_locked(cands[i], &snaps[nsnaps]))
-				continue;
-			whos[nsnaps][0] = '\0';
-			if (cands[i]->user_identifier[0])
-				snprintf(whos[nsnaps], sizeof(whos[nsnaps]), "%s",
-					 cands[i]->user_identifier);
-			nsnaps++;
-		}
-		mutex_unlock(&jd_lock);
-
-		for (i = 0; i < nsnaps; i++) {
-			dealloc(block);
-			block = assemble_solved_from_snap(&snaps[i], sol.extranonce,
-							  sol.extranonce_len, sol.version,
-							  sol.ntime, sol.nonce, sol.nbits,
-							  sol.prev_hash, &blen);
-			if (!block || !header_meets_nbits(block, pow_nbits))
-				continue;
-			if (whos[i][0])
-				snprintf(who, sizeof(who), "%s", whos[i]);
-			/*
-			 * Hand off rather than submit here: this runs on the
-			 * connector's single receive thread and submitblock is
-			 * synchronous. Only a block that already met nbits above
-			 * can reach this, so the queue cannot be flooded.
-			 */
-			pthread_once(&jd_submit_once, jd_submit_q_init);
-			if (likely(jd_submit_q)) {
-				struct jd_submit_job *job = ckzalloc(sizeof(*job));
-
-				job->block = block;
-				job->blen = blen;
-				job->client_id = c->client_id;
-				snprintf(job->who, sizeof(job->who), "%s", who);
-				block = NULL;	/* owned by the submit worker */
-				ckmsgq_add(jd_submit_q, job);
-			} else {
-				/* Never lose a solved block to a missing queue. */
-				LOGWARNING("SV2 JD no submit queue, submitting inline");
-				stratifier_sv2_submit_block_bin(block, blen, 0,
-								who[0] ? who : NULL);
-			}
-			solved = true;
-			break;
-		}
-		for (j = 0; j < nsnaps; j++)
-			free_rebuild_snap(&snaps[j]);
-	}
-
-	if (!solved) {
-		LOGWARNING("SV2 JD PushSolution: no matching declared template client %"PRId64,
-			   c->client_id);
-	} else {
-		/* Outcome is logged by the submit worker once bitcoind replies. */
-		LOGNOTICE("SV2 JD PushSolution client %"PRId64" block %zu bytes queued "
-			  "for submit", c->client_id, blen);
-	}
-	dealloc(block);
+	job = ckalloc(sizeof(*job));
+	job->client = c;
+	job->sol = sol;
+	ckmsgq_add(jd_submit_q, job);
 	return NULL; /* no response message in protocol */
 }
 

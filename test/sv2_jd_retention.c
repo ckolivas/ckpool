@@ -122,6 +122,43 @@ static void check_custom_binding(void)
 	assert(sv2_jd_custom_matches(&req, 8));
 	req.version ^= 1;
 	assert(!sv2_jd_custom_matches(&req, 8));
+	/* Cached branches must reconstruct the identical header, including an
+	 * odd transaction count and a nonzero extranonce. */
+	{
+		struct sv2_jd_token local = *tok;
+		struct sv2_push_solution sol = {0};
+		struct rebuild_snap snap;
+		uint8_t tx[256], enonce[8] = {7}, header[80], *block;
+		uint8_t *raws[2] = {tx, tx};
+		uint32_t lens[2];
+		size_t txlen, blen;
+
+		txlen = tok->coinbase_tx_prefix_len + 8 + tok->coinbase_tx_suffix_len;
+		assert(txlen <= sizeof(tx));
+		memcpy(tx, tok->coinbase_tx_prefix, tok->coinbase_tx_prefix_len);
+		memcpy(tx + tok->coinbase_tx_prefix_len, enonce, 8);
+		memcpy(tx + tok->coinbase_tx_prefix_len + 8, tok->coinbase_tx_suffix,
+		       tok->coinbase_tx_suffix_len);
+		lens[0] = lens[1] = txlen;
+		local.wtxid_count = 2;
+		local.tx_raws = raws;
+		local.tx_lens = lens;
+		token_commit_custom(&local);
+		assert(local.coinbase_path_len == 2);
+		sol.extranonce_len = 8;
+		memcpy(sol.extranonce, enonce, 8);
+		sol.version = local.version;
+		sol.nbits = 0x1d00ffff;
+		assert(solution_header(&local, &sol, header));
+		assert(snapshot_token_for_rebuild_locked(&local, &snap));
+		block = assemble_solved_from_snap(&snap, enonce, 8, sol.version, 0, 0,
+						 sol.nbits, sol.prev_hash, &blen);
+		assert(block && !memcmp(header, block, 80));
+		free(block);
+		free_rebuild_snap(&snap);
+		sol.extranonce_len--;
+		assert(!solution_header(&local, &sol, header));
+	}
 	free_jd_pending_fields(&p);
 	sv2_jd_drop_client(99);
 }
@@ -250,6 +287,26 @@ int main(void)
 	check_accounting(2, 1);
 	sv2_jd_drop_client(2);
 	assert(!jd_tokens && !jd_token_count && !jd_token_snapshot_bytes);
+	{
+		struct sv2_jd_client *c = client_get(123, true);
+
+		assert(reserve_push_locked(c, 1));
+		assert(!reserve_push_locked(c, 1));
+		release_push(c);
+		for (i = 1; i < SV2_JD_PUSH_RATE; i++) {
+			assert(reserve_push_locked(c, 1));
+			release_push(c);
+		}
+		assert(!reserve_push_locked(c, 1));
+		jd_push_inflight = SV2_JD_PUSH_MAX_INFLIGHT;
+		assert(!reserve_push_locked(c, 2));
+		jd_push_inflight = 0;
+		assert(reserve_push_locked(c, 2));
+		release_push(c);
+		assert(c->refs == 2 && !jd_push_inflight);
+		client_put(c);
+		sv2_jd_drop_client(123);
+	}
 	check_custom_binding();
 	check_pinned_snapshot();
 	puts("sv2_jd_retention: all OK");
