@@ -57,10 +57,11 @@
  * TTL races with concurrent Allocate (which runs expire_old_tokens) and
  * yields invalid-mining-job-token → SRI JDC treats that as malicious and
  * tears down the session. Keep undeclared tokens alive long enough for
- * the client queue; declared tokens only need a rebuild window.
+ * the client queue. Declared-token metadata has a separate TTL from
+ * the bounded reconstruction history; the latest snapshot never expires.
  */
 #define SV2_JD_TOKEN_TTL_UNDECLARED_SECS	7200	/* 2h unused/queued */
-#define SV2_JD_TOKEN_TTL_DECLARED_SECS	3600	/* 1h after checkBlock OK */
+#define SV2_JD_TOKEN_TTL_DECLARED_SECS	3600	/* 1h metadata, except latest */
 #define SV2_JD_MAX_TOKENS_GLOBAL	4096
 #define SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_GLOBAL	(512ULL << 20) /* 512 MiB */
 #define SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_CLIENT	(64ULL << 20)  /* 64 MiB */
@@ -76,7 +77,9 @@
 #define SV2_JD_CHECKBLOCK_MAX_INFLIGHT	4
 /* Max enonce-length checkBlock attempts per declare (derived, then conf). */
 #define SV2_JD_ENONCE_MAX_TRIES		2
-/* Recent declared tokens to try on PushSolution (no token on wire). */
+/* Retained snapshots per connection, also tried on PushSolution.
+ * Spec 6.4.9 requires only the latest successful declaration; keep a small
+ * history for solutions racing with replacement jobs. */
 #define SV2_JD_PUSH_TOKEN_CANDIDATES	8
 /* Coalesce identical declare templates for this many seconds. */
 #define SV2_JD_COALESCE_TTL_SECS	120
@@ -197,6 +200,8 @@ struct sv2_jd_token {
 	uint32_t *tx_lens;
 	/* All heap material retained by this declaration (budget accounting). */
 	uint64_t snapshot_bytes;
+	uint64_t snapshot_order; /* declaration order, not allocation time */
+	bool latest_snapshot;
 	uint8_t enonce_len;	/* enonce size that passed checkBlock */
 };
 
@@ -216,6 +221,7 @@ static int jd_token_count;
 static int tx_cache_count;
 static uint64_t tx_cache_bytes;
 static uint64_t jd_token_snapshot_bytes;
+static uint64_t jd_snapshot_order;
 static int jd_coalesce_count;
 /* In-flight checkBlock calls (global); not under jd_lock during IPC wait. */
 static mutex_t jd_cb_lock;
@@ -518,6 +524,28 @@ void sv2_jd_drop_all(void)
 		LOGNOTICE("SV2 JD drop_all: clients=%d tokens=%d", ncli, ntok);
 }
 
+/* Caller holds jd_lock. Preserve token authorization when retiring material. */
+static void free_token_snapshot_locked(struct sv2_jd_token *t)
+{
+	if (jd_token_snapshot_bytes >= t->snapshot_bytes)
+		jd_token_snapshot_bytes -= t->snapshot_bytes;
+	else
+		jd_token_snapshot_bytes = 0;
+	dealloc(t->coinbase_tx_prefix);
+	dealloc(t->coinbase_tx_suffix);
+	free_tx_snapshot(t->tx_raws, t->tx_lens, t->wtxid_count);
+	dealloc(t->wtxid_list);
+	t->coinbase_tx_prefix = NULL;
+	t->coinbase_tx_suffix = NULL;
+	t->tx_raws = NULL;
+	t->tx_lens = NULL;
+	t->wtxid_list = NULL;
+	t->coinbase_tx_prefix_len = t->coinbase_tx_suffix_len = 0;
+	t->wtxid_count = 0;
+	t->snapshot_bytes = t->snapshot_order = 0;
+	t->latest_snapshot = false;
+}
+
 /* Caller holds jd_lock. */
 static void free_token_locked(struct sv2_jd_token *t)
 {
@@ -525,16 +553,39 @@ static void free_token_locked(struct sv2_jd_token *t)
 		return;
 	HASH_DEL(jd_tokens, t);
 	jd_token_count--;
-	if (jd_token_snapshot_bytes >= t->snapshot_bytes)
-		jd_token_snapshot_bytes -= t->snapshot_bytes;
-	else
-		jd_token_snapshot_bytes = 0;
+	free_token_snapshot_locked(t);
 	dealloc(t->payout_script);
-	dealloc(t->coinbase_tx_prefix);
-	dealloc(t->coinbase_tx_suffix);
-	free_tx_snapshot(t->tx_raws, t->tx_lens, t->wtxid_count);
-	dealloc(t->wtxid_list);
 	dealloc(t);
+}
+
+/* Caller holds jd_lock. Return the snapshot displaced by one more declare. */
+static struct sv2_jd_token *snapshot_to_retire_locked(int64_t client_id)
+{
+	struct sv2_jd_token *t, *tmp, *oldest = NULL;
+	int count = 0;
+
+	HASH_ITER(hh, jd_tokens, t, tmp) {
+		if (t->client_id != client_id || !t->snapshot_order)
+			continue;
+		count++;
+		if (!oldest || t->snapshot_order < oldest->snapshot_order)
+			oldest = t;
+	}
+	return count >= SV2_JD_PUSH_TOKEN_CANDIDATES ? oldest : NULL;
+}
+
+/* Allocation reissues must not change reconstruction order. An identical
+ * redeclare, however, makes that retained snapshot the latest one again. */
+static void note_snapshot_locked(struct sv2_jd_token *tok)
+{
+	struct sv2_jd_token *t, *tmp;
+
+	HASH_ITER(hh, jd_tokens, t, tmp) {
+		if (t->client_id == tok->client_id)
+			t->latest_snapshot = false;
+	}
+	tok->snapshot_order = ++jd_snapshot_order;
+	tok->latest_snapshot = true;
 }
 
 static bool token_user_match(const struct sv2_jd_token *t, const char *user)
@@ -608,7 +659,7 @@ static void expire_old_tokens_locked(time_t now)
 		time_t ttl = t->declared ? SV2_JD_TOKEN_TTL_DECLARED_SECS
 					 : SV2_JD_TOKEN_TTL_UNDECLARED_SECS;
 
-		if (now - t->created > ttl) {
+		if (!t->latest_snapshot && now - t->created > ttl) {
 			expired++;
 			free_token_locked(t);
 		}
@@ -992,15 +1043,16 @@ static uint64_t token_snapshot_client_bytes_locked(int64_t client_id)
 }
 
 /* Caller holds jd_lock. */
-static bool token_snapshot_may_add_locked(int64_t client_id, uint64_t bytes)
+static bool token_snapshot_may_add_locked(int64_t client_id, uint64_t bytes,
+					  uint64_t retiring_bytes)
 {
 	uint64_t client_bytes;
 
 	if (bytes > SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_GLOBAL ||
-	    jd_token_snapshot_bytes >
+	    jd_token_snapshot_bytes - retiring_bytes >
 		SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_GLOBAL - bytes)
 		return false;
-	client_bytes = token_snapshot_client_bytes_locked(client_id);
+	client_bytes = token_snapshot_client_bytes_locked(client_id) - retiring_bytes;
 	if (bytes > SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_CLIENT ||
 	    client_bytes > SV2_JD_MAX_TOKEN_SNAPSHOT_BYTES_CLIENT - bytes)
 		return false;
@@ -1231,7 +1283,7 @@ static void token_fill_unique_locked(struct sv2_jd_token *tok)
 static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 				       uint8_t enonce_used)
 {
-	struct sv2_jd_token *parent, *tok;
+	struct sv2_jd_token *parent, *tok, *retire;
 	uint64_t snapshot_bytes;
 
 	expire_old_tokens_locked(time(NULL));
@@ -1242,7 +1294,7 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	 * reconstruction snapshot needs no new generation. The parent's enonce
 	 * length is the value that actually passed checkBlock; a later skip-check
 	 * derivation need not reproduce it to reuse the same material. */
-	if (parent->declared && parent->version == pend->version &&
+	if (parent->snapshot_order && parent->version == pend->version &&
 	    parent->coinbase_tx_prefix_len == pend->coinbase_tx_prefix_len &&
 	    parent->coinbase_tx_suffix_len == pend->coinbase_tx_suffix_len &&
 	    parent->wtxid_count == pend->wtxid_count &&
@@ -1256,6 +1308,7 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	     !memcmp(parent->wtxid_list, pend->wtxid_list,
 		     (size_t)parent->wtxid_count * 32))) {
 		parent->created = time(NULL);
+		note_snapshot_locked(parent);
 		LOGDEBUG("SV2 JD identical redeclare reused token client %"PRId64,
 			 pend->client_id);
 		return 0;
@@ -1267,7 +1320,10 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	if (!pending_rebuild_size_ok(pend, enonce_used))
 		return 3;
 	snapshot_bytes = pending_snapshot_bytes(pend);
-	if (!token_snapshot_may_add_locked(pend->client_id, snapshot_bytes)) {
+	retire = snapshot_to_retire_locked(pend->client_id);
+	/* Account for replacement without dropping history on a failed declare. */
+	if (!token_snapshot_may_add_locked(pend->client_id, snapshot_bytes,
+					  retire ? retire->snapshot_bytes : 0)) {
 		LOGNOTICE("SV2 JD declare snapshot budget full client %"PRId64
 			  " add=%"PRIu64" client=%"PRIu64" global=%"PRIu64,
 			  pend->client_id, snapshot_bytes,
@@ -1277,6 +1333,9 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	}
 	if (!parent->declared) {
 		token_steal_declare_locked(parent, pend, enonce_used, snapshot_bytes);
+		note_snapshot_locked(parent);
+		if (retire)
+			free_token_snapshot_locked(retire);
 		return 0;
 	}
 
@@ -1304,6 +1363,9 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	token_steal_declare_locked(tok, pend, enonce_used, snapshot_bytes);
 	HASH_ADD(hh, jd_tokens, token, SV2_JD_TOKEN_BYTES, tok);
 	jd_token_count++;
+	note_snapshot_locked(tok);
+	if (retire)
+		free_token_snapshot_locked(retire);
 	pend->token_len = tok->token_len;
 	memcpy(pend->token, tok->token, tok->token_len);
 	LOGINFO("SV2 JD declare minted new token client %"PRId64" (prior declared)",
@@ -2912,15 +2974,15 @@ static uint8_t *handle_push_solution(struct sv2_jd_client *c, const uint8_t *pay
 		if (tok->client_id != c->client_id || !tok->declared ||
 		    !tok->coinbase_tx_prefix)
 			continue;
-		/* Insert sorted by created descending (most recent first). */
+		/* Allocation timestamps can change on reissue; use declaration order. */
 		if (ncands < SV2_JD_PUSH_TOKEN_CANDIDATES) {
 			cands[ncands++] = tok;
-		} else if (tok->created > cands[ncands - 1]->created) {
+		} else if (tok->snapshot_order > cands[ncands - 1]->snapshot_order) {
 			cands[ncands - 1] = tok;
 		} else
 			continue;
 		for (i = ncands - 1; i > 0; i--) {
-			if (cands[i]->created <= cands[i - 1]->created)
+			if (cands[i]->snapshot_order <= cands[i - 1]->snapshot_order)
 				break;
 			tok = cands[i];
 			cands[i] = cands[i - 1];

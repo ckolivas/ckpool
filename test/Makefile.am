@@ -20,9 +20,15 @@ validate_address_CPPFLAGS = $(AM_CPPFLAGS)
 if HAVE_SV2
 AM_CPPFLAGS += @SV2_CFLAGS@
 check_PROGRAMS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit \
-	sv2_idle sv2_tx sv2_cb sv2_bridge sv2_groups
+	sv2_idle sv2_tx sv2_cb sv2_bridge sv2_groups sv2_jd_retention
 TESTS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit sv2_idle \
-	sv2_tx sv2_cb sv2_bridge sv2_groups
+	sv2_tx sv2_cb sv2_bridge sv2_groups sv2_jd_retention
+# Include JDS internals to check retained snapshots without node/IPC workers.
+sv2_jd_retention_SOURCES = sv2_jd_retention.c
+sv2_jd_retention_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/ipc/mining
+sv2_jd_retention_CFLAGS = $(AM_CFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections
+sv2_jd_retention_LDFLAGS = -Wl,--gc-sections
+sv2_jd_retention_LDADD = $(top_srcdir)/src/libckpool.a @SV2_LIBS@
 sv2_groups_SOURCES = sv2_groups.c $(top_srcdir)/src/sv2_strat.c
 sv2_groups_CPPFLAGS = $(AM_CPPFLAGS)
 # Codec is in libckpool.a — do not list src/sv2_codec.c here (same object
