@@ -55,7 +55,7 @@ void stratifier_sv2_close_session(int64_t instance_id);
  * For extended, pass hex of client extranonce (length = enonce2varlen*2). */
 bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 				 uint32_t ntime, uint32_t nonce, uint32_t version,
-				 const char *nonce2hex,
+				 const char *nonce2hex, double job_diff,
 				 char *errbuf, size_t errbufsz, double *sdiff_out);
 
 /* Compute merkle root (header byte order) for instance's enonce1 on current wb. */
@@ -75,7 +75,7 @@ bool stratifier_sv2_tip_for_jd(uint32_t *version_out, uint32_t *ntime_out,
  * wb_id is used for duplicate-share tracking (0 = current tip).
  * If network_diff_met is non-NULL, set when sdiff meets network difficulty. */
 bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
-				  const unsigned char hash[32], double sdiff,
+				  const unsigned char hash[32], double sdiff, double job_diff,
 				  char *errbuf, size_t errbufsz,
 				  bool *network_diff_met);
 

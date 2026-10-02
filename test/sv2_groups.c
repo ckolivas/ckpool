@@ -18,6 +18,7 @@
 #include "sv2_jd.h"
 #include "sv2_strat.h"
 #include "sv2_work.h"
+#include "../src/sv2_strat.c"
 
 ckpool_t ckpool;
 
@@ -31,6 +32,9 @@ static struct opened_channel opened;
 static unsigned int success_count, sessions;
 static int64_t expected_client;
 static uint32_t expected_request;
+static void *queued_share;
+static double accounted_diff;
+static uint64_t acknowledged_diff;
 
 static void require(bool condition, const char *message)
 {
@@ -54,6 +58,14 @@ void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen
 
 	require(client_id == expected_client, "reply sent to wrong connection");
 	require(sv2_decode_header(plain, plainlen, &frame), "reply header");
+	if (frame.msg_type == SV2_MSG_SUBMIT_SHARES_SUCCESS) {
+		struct sv2_submit_shares_success ack;
+
+		require(sv2_decode_submit_shares_success(p, end - p, &ack), "decode share ack");
+		acknowledged_diff += ack.new_shares_sum;
+		free(plain);
+		return;
+	}
 	if (frame.msg_type == SV2_MSG_SET_TARGET) {
 		free(plain);
 		return;
@@ -181,6 +193,49 @@ static void check_connection(int64_t client_id, bool extended_first)
 	}
 }
 
+/* Submit an old job after two retargets; both the worker and wire ACK must
+ * retain the job's difficulty for standard and extended channels. */
+static void check_job_targets(bool extended)
+{
+	struct sv2_channel *ch;
+	struct sv2_submit_shares_extended sub = {0};
+	uint8_t payload[128];
+	size_t len;
+
+	ckpool.nonce1length = 4;
+	ckpool.nonce2length = 8;
+	check_connection(1, extended);
+	ch = channel_find_ref(1, SV2_FIRST_CHANNEL_ID);
+	sv2_strat_set_instance_diff(ch->instance_id, 100);
+	mutex_lock(&sv2_lock);
+	channel_note_job_locked(ch, 1, 1000, false, NULL, 0x20000000, false);
+	mutex_unlock(&sv2_lock);
+	sv2_strat_set_instance_diff(ch->instance_id, 400);
+	mutex_lock(&sv2_lock);
+	channel_note_job_locked(ch, 2, 1001, false, NULL, 0x20000000, false);
+	mutex_unlock(&sv2_lock);
+
+	sub.base.channel_id = ch->channel_id;
+	sub.base.sequence_number = 1;
+	sub.base.job_id = 1;
+	sub.base.version = 0x20000000;
+	sub.extranonce_len = ch->extranonce_size;
+	require(sv2_encode_submit_shares_extended(payload, sizeof(payload), &len, &sub), "encode share");
+	send_request(extended ? SV2_MSG_SUBMIT_SHARES_EXTENDED : SV2_MSG_SUBMIT_SHARES_STANDARD,
+		     payload, extended ? len : 24, false);
+	require(queued_share != NULL, "share queued");
+	sv2_strat_set_instance_diff(ch->instance_id, 50);
+	accounted_diff = 0;
+	acknowledged_diff = 0;
+	sv2_strat_process_share_job(queued_share);
+	queued_share = NULL;
+	flush_success_batch(ch);
+	require(accounted_diff == 100 && acknowledged_diff == 100,
+		"old active job keeps its target across retargets and queue delay");
+	channel_put(ch);
+	sv2_strat_drop_all();
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -194,6 +249,8 @@ int main(void)
 		sv2_strat_drop_all();
 		require(!sessions, "all sessions closed");
 	}
+	check_job_targets(false);
+	check_job_targets(true);
 	puts("sv2_groups: all OK");
 	return 0;
 }
@@ -201,12 +258,14 @@ int main(void)
 /* Unrelated share/JD entry points must not be reached by channel opens. */
 bool stratifier_queue_share_work(bool __maybe_unused is_sv2, void __maybe_unused *payload)
 {
-	require(false, "unexpected stratifier_queue_share_work");
-	return 0;
+	require(!queued_share, "one queued test share");
+	queued_share = payload;
+	return true;
 }
 
 bool stratifier_sv2_account_share(int64_t __maybe_unused instance_id, int64_t __maybe_unused workbase_id,
 				  const unsigned char __maybe_unused hash[32], double __maybe_unused sdiff,
+				  double __maybe_unused job_diff,
 				  char __maybe_unused *errbuf, size_t __maybe_unused errbufsz,
 				  bool __maybe_unused *network_diff_met)
 {
@@ -228,11 +287,11 @@ bool stratifier_sv2_submit_block_bin(const unsigned char __maybe_unused *block, 
 
 bool stratifier_sv2_submit_share(int64_t __maybe_unused instance_id, int64_t __maybe_unused workbase_id,
 				 uint32_t __maybe_unused ntime, uint32_t __maybe_unused nonce, uint32_t __maybe_unused version,
-				 const char __maybe_unused *nonce2hex,
+				 const char __maybe_unused *nonce2hex, double __maybe_unused job_diff,
 				 char __maybe_unused *errbuf, size_t __maybe_unused errbufsz, double __maybe_unused *sdiff_out)
 {
-	require(false, "unexpected stratifier_sv2_submit_share");
-	return 0;
+	accounted_diff = job_diff;
+	return true;
 }
 
 bool stratifier_sv2_tip_for_jd(uint32_t __maybe_unused *version_out, uint32_t __maybe_unused *ntime_out,

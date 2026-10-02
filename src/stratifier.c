@@ -3542,6 +3542,8 @@ static void update_notify(const char *cmd)
 	wb->enonce1varlen = proxy->enonce1varlen;
 	wb->enonce2varlen = proxy->enonce2varlen;
 	wb->diff = proxy->diff;
+	/* SV2 targets belong to jobs; proxy state may already have advanced. */
+	yyjson_obj_get_double(&wb->diff, val, "sv2_job_diff");
 	ck_runlock(&dsdata->workbase_lock);
 
 	add_base(dsdata, wb, &new_block);
@@ -7249,7 +7251,7 @@ static void check_best_diff(sdata_t *sdata, user_instance_t *user, worker_instan
 
 bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 				 uint32_t ntime, uint32_t nonce, uint32_t version,
-				 const char *nonce2hex_in,
+				 const char *nonce2hex_in, double job_diff,
 				 char *errbuf, size_t errbufsz, double *sdiff_out)
 {
 	sdata_t *sdata = ckpool.sdata;
@@ -7337,11 +7339,8 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 		return false;
 	}
 
-	/* Accept min(new,old) until workbase advances past retarget (SV1 parity). */
-	diff = client->diff;
-	if (workbase_id && workbase_id < client->diff_change_job_id &&
-	    client->old_diff > 0)
-		diff = MIN(diff, (double)client->old_diff);
+	/* SV2 active jobs retain their advertised difficulty across retargets. */
+	diff = job_diff;
 	if (sdiff >= diff) {
 		if (new_share(sdata, hash, workbase_id)) {
 			result = true;
@@ -7402,7 +7401,7 @@ double stratifier_sv2_network_diff(void)
 }
 
 bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
-				  const unsigned char hash[32], double sdiff,
+				  const unsigned char hash[32], double sdiff, double job_diff,
 				  char *errbuf, size_t errbufsz,
 				  bool *network_diff_met)
 {
@@ -7439,9 +7438,7 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 			wb_id = sdata->current_workbase->id;
 		ck_runlock(&sdata->workbase_lock);
 	}
-	diff = client->diff;
-	if (wb_id && wb_id < client->diff_change_job_id && client->old_diff > 0)
-		diff = MIN(diff, (double)client->old_diff);
+	diff = job_diff;
 	if (sdiff >= diff) {
 		if (new_share(sdata, hash, wb_id)) {
 			result = true;

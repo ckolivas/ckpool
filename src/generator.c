@@ -61,6 +61,7 @@ struct notify_instance {
 	 * is rotated by the receive thread under no lock at all. A share arrives
 	 * on a different thread, so it must not chase ring memory.
 	 */
+	double sv2_diff;	/* upstream difficulty of this specific job */
 	bool sv2_custom;
 	struct sv2_jdc_template *sv2_tmpl;	/* reference held */
 	/* Declared-form coinbase either side of the extranonce hole, for a local
@@ -1692,6 +1693,10 @@ static void send_notify(proxy_instance_t *proxi, notify_instance_t *ni)
 			     "merklehash", merkle_arr, "bbversion", ni->bbversion,
 			     "nbit", ni->nbit, "ntime", ni->ntime,
 			     "clean", ni->clean);
+#ifdef HAVE_SV2
+	if (ni->sv2_diff > 0)
+		yyjson_mut_obj_add_real(doc, root, "sv2_job_diff", ni->sv2_diff);
+#endif
 	yyjson_mut_doc_set_root(doc, root);
 
 	msg = yyjson_mut_write(doc, 0, NULL);
@@ -2492,6 +2497,7 @@ static void proxy_backoff(proxy_instance_t *proxy)
 /* One recent upstream job (extended). Kept so SetNewPrevHash can activate a
  * future job and so share submits can map our notify id back to job_id. */
 struct sv2_proxy_job {
+	double diff;
 	bool valid;
 	bool future;			/* min_ntime absent: awaiting SetNewPrevHash */
 	uint32_t job_id;		/* upstream U32 job id */
@@ -2532,6 +2538,7 @@ struct sv2_pending_share {
 };
 
 struct sv2_proxy {
+	double target_diff;	/* target for future jobs, not active work */
 	sv2_noise_session_t *noise;
 	uint32_t channel_id;
 	bool channel_open;
@@ -3022,6 +3029,7 @@ static bool sv2_proxy_open(proxy_instance_t *proxi, connsock_t *cs)
 			proxi->diff = diff_from_target(ok.target);
 			if (proxi->diff < 1)
 				proxi->diff = 1;
+			sp->target_diff = proxi->diff;
 			LOGNOTICE("SV2 proxy %d channel %u diff=%.1f",
 				  proxi->id, sp->channel_id, proxi->diff);
 			return true;
@@ -3314,6 +3322,17 @@ static void sv2_proxy_work_src(proxy_instance_t *proxi, enum sv2_work_src src,
 	}
 }
 
+/* Freeze the target when future work becomes active. Re-emitting an active
+ * job (for example after SetExtranoncePrefix) must not retarget it. */
+static void sv2_proxy_activate_job(struct sv2_proxy *sp, struct sv2_proxy_job *job)
+{
+	if (!job->future)
+		return;
+	job->diff = sp->target_diff;
+	job->min_ntime = sp->snph_min_ntime;
+	job->future = false;
+}
+
 /* Translate a stored SV2 job + current prevhash context into an SV1-shaped
  * notify_instance and hand it to the stratifier via send_notify. clean=true on
  * a real tip change (SetNewPrevHash), false for a same-tip immediate job. */
@@ -3351,6 +3370,9 @@ static void sv2_proxy_send_job(proxy_instance_t *proxi, struct sv2_proxy_job *jo
 	ni->jobid = yyjson_mut_doc_new(&ckyyalc);
 	yyjson_mut_doc_set_root(ni->jobid, yyjson_mut_uint(ni->jobid, job->job_id));
 
+	sv2_proxy_activate_job(sp, job);
+	ni->sv2_diff = job->diff;
+	proxi->diff = job->diff;
 	ni->coinb1len = job->coinb1len;
 	ni->coinbase1 = ckalloc(job->coinb1len * 2 + 1);
 	__bin2hex(ni->coinbase1, job->coinb1, job->coinb1len);
@@ -3551,6 +3573,7 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	uint8_t nonce2bin[32];
 	uint8_t full_len = 0, ep[SV2_MAX_B0_32], eplen = 0;
 	bool custom = false;
+	double job_diff = 0;
 	int64_t jobid = 0;
 	uint8_t pbuf[128];
 	size_t plen = 0;
@@ -3575,6 +3598,7 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	if (ni) {
 		upstream_job = (uint32_t)yyjson_mut_get_uint(yyjson_mut_doc_get_root(ni->jobid));
 		sscanf(ni->bbversion, "%x", &base_version);
+		job_diff = ni->sv2_diff;
 		custom = ni->sv2_custom;
 		eplen = ni->sv2_en_prefix_len;
 		memcpy(ep, ni->sv2_en_prefix, eplen);
@@ -3641,7 +3665,7 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	/* Track for accounting when the batched Success / Error arrives. */
 	ps = ckzalloc(sizeof(*ps));
 	ps->seq = seq;
-	ps->diff = proxi->diff;
+	ps->diff = job_diff;
 	ps->client_id = client_id;
 	mutex_lock(&sp->send_lock);
 	HASH_ADD(hh, sp->pending, seq, sizeof(uint32_t), ps);
@@ -3694,6 +3718,7 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 			break;
 		}
 		job = sv2_proxy_job_slot(sp, j.job_id);
+		job->diff = sp->target_diff;
 		job->future = !j.min_ntime_present;
 		job->min_ntime = j.min_ntime;
 		job->version = j.version;
@@ -3867,6 +3892,7 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		/* Custom and pool job ids come from one server-side counter, so
 		 * they share the ring without colliding. */
 		job = sv2_proxy_job_slot(sp, ok.job_id);
+		stage.diff = sp->target_diff;
 		stage.job_id = ok.job_id;
 		stage.valid = true;
 		*job = stage;
@@ -3913,9 +3939,8 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		diff = diff_from_target(t.maximum_target);
 		if (diff < 1)
 			diff = 1;
-		proxi->diff = diff;
+		sp->target_diff = diff;
 		LOGNOTICE("SV2 proxy %d SetTarget diff %.1f", proxi->id, diff);
-		send_diff(proxi);
 		break;
 	}
 	case SV2_MSG_SET_EXTRANONCE_PREFIX: {
