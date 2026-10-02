@@ -436,6 +436,12 @@ static void test_assemble_limits(void)
 	expect(!sv2_cb_assemble(out, sizeof(out), 2, 0xffffffff, 0, big, 200,
 				NULL, 0, big, 100, outputs, (uint16_t)olen),
 	       "assemble refuses a scriptSig over 255 bytes");
+	expect(sv2_cb_assemble(out, sizeof(out), 2, 0xffffffff, 0, big, 88,
+			      NULL, 0, big, 12, outputs, (uint16_t)olen),
+	       "assemble accepts a 100-byte scriptSig");
+	expect(!sv2_cb_assemble(out, sizeof(out), 2, 0xffffffff, 0, big, 89,
+			       NULL, 0, big, 12, outputs, (uint16_t)olen),
+	       "assemble rejects a 101-byte scriptSig");
 	/* Empty extranonce is legal for the assembler itself (the JDS calls it
 	 * with a zero-length one when probing). */
 	expect(sv2_cb_assemble(out, sizeof(out), 2, 0xffffffff, 0, ssig_prefix,

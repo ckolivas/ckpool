@@ -18,6 +18,7 @@
 
 void generator_add_send(yyjson_mut_doc *doc);
 struct genwork *generator_getbase(void);
+uint32_t generator_get_block_mintime(const char *hash);
 int generator_getbest(char *hash);
 bool generator_alive(void);
 bool generator_checkaddr(const char *addr, bool *script, bool *segwit);

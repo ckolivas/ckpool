@@ -1025,6 +1025,14 @@ out:
 	return ret;
 }
 
+uint32_t generator_get_block_mintime(const char *hash)
+{
+	gdata_t *gdata = ckpool.gdata;
+	server_instance_t *si = gdata ? gdata->current_si : NULL;
+
+	return si ? get_block_mintime(&si->cs, hash) : 0;
+}
+
 char *generator_get_txn(const char *hash)
 {
 	gdata_t *gdata = ckpool.gdata;

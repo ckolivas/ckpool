@@ -239,6 +239,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	gbt->version = version;
 
 	gbt->curtime = curtime;
+	gbt->mintime = yyjson_get_uint(yyjson_obj_get(res_val, "mintime"));
 
 	snprintf(gbt->ntime, 9, "%08x", curtime);
 	yyjson_mut_obj_add_str(mut_doc, mut_root, "ntime", gbt->ntime);
@@ -526,4 +527,26 @@ out_free:
 	yyjson_doc_free(doc);
 out:
 	return ret;
+}
+
+/* Query a specific parent, so a concurrent tip change cannot mix contexts. */
+uint32_t get_block_mintime(connsock_t *cs, const char *hash)
+{
+	yyjson_doc *doc;
+	yyjson_val *value;
+	char request[160];
+	uint64_t mtp = 0;
+
+	if (strlen(hash) != 64 || !validhex(hash))
+		return 0;
+	snprintf(request, sizeof(request),
+		 "{\"method\":\"getblockheader\",\"params\":[\"%s\",true]}\n", hash);
+	doc = yyjson_rpc_response(cs, request);
+	if (!doc)
+		return 0;
+	value = yyjson_obj_get(yyjson_obj_get(yyjson_doc_get_root(doc), "result"), "mediantime");
+	if (yyjson_is_uint(value))
+		mtp = yyjson_get_uint(value);
+	yyjson_doc_free(doc);
+	return mtp && mtp < UINT32_MAX ? (uint32_t)mtp + 1 : 0;
 }

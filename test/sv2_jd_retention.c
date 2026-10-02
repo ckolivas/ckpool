@@ -82,6 +82,50 @@ static void check_accounting(int64_t client, int expected)
 	assert(count == expected && latest == (expected != 0));
 }
 
+static void check_custom_binding(void)
+{
+	struct sv2_jd_token *tok = allocate_token(99);
+	struct sv2_jd_pending p = {0};
+	struct sv2_set_custom_mining_job req = {0};
+	struct sv2_cb_spec cb = {0};
+	uint8_t outputs[11] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x51};
+
+	p.client_id = 99;
+	p.token_len = tok->token_len;
+	memcpy(p.token, tok->token, tok->token_len);
+	p.version = req.version = 0x20000000;
+	req.coinbase_prefix_len = ser_number(req.coinbase_prefix, 700000);
+	req.coinbase_tx_version = cb.version = 2;
+	req.coinbase_tx_input_nSequence = cb.nsequence = UINT32_MAX;
+	req.coinbase_tx_outputs = outputs;
+	req.coinbase_tx_outputs_len = sizeof(outputs);
+	cb.ssig_prefix = req.coinbase_prefix;
+	cb.ssig_prefix_len = req.coinbase_prefix_len;
+	cb.hole_len = 8;
+	cb.outputs = outputs;
+	cb.outputs_len = sizeof(outputs);
+	assert(sv2_cb_declare_parts(&cb, &p.coinbase_tx_prefix, &p.coinbase_tx_prefix_len,
+		&p.coinbase_tx_suffix, &p.coinbase_tx_suffix_len));
+	assert(token_accept_declare_locked(&p, 8) == 0);
+	req.mining_job_token_len = p.token_len;
+	memcpy(req.mining_job_token, p.token, p.token_len);
+	assert(sv2_jd_custom_matches(&req, 8));
+	assert(!sv2_jd_custom_matches(&req, 12));
+	outputs[1]++;
+	assert(!sv2_jd_custom_matches(&req, 8));
+	outputs[1]--;
+	req.merkle_count = 1;
+	assert(!sv2_jd_custom_matches(&req, 8));
+	req.merkle_count = 0;
+	ckpool.version_mask = 0x1fffe000;
+	req.version ^= 0x2000;
+	assert(sv2_jd_custom_matches(&req, 8));
+	req.version ^= 1;
+	assert(!sv2_jd_custom_matches(&req, 8));
+	free_jd_pending_fields(&p);
+	sv2_jd_drop_client(99);
+}
+
 int main(void)
 {
 	struct sv2_jd_token *first, *latest, *other, *t, *tmp;
@@ -174,6 +218,7 @@ int main(void)
 	check_accounting(2, 1);
 	sv2_jd_drop_client(2);
 	assert(!jd_tokens && !jd_token_count && !jd_token_snapshot_bytes);
+	check_custom_binding();
 	puts("sv2_jd_retention: all OK");
 	return 0;
 }

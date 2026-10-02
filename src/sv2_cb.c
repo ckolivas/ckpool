@@ -25,7 +25,7 @@ size_t sv2_cb_assemble(uint8_t *out, size_t outsz,
 	size_t ssig_len = (size_t)ssig_prefix_len + en1_len + extranonce_len;
 	size_t need;
 
-	if (ssig_len > 255)
+	if (ssig_len > SV2_CB_MAX_SCRIPTSIG)
 		return 0;
 	need = 4 + 1 + 36 + 1 + ssig_len + 4 + outputs_len + 4;
 	if (need > outsz)

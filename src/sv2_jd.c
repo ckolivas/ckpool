@@ -201,6 +201,8 @@ struct sv2_jd_token {
 	/* All heap material retained by this declaration (budget accounting). */
 	uint64_t snapshot_bytes;
 	uint64_t snapshot_order; /* declaration order, not allocation time */
+	bool have_custom_commitment;
+	uint8_t coinbase_zero_txid[32], merkle_zero_root[32];
 	bool latest_snapshot;
 	uint8_t enonce_len;	/* enonce size that passed checkBlock */
 };
@@ -1231,6 +1233,35 @@ static uint8_t *error_declare(uint32_t request_id, const char *code, size_t *rep
 	return reply_frame(SV2_MSG_DECLARE_MINING_JOB_ERROR, pbuf, plen, replylen);
 }
 
+/* Commit to the declared legacy coinbase and transaction tree, substituting
+ * zeroes for the channel extranonce. Witness data stays in the saved block. */
+static void token_commit_custom(struct sv2_jd_token *tok)
+{
+	uint8_t *cb, (*txids)[32];
+	size_t len = tok->coinbase_tx_prefix_len + tok->enonce_len + tok->coinbase_tx_suffix_len;
+	unsigned int i;
+
+	tok->have_custom_commitment = false;
+	cb = ckzalloc(len ? len : 1);
+	memcpy(cb, tok->coinbase_tx_prefix, tok->coinbase_tx_prefix_len);
+	memcpy(cb + tok->coinbase_tx_prefix_len + tok->enonce_len,
+	       tok->coinbase_tx_suffix, tok->coinbase_tx_suffix_len);
+	if (!sv2_bitcoin_txid(cb, len, tok->coinbase_zero_txid)) {
+		free(cb);
+		return;
+	}
+	free(cb);
+	txids = ckzalloc(((size_t)tok->wtxid_count + 1) * 32);
+	for (i = 0; i < tok->wtxid_count; i++) {
+		if (!sv2_bitcoin_txid(tok->tx_raws[i], tok->tx_lens[i], txids[i + 1]))
+			goto out;
+	}
+	sv2_merkle_root_from_txids(txids, tok->wtxid_count + 1, tok->merkle_zero_root);
+	tok->have_custom_commitment = true;
+out:
+	free(txids);
+}
+
 /*
  * Steal pending rebuild material onto tok. tok must not already hold
  * coinbase/tx pointers (fresh or previously undeclared).
@@ -1252,6 +1283,7 @@ static void token_steal_declare_locked(struct sv2_jd_token *tok,
 	tok->wtxid_list = pend->wtxid_list;
 	tok->tx_raws = pend->tx_raws;
 	tok->tx_lens = pend->tx_lens;
+	token_commit_custom(tok);
 	tok->snapshot_bytes = snapshot_bytes;
 	jd_token_snapshot_bytes += snapshot_bytes;
 	pend->coinbase_tx_prefix = NULL;
@@ -3270,6 +3302,40 @@ uint8_t *sv2_jd_handle_frame(int64_t client_id, const uint8_t *frame,
 	}
 	client_put(c);
 	return ret;
+}
+
+/* The header's time and tip are checked by the mining server. Match the
+ * remaining job material to the immutable declaration, allowing BIP320 bits. */
+bool sv2_jd_custom_matches(const struct sv2_set_custom_mining_job *req, uint8_t hole)
+{
+	struct sv2_jd_token *tok;
+	uint8_t zeros[32] = {0}, cbhash[32], root[32], *cb;
+	size_t cap = (size_t)req->coinbase_tx_outputs_len + 151, len;
+	bool ok = false;
+
+	if (!hole || hole > sizeof(zeros))
+		return false;
+	cb = ckalloc(cap);
+	len = sv2_cb_assemble(cb, cap, req->coinbase_tx_version,
+			      req->coinbase_tx_input_nSequence, req->coinbase_tx_locktime,
+			      req->coinbase_prefix, req->coinbase_prefix_len,
+			      zeros, hole, NULL, 0, req->coinbase_tx_outputs,
+			      req->coinbase_tx_outputs_len);
+	if (!len || !sv2_bitcoin_txid(cb, len, cbhash))
+		goto out;
+	sv2_merkle_root_from_path(zeros, req->merkle_path, req->merkle_count, root);
+	ensure_lock();
+	mutex_lock(&jd_lock);
+	tok = find_token_locked(req->mining_job_token, req->mining_job_token_len);
+	if (tok && tok->declared && tok->have_custom_commitment && tok->enonce_len == hole &&
+	    !((req->version ^ tok->version) & ~ckpool.version_mask) &&
+	    !memcmp(cbhash, tok->coinbase_zero_txid, 32) &&
+	    !memcmp(root, tok->merkle_zero_root, 32))
+		ok = true;
+	mutex_unlock(&jd_lock);
+out:
+	free(cb);
+	return ok;
 }
 
 #endif /* HAVE_SV2 */

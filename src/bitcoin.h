@@ -22,6 +22,7 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 yyjson_doc *validate_txn(connsock_t *cs, const char *txn);
 bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt);
 void clear_gbtbase(gbtbase_t *gbt);
+uint32_t get_block_mintime(connsock_t *cs, const char *hash);
 int get_blockcount(connsock_t *cs);
 bool get_blockhash(connsock_t *cs, int height, char *hash);
 bool get_bestblockhash(connsock_t *cs, char *hash);

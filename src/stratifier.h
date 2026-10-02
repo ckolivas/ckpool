@@ -39,6 +39,7 @@ struct genwork {
 	double network_diff;
 	uint32_t version;
 	uint32_t curtime;
+	uint32_t mintime;	/* candidate minimum: previous block MTP + 1 */
 	char prevhash[68];
 	char ntime[12];
 	uint32_t ntime32;

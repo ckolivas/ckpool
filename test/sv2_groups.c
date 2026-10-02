@@ -35,6 +35,8 @@ static uint32_t expected_request;
 static void *queued_share;
 static double accounted_diff;
 static uint64_t acknowledged_diff;
+static bool custom_test;
+static unsigned int custom_successes;
 
 static void require(bool condition, const char *message)
 {
@@ -58,6 +60,11 @@ void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen
 
 	require(client_id == expected_client, "reply sent to wrong connection");
 	require(sv2_decode_header(plain, plainlen, &frame), "reply header");
+	if (frame.msg_type == SV2_MSG_SET_CUSTOM_MINING_JOB_SUCCESS) {
+		custom_successes++;
+		free(plain);
+		return;
+	}
 	if (frame.msg_type == SV2_MSG_SUBMIT_SHARES_SUCCESS) {
 		struct sv2_submit_shares_success ack;
 
@@ -126,7 +133,7 @@ bool stratifier_sv2_merkle_root(int64_t __maybe_unused instance_id,
 
 bool sv2_jd_enabled(void)
 {
-	return false;
+	return custom_test;
 }
 
 static void send_request(uint8_t type, const uint8_t *payload, size_t len, bool setup)
@@ -236,6 +243,81 @@ static void check_job_targets(bool extended)
 	sv2_strat_drop_all();
 }
 
+static void check_custom_request(struct sv2_set_custom_mining_job *req, bool accept)
+{
+	uint8_t payload[65536], *frame, *reply;
+	size_t len, flen, rlen;
+	unsigned int before = custom_successes;
+
+	require(sv2_encode_set_custom_mining_job(payload, sizeof(payload), &len, req), "encode custom");
+	require(sv2_build_frame(SV2_CHANNEL_MSG_BIT, SV2_MSG_SET_CUSTOM_MINING_JOB,
+		payload, len, &frame, &flen), "frame custom");
+	reply = sv2_strat_handle_frame(expected_client, frame, flen, &rlen);
+	if (accept)
+		require(!reply && custom_successes == before + 1, "custom accepted");
+	else
+		require(reply && reply[2] == SV2_MSG_SET_CUSTOM_MINING_JOB_ERROR &&
+			custom_successes == before, "custom rejected");
+	free(frame);
+	free(reply);
+}
+
+static void check_custom_validation(void)
+{
+	struct sv2_set_custom_mining_job req = {0};
+	struct sv2_channel *ch;
+	struct sv2_client *client;
+	uint8_t outputs[3003] = {0}, zeros[12] = {0}, hash[32];
+	char error[64];
+	double diff;
+	unsigned int i;
+
+	custom_test = true;
+	ckpool.nonce1length = 4;
+	ckpool.nonce2length = 8;
+	check_connection(1, true);
+	client = client_get(1, false);
+	client->flags |= SV2_FLAG_REQUIRES_WORK_SELECTION;
+	client_put(client);
+	ch = channel_find_ref(1, SV2_FIRST_CHANNEL_ID);
+	req.channel_id = ch->channel_id;
+	req.mining_job_token_len = 1;
+	req.version = 0x20000000;
+	memset(req.prev_hash, 0x12, 32);
+	req.nbits = 0x17021ec5;
+	req.min_ntime = time(NULL) - 10;
+	req.coinbase_prefix_len = ser_number(req.coinbase_prefix, 700000);
+	req.coinbase_tx_version = 2;
+	req.coinbase_tx_input_nSequence = UINT32_MAX;
+	outputs[0] = 0xfd; outputs[1] = 0x2c; outputs[2] = 1;
+	for (i = 0; i < 300; i++) {
+		outputs[3 + i * 10 + 8] = 1;
+		outputs[3 + i * 10 + 9] = 0x51;
+	}
+	req.coinbase_tx_outputs = outputs;
+	req.coinbase_tx_outputs_len = sizeof(outputs);
+	check_custom_request(&req, true);
+	require(validate_custom_share(ch->custom, zeros, 4, zeros, 8,
+		req.min_ntime, 0, req.version, hash, &diff, error, sizeof(error)),
+		"accepted large coinbase hashes successfully");
+	req.min_ntime = 0;
+	check_custom_request(&req, false);
+	req.min_ntime = time(NULL) + 7201;
+	check_custom_request(&req, false);
+	req.min_ntime = time(NULL);
+	req.nbits++;
+	check_custom_request(&req, false);
+	req.nbits--;
+	req.coinbase_prefix[1] ^= 1;
+	check_custom_request(&req, false);
+	req.coinbase_prefix[1] ^= 1;
+	req.coinbase_prefix_len = 89;
+	check_custom_request(&req, false);
+	channel_put(ch);
+	sv2_strat_drop_all();
+	custom_test = false;
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -251,6 +333,7 @@ int main(void)
 	}
 	check_job_targets(false);
 	check_job_targets(true);
+	check_custom_validation();
 	puts("sv2_groups: all OK");
 	return 0;
 }
@@ -324,14 +407,30 @@ bool sv2_jd_rebuild_solved_block(const uint8_t __maybe_unused *token, uint8_t __
 
 bool sv2_jd_token_is_declared(const uint8_t __maybe_unused *token, uint8_t __maybe_unused token_len)
 {
-	require(false, "unexpected sv2_jd_token_is_declared");
-	return 0;
+	return custom_test;
 }
 
 bool sv2_jd_token_outputs_fund_payout(const uint8_t __maybe_unused *token, uint8_t __maybe_unused token_len,
 				      const uint8_t __maybe_unused *outputs, uint16_t __maybe_unused outputs_len)
 {
-	require(false, "unexpected sv2_jd_token_outputs_fund_payout");
-	return 0;
+	return custom_test;
 }
 
+
+bool stratifier_sv2_custom_tip(uint8_t __maybe_unused prev[32], uint32_t __maybe_unused *nbits,
+				uint32_t __maybe_unused *mintime, int __maybe_unused *height,
+				int64_t __maybe_unused *wb_id)
+{
+	memset(prev, 0x12, 32);
+	*nbits = 0x17021ec5;
+	*mintime = time(NULL) - 60;
+	*height = 700000;
+	*wb_id = 1000;
+	return custom_test;
+}
+
+bool sv2_jd_custom_matches(const struct sv2_set_custom_mining_job __maybe_unused *req,
+			  uint8_t __maybe_unused hole)
+{
+	return custom_test;
+}

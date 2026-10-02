@@ -70,6 +70,9 @@ bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 bool stratifier_sv2_tip_for_jd(uint32_t *version_out, uint32_t *ntime_out,
 			       uint32_t *nbits_out, uint8_t prevhash_header[32]);
 
+bool stratifier_sv2_custom_tip(uint8_t prev[32], uint32_t *nbits,
+				uint32_t *mintime, int *height, int64_t *wb_id);
+
 /* Account a share whose PoW hash was already validated by the caller (e.g.
  * custom-job path). hash is the double-SHA256 share hash; sdiff its difficulty.
  * wb_id is used for duplicate-share tracking (0 = current tip).

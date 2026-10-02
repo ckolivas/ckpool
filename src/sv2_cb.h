@@ -33,7 +33,7 @@
  *
  * outputs is the CompactSize-prefixed output list exactly as it travels on the
  * wire. Returns the number of bytes written, or 0 if it does not fit in outsz
- * or the scriptSig would exceed 255 bytes.
+ * or the scriptSig would exceed the 100-byte consensus limit.
  *
  * This is the txid preimage: no BIP141 marker/flag and no witness, which is
  * what a txid is defined over.

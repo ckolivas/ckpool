@@ -83,4 +83,7 @@ char *sv2_jd_stats_json(void);
  * not skipped for templates validated against a previous tip. */
 void sv2_jd_on_tip_change(void);
 
+struct sv2_set_custom_mining_job;
+bool sv2_jd_custom_matches(const struct sv2_set_custom_mining_job *req, uint8_t hole);
+
 #endif /* SV2_JD_H */

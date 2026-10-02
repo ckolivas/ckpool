@@ -1627,6 +1627,7 @@ static void gbt_witness_data(workbase_t *wb, yyjson_val *txn_array)
  * so the caller can fall back to GBT. */
 static workbase_t *build_ipc_workbase(void)
 {
+	sdata_t *sdata = ckpool.sdata;
 	unsigned char branch[MINING_MAX_MERKLES][32];
 	unsigned char header[80], rev[32], swap[32];
 	mining_block_template *tmpl = NULL;
@@ -1667,6 +1668,20 @@ static workbase_t *build_ipc_workbase(void)
 		rev[i] = header[4 + 31 - i];
 	swap_256(swap, rev);
 	__bin2hex(wb->prevhash, swap, 32);
+
+	/* IPC does not expose MTP. Cache the parent's RPC result on its workbase
+	 * instead of making node calls on the connector's receive thread. */
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase &&
+	    !strcmp(sdata->current_workbase->prevhash, wb->prevhash))
+		wb->mintime = sdata->current_workbase->mintime;
+	ck_runlock(&sdata->workbase_lock);
+	if (!wb->mintime) {
+		char parent[65];
+
+		__bin2hex(parent, rev, 32);
+		wb->mintime = generator_get_block_mintime(parent);
+	}
 
 	/* Coinbase-derived fields. */
 	wb->coinbasevalue = cb.block_reward_remaining;
@@ -7186,6 +7201,33 @@ bool stratifier_sv2_tip_for_jd(uint32_t *version_out, uint32_t *ntime_out,
 	*nbits_out = le32toh(w32[18]); /* offset 72 */
 	ck_runlock(&sdata->workbase_lock);
 	return true;
+}
+
+bool stratifier_sv2_custom_tip(uint8_t prev[32], uint32_t *nbits,
+				uint32_t *mintime, int *height, int64_t *wb_id)
+{
+	sdata_t *sdata = ckpool.sdata;
+	workbase_t *wb;
+	uint8_t wire[80];
+	uint32_t bits;
+	bool ok = false;
+
+	if (!sdata)
+		return false;
+	ck_rlock(&sdata->workbase_lock);
+	wb = sdata->current_workbase;
+	if (wb && wb->mintime) {
+		flip_80(wire, wb->headerbin);
+		memcpy(prev, wire + 4, 32);
+		memcpy(&bits, wire + 72, 4);
+		*nbits = le32toh(bits);
+		*mintime = wb->mintime;
+		*height = wb->height;
+		*wb_id = wb->id;
+		ok = true;
+	}
+	ck_runlock(&sdata->workbase_lock);
+	return ok;
 }
 
 bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],

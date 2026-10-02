@@ -1464,7 +1464,8 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	size_t plen = 0;
 	uint32_t job_id;
 	int64_t wb_id = 0;
-	uint32_t tip_ver, tip_ntime, tip_nbits;
+	uint32_t tip_mintime, tip_nbits;
+	int tip_height;
 	uint8_t tip_prev[32];
 	uint32_t err_ch = 0, err_req = 0;
 	int i;
@@ -1509,39 +1510,49 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 		goto err;
 	}
 
-	/* Tip must match declared prev_hash (stale custom rejected after tip) */
-	if (!stratifier_sv2_tip_for_jd(&tip_ver, &tip_ntime, &tip_nbits, tip_prev)) {
+	/* Obtain one coherent tip context, including the chain's MTP floor. */
+	if (!stratifier_sv2_custom_tip(tip_prev, &tip_nbits, &tip_mintime,
+				      &tip_height, &wb_id)) {
+		snprintf(ecode, sizeof(ecode), "validation-unavailable");
+		channel_put(ch);
+		goto err;
+	}
+	if (memcmp(req.prev_hash, tip_prev, 32)) {
 		snprintf(ecode, sizeof(ecode), "stale-prev-hash");
 		channel_put(ch);
 		goto err;
 	}
-	{
-		uint8_t req_rev[32];
-		int j;
-
-		for (j = 0; j < 32; j++)
-			req_rev[j] = req.prev_hash[31 - j];
-		if (memcmp(req.prev_hash, tip_prev, 32) != 0 &&
-		    memcmp(req_rev, tip_prev, 32) != 0) {
-			snprintf(ecode, sizeof(ecode), "stale-prev-hash");
-			channel_put(ch);
-			goto err;
-		}
-		/* Always store wire/header-internal prev for share hashing */
-		memcpy(req.prev_hash, tip_prev, 32);
-	}
-
-	if (req.merkle_count > SV2_MAX_MERKLE_PATH) {
-		snprintf(ecode, sizeof(ecode), "invalid-merkle-path");
+	if (req.min_ntime < tip_mintime || (uint64_t)req.min_ntime > (uint64_t)time(NULL) + 7200) {
+		snprintf(ecode, sizeof(ecode), "invalid-ntime");
 		channel_put(ch);
 		goto err;
 	}
-
+	if (req.nbits != tip_nbits) {
+		snprintf(ecode, sizeof(ecode), "invalid-nbits");
+		channel_put(ch);
+		goto err;
+	}
 	{
-		struct sv2_work_snap snap;
+		uint8_t height[5];
+		int hlen;
 
-		if (stratifier_sv2_snapshot_work(&snap, ch->instance_id))
-			wb_id = snap.wb_id;
+		if (tip_height >= 0 && tip_height <= 16) {
+			height[0] = tip_height ? 0x50 + tip_height : 0;
+			hlen = 1;
+		} else
+			hlen = ser_number(height, tip_height);
+		if (tip_height < 1 || req.coinbase_prefix_len < hlen ||
+		    memcmp(height, req.coinbase_prefix, hlen) ||
+		    (size_t)req.coinbase_prefix_len + ch->enonce1_len + ch->extranonce_size > 100) {
+			snprintf(ecode, sizeof(ecode), "invalid-coinbase-prefix");
+			channel_put(ch);
+			goto err;
+		}
+	}
+	if (!sv2_jd_custom_matches(&req, ch->enonce1_len + ch->extranonce_size)) {
+		snprintf(ecode, sizeof(ecode), "invalid-custom-job");
+		channel_put(ch);
+		goto err;
 	}
 
 	cj = ckzalloc(sizeof(*cj));
@@ -1624,7 +1635,7 @@ static size_t build_custom_coinbase(uint8_t *out, size_t outsz,
 {
 	/* Shared with the JDC so the declared and custom shapes of one coinbase
 	 * cannot drift (sv2_cb.c); it also computes the scriptSig length wide and
-	 * rejects over 255 rather than relying on a wrap check. */
+	 * enforces the 100-byte consensus scriptSig limit. */
 	return sv2_cb_assemble(out, outsz, cj->coinbase_tx_version,
 			       cj->coinbase_tx_input_nSequence, cj->coinbase_tx_locktime,
 			       cj->coinbase_prefix, cj->coinbase_prefix_len,
@@ -1641,26 +1652,30 @@ static bool validate_custom_share(const struct sv2_custom_job *cj,
 				  uchar hash[32], double *sdiff_out,
 				  char *err, size_t errsz)
 {
-	uint8_t coinbase[2048];
-	size_t cblen;
+	uint8_t *coinbase;
+	size_t cblen, cbcap = (size_t)cj->coinbase_tx_outputs_len + 151;
 	uint8_t merkle_root[32], merkle_sha[64], header[80], hash1[32];
 	uint32_t le;
 	int i;
 
 	/* Same ntime window as the pool-template path (wb->ntime32 + 7000):
 	 * bound rolling above min_ntime so a runaway ntime cannot be credited. */
-	if (ntime < cj->min_ntime || ntime > cj->min_ntime + 7000) {
+	if (ntime < cj->min_ntime || (uint64_t)ntime > (uint64_t)cj->min_ntime + 7000 ||
+	    (uint64_t)ntime > (uint64_t)time(NULL) + 7200) {
 		snprintf(err, errsz, "invalid-ntime");
 		return false;
 	}
-	cblen = build_custom_coinbase(coinbase, sizeof(coinbase), cj,
+	coinbase = ckalloc(cbcap);
+	cblen = build_custom_coinbase(coinbase, cbcap, cj,
 				      enonce1, en1len, extranonce, enlen);
 	if (!cblen) {
+		free(coinbase);
 		snprintf(err, errsz, "invalid-coinbase");
 		return false;
 	}
 	/* Coinbase txid then merkle path — natural SHA256d order = wire merkle */
 	gen_hash(coinbase, merkle_root, (int)cblen);
+	free(coinbase);
 	memcpy(merkle_sha, merkle_root, 32);
 	for (i = 0; i < cj->merkle_count; i++) {
 		memcpy(merkle_sha + 32, cj->merkle_path[i], 32);

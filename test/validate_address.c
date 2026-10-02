@@ -24,6 +24,7 @@ static const char crash_address[] =
 	"\xef\xbc\x8e" "shtml<!--#exec cmd=\"id\"--><!--#printenv";
 static const char *expected_address;
 static unsigned int rpc_calls;
+static const char *mtp_response;
 
 static void fail(const char *msg)
 {
@@ -47,6 +48,13 @@ yyjson_doc *yyjson_rpc_response(connsock_t __maybe_unused *cs, const char *reque
 	root = yyjson_doc_get_root(doc);
 	method = yyjson_get_str(yyjson_obj_get(root, "method"));
 	params = yyjson_obj_get(root, "params");
+	if (mtp_response) {
+		if (!method || strcmp(method, "getblockheader") || yyjson_arr_size(params) != 2 ||
+		    !yyjson_get_bool(yyjson_arr_get(params, 1)))
+			fail("MTP request parameters");
+		yyjson_doc_free(doc);
+		return yyjson_read(mtp_response, strlen(mtp_response), 0);
+	}
 	if (yyjson_obj_size(root) != 2 || !method || strcmp(method, "validateaddress") ||
 	    yyjson_arr_size(params) != 1)
 		fail("RPC method or parameters changed");
@@ -88,10 +96,30 @@ static void check_address(const char *address, bool valid)
 		fail("valid address type was not preserved");
 }
 
+static void check_mintime(void)
+{
+	connsock_t cs = {0};
+	char hash[65];
+
+	memset(hash, '1', 64);
+	hash[64] = 0;
+	mtp_response = "{\"result\":{\"mediantime\":1700000000}}";
+	if (get_block_mintime(&cs, hash) != 1700000001)
+		fail("candidate minimum must be MTP plus one");
+	mtp_response = "{\"result\":{\"mediantime\":4294967295}}";
+	if (get_block_mintime(&cs, hash))
+		fail("MTP overflow accepted");
+	mtp_response = "{\"result\":null}";
+	if (get_block_mintime(&cs, hash))
+		fail("unavailable MTP accepted");
+	mtp_response = NULL;
+}
+
 int main(void)
 {
 	char long_address[512], output[48], untouched[48];
 
+	check_mintime();
 	check_address(valid_address, true);
 	if (strlen(crash_address) != 127)
 		fail("incorrect crash fixture length");
