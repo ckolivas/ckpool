@@ -70,19 +70,27 @@ rorx=
 avx1=
 sse4=
 sha2=
-if test $host_cpu = 'x86_64' && test x$YASM = xyes; then
-	cpuinfo=$(cat /proc/cpuinfo)
+if test $host_cpu = 'x86_64'; then
+	cpuinfo=$(cat /proc/cpuinfo 2>/dev/null)
 
-	if [[[ $cpuinfo =~ sha_ni ]]]; then
-		 CFLAGS="$CFLAGS -msse4.1 -msha"
-        	x86_shani="sha_ni"
-	elif [[[ $cpuinfo =~ avx2 ]]]; then
+	dnl Match complete feature names, including at line boundaries.
+	AS_CASE([" $cpuinfo "],
+	    [*[[[:space:]]]sha_ni[[[:space:]]]*], [
+		CFLAGS="$CFLAGS -msse4.1 -msha"
+		x86_shani="sha_ni"
+	    ], [*[[[:space:]]]avx2[[[:space:]]]*], [
 		rorx="avx2"
-	elif [[[ $cpuinfo =~ avx ]]]; then
+	    ], [*[[[:space:]]]avx[[[:space:]]]*], [
 		avx1="avx"
-	elif [[[ $cpuinfo =~ sse4_1 ]]]; then
+	    ], [*[[[:space:]]]sse4_1[[[:space:]]]*], [
 		sse4="sse4_1"
-	fi
+	    ])
+	dnl SHA-NI uses C intrinsics; only the AVX/SSE implementations need YASM.
+	AS_IF([test x$YASM != xyes], [
+		rorx=
+		avx1=
+		sse4=
+	])
 fi
 if test $host_cpu = 'aarch64'; then
 	CFLAGS="$CFLAGS -march=armv8-a+crypto"
