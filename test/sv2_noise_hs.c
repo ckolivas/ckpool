@@ -527,6 +527,33 @@ int main(void)
 		printf("sv2_noise_hs: src initiator interop + wrong-key reject OK\n");
 	}
 
+	/* Simulate keys loaded over a year ago. New handshakes renew dates,
+	 * retain the configured duration and leave shared key material untouched. */
+	{
+		struct sv2_noise_server_keys old = keys, saved;
+		sv2_noise_session_t *sresp, *scli;
+		uint32_t now = (uint32_t)time(NULL);
+
+		old.cert_valid_from = now - 366u * 86400;
+		old.cert_not_valid_after = now - 86400;
+		saved = old;
+		sresp = sv2_noise_session_new(&old);
+		scli = sv2_noise_client_session_new(old.authority_xonly);
+		if (!sresp || !scli || !sv2_noise_client_act1(scli, act1) ||
+		    !sv2_noise_handshake_read(sresp, act1, sizeof(act1), &act2, &act2len) ||
+		    !sv2_noise_client_act2(scli, act2, act2len))
+			return fail("long uptime certificate renewal");
+		if (memcmp(&old, &saved, sizeof(old)))
+			return fail("renewal modified shared keys");
+		dealloc(act2);
+		act2 = NULL;
+		sv2_noise_session_free(sresp);
+		sv2_noise_session_free(scli);
+		sv2_noise_server_keys_clear(&old);
+		sv2_noise_server_keys_clear(&saved);
+		printf("sv2_noise_hs: long uptime certificate renewal OK\n");
+	}
+
 	/* Correctly signed certificates with unsupported versions must fail.
 	 * Exercise both bytes of the U16 version, including the old ckpool value. */
 	{

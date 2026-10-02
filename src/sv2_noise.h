@@ -33,6 +33,7 @@ struct sv2_noise_server_keys {
 	uint8_t static_xonly[32];	/* server static x-only pub for cert */
 	uint8_t authority_sk[32];	/* authority private (signs cert) */
 	uint8_t authority_xonly[32];	/* authority public (published to miners) */
+	/* Initial window; its duration is reused for per-handshake renewal. */
 	uint32_t cert_valid_from;
 	uint32_t cert_not_valid_after;
 	uint16_t cert_version;

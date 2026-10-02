@@ -444,18 +444,33 @@ static bool build_signature_noise_message(const struct sv2_noise_server_keys *ke
 	uint8_t signed_fields[42];
 	secp256k1_keypair keypair;
 	uint8_t mhash[32];
+	uint32_t valid_from = keys->cert_valid_from;
+	uint32_t not_valid_after = keys->cert_not_valid_after;
+	time_t now = time(NULL);
+	uint64_t until;
+
+	if (now < 0 || (uint64_t)now >= UINT32_MAX || not_valid_after <= valid_from)
+		return false;
+	/* Renew within a day of expiry, using local dates for this handshake.
+	 * Shared key material stays immutable; concurrent handshakes need no
+	 * renewal lock and retain the same authority and static public keys. */
+	if ((uint64_t)not_valid_after <= (uint64_t)now + 86400) {
+		until = (uint64_t)now + (not_valid_after - valid_from);
+		valid_from = (uint32_t)now;
+		not_valid_after = until > UINT32_MAX ? UINT32_MAX : (uint32_t)until;
+	}
 
 	/* LE fields matching wire layout of version/valid_from/not_valid_after */
 	signed_fields[0] = (uint8_t)(keys->cert_version & 0xff);
 	signed_fields[1] = (uint8_t)((keys->cert_version >> 8) & 0xff);
-	signed_fields[2] = (uint8_t)(keys->cert_valid_from & 0xff);
-	signed_fields[3] = (uint8_t)((keys->cert_valid_from >> 8) & 0xff);
-	signed_fields[4] = (uint8_t)((keys->cert_valid_from >> 16) & 0xff);
-	signed_fields[5] = (uint8_t)((keys->cert_valid_from >> 24) & 0xff);
-	signed_fields[6] = (uint8_t)(keys->cert_not_valid_after & 0xff);
-	signed_fields[7] = (uint8_t)((keys->cert_not_valid_after >> 8) & 0xff);
-	signed_fields[8] = (uint8_t)((keys->cert_not_valid_after >> 16) & 0xff);
-	signed_fields[9] = (uint8_t)((keys->cert_not_valid_after >> 24) & 0xff);
+	signed_fields[2] = (uint8_t)(valid_from & 0xff);
+	signed_fields[3] = (uint8_t)((valid_from >> 8) & 0xff);
+	signed_fields[4] = (uint8_t)((valid_from >> 16) & 0xff);
+	signed_fields[5] = (uint8_t)((valid_from >> 24) & 0xff);
+	signed_fields[6] = (uint8_t)(not_valid_after & 0xff);
+	signed_fields[7] = (uint8_t)((not_valid_after >> 8) & 0xff);
+	signed_fields[8] = (uint8_t)((not_valid_after >> 16) & 0xff);
+	signed_fields[9] = (uint8_t)((not_valid_after >> 24) & 0xff);
 	memcpy(signed_fields + 10, keys->static_xonly, 32);
 
 	/* Wire: version|valid_from|not_valid_after (10) || sig (64) */
@@ -495,6 +510,7 @@ bool sv2_noise_load_server_keys(struct sv2_noise_server_keys *keys,
 	time_t now = time(NULL);
 	bool ok = false;
 	bool auth_new = false, static_new = false;
+	uint64_t until;
 
 	memset(keys, 0, sizeof(*keys));
 	if (sodium_init() < 0) {
@@ -505,11 +521,14 @@ bool sv2_noise_load_server_keys(struct sv2_noise_server_keys *keys,
 	if (!secp)
 		return false;
 
+	if (now < 0 || (uint64_t)now >= UINT32_MAX)
+		return false;
 	keys->cert_version = SV2_NOISE_CERT_VERSION;
 	keys->cert_valid_from = (uint32_t)now;
 	if (valid_days == 0)
 		valid_days = 365;
-	keys->cert_not_valid_after = (uint32_t)now + valid_days * 86400u;
+	until = (uint64_t)now + (uint64_t)valid_days * 86400;
+	keys->cert_not_valid_after = until > UINT32_MAX ? UINT32_MAX : (uint32_t)until;
 
 	/* Authority seckey */
 	if (authority_path && authority_path[0] &&
