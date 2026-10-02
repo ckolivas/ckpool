@@ -63,6 +63,7 @@ enum sv2_work_src {
 
 /* Snapshot of an accepted custom job for share reconstruction */
 struct sv2_custom_job {
+	bool token_pinned;
 	uint32_t job_id;
 	uint32_t version;
 	uint8_t prev_hash[32];	/* as on wire (U256 LE / header-internal) */
@@ -253,6 +254,8 @@ static void free_custom_job(struct sv2_custom_job *cj)
 {
 	if (!cj)
 		return;
+	if (cj->token_pinned)
+		sv2_jd_unpin_token(cj->token, cj->token_len);
 	dealloc(cj->coinbase_tx_outputs);
 	dealloc(cj);
 }
@@ -1555,7 +1558,13 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 		goto err;
 	}
 
+	if (!sv2_jd_pin_token(req.mining_job_token, req.mining_job_token_len)) {
+		snprintf(ecode, sizeof(ecode), "invalid-mining-job-token");
+		channel_put(ch);
+		goto err;
+	}
 	cj = ckzalloc(sizeof(*cj));
+	cj->token_pinned = true;
 	cj->version = req.version;
 	memcpy(cj->prev_hash, req.prev_hash, 32);
 	cj->min_ntime = req.min_ntime;
@@ -1753,6 +1762,7 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 		if (ok_job && is_custom && cj_slot) {
 			cj_copy = ckzalloc(sizeof(*cj_copy));
 			*cj_copy = *cj_slot;
+			cj_copy->token_pinned = sv2_jd_pin_token(cj_copy->token, cj_copy->token_len);
 			if (cj_slot->coinbase_tx_outputs_len) {
 				cj_copy->coinbase_tx_outputs =
 					ckalloc(cj_slot->coinbase_tx_outputs_len);
@@ -1781,9 +1791,11 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
 					  "invalid-share", replylen);
 	}
-	if (is_custom && !cj_copy)
+	if (is_custom && (!cj_copy || !cj_copy->token_pinned)) {
+		free_custom_job(cj_copy);
 		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
 					  "invalid-job-id", replylen);
+	}
 
 	job = ckzalloc(sizeof(*job));
 	job->connector_id = c->client_id;

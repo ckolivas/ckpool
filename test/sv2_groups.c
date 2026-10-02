@@ -434,3 +434,12 @@ bool sv2_jd_custom_matches(const struct sv2_set_custom_mining_job __maybe_unused
 {
 	return custom_test;
 }
+
+bool sv2_jd_pin_token(const uint8_t __maybe_unused *token, uint8_t __maybe_unused len)
+{
+	return custom_test;
+}
+
+void sv2_jd_unpin_token(const uint8_t __maybe_unused *token, uint8_t __maybe_unused len)
+{
+}

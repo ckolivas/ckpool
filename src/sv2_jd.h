@@ -83,6 +83,10 @@ char *sv2_jd_stats_json(void);
  * not skipped for templates validated against a previous tip. */
 void sv2_jd_on_tip_change(void);
 
+/* Pin reconstructed material for every live mining job and queued share. */
+bool sv2_jd_pin_token(const uint8_t *token, uint8_t len);
+void sv2_jd_unpin_token(const uint8_t *token, uint8_t len);
+
 struct sv2_set_custom_mining_job;
 bool sv2_jd_custom_matches(const struct sv2_set_custom_mining_job *req, uint8_t hole);
 

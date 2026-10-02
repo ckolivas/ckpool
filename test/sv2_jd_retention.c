@@ -126,6 +126,37 @@ static void check_custom_binding(void)
 	sv2_jd_drop_client(99);
 }
 
+static void check_pinned_snapshot(void)
+{
+	struct sv2_jd_token *first, *last;
+	struct rebuild_snap snap;
+	uint8_t token[SV2_JD_TOKEN_BYTES];
+	unsigned int i;
+
+	first = declare(allocate_token(3), 1);
+	memcpy(token, first->token, sizeof(token));
+	assert(sv2_jd_pin_token(token, sizeof(token)));
+	/* A share queued from the mining slot has its own ownership. */
+	assert(sv2_jd_pin_token(token, sizeof(token)));
+	for (i = 2; i <= 20; i++)
+		last = declare(allocate_token(3), i);
+	assert(last != first);
+	assert(snapshot_token_for_rebuild_locked(first, &snap));
+	free_rebuild_snap(&snap);
+	first->created = time(NULL) - SV2_JD_TOKEN_TTL_DECLARED_SECS - 1;
+	expire_old_tokens_locked(time(NULL));
+	assert(find_token_locked(token, sizeof(token)) == first);
+	sv2_jd_drop_client(3);
+	assert(find_token_locked(token, sizeof(token)) == first);
+	sv2_jd_unpin_token(token, sizeof(token));
+	assert(snapshot_token_for_rebuild_locked(first, &snap));
+	free_rebuild_snap(&snap);
+	sv2_jd_unpin_token(token, sizeof(token));
+	assert(!find_token_locked(token, sizeof(token)));
+	assert(!jd_token_count && !jd_token_snapshot_bytes);
+	assert(!sv2_jd_pin_token(token, sizeof(token)));
+}
+
 int main(void)
 {
 	struct sv2_jd_token *first, *latest, *other, *t, *tmp;
@@ -148,6 +179,7 @@ int main(void)
 	assert(!first->snapshot_bytes && !first->tx_raws && !first->wtxid_list);
 	assert(sv2_jd_token_is_declared(first->token, first->token_len));
 	assert(!snapshot_token_for_rebuild_locked(first, &snap));
+	assert(!sv2_jd_pin_token(first->token, first->token_len));
 	assert(snapshot_token_for_rebuild_locked(latest, &snap));
 	assert(snap.tx_lens[0] == 2 * 1024 * 1024);
 	free_rebuild_snap(&snap);
@@ -219,6 +251,7 @@ int main(void)
 	sv2_jd_drop_client(2);
 	assert(!jd_tokens && !jd_token_count && !jd_token_snapshot_bytes);
 	check_custom_binding();
+	check_pinned_snapshot();
 	puts("sv2_jd_retention: all OK");
 	return 0;
 }

@@ -178,6 +178,8 @@ struct sv2_jd_token {
 	int64_t client_id;
 	char user_identifier[SV2_MAX_STR_LEN + 1];
 	time_t created;
+	unsigned int job_refs;	/* mining slots and queued shares pin material */
+	bool orphaned;		/* JDS disconnected; free after the last job */
 	bool declared;		/* checkBlock accepted; material is then immutable */
 	uint32_t version;
 	uint16_t wtxid_count;
@@ -529,6 +531,8 @@ void sv2_jd_drop_all(void)
 /* Caller holds jd_lock. Preserve token authorization when retiring material. */
 static void free_token_snapshot_locked(struct sv2_jd_token *t)
 {
+	if (t->job_refs)
+		return;
 	if (jd_token_snapshot_bytes >= t->snapshot_bytes)
 		jd_token_snapshot_bytes -= t->snapshot_bytes;
 	else
@@ -553,6 +557,10 @@ static void free_token_locked(struct sv2_jd_token *t)
 {
 	if (!t)
 		return;
+	if (t->job_refs) {
+		t->orphaned = true;
+		return;
+	}
 	HASH_DEL(jd_tokens, t);
 	jd_token_count--;
 	free_token_snapshot_locked(t);
@@ -567,7 +575,7 @@ static struct sv2_jd_token *snapshot_to_retire_locked(int64_t client_id)
 	int count = 0;
 
 	HASH_ITER(hh, jd_tokens, t, tmp) {
-		if (t->client_id != client_id || !t->snapshot_order)
+		if (t->client_id != client_id || !t->snapshot_order || t->job_refs)
 			continue;
 		count++;
 		if (!oldest || t->snapshot_order < oldest->snapshot_order)
@@ -661,7 +669,7 @@ static void expire_old_tokens_locked(time_t now)
 		time_t ttl = t->declared ? SV2_JD_TOKEN_TTL_DECLARED_SECS
 					 : SV2_JD_TOKEN_TTL_UNDECLARED_SECS;
 
-		if (!t->latest_snapshot && now - t->created > ttl) {
+		if (!t->job_refs && !t->latest_snapshot && now - t->created > ttl) {
 			expired++;
 			free_token_locked(t);
 		}
@@ -3184,6 +3192,58 @@ char *sv2_jd_stats_json(void)
 		 st.tokens, st.tx_cache, st.tx_cache_bytes, st.token_snapshot_bytes,
 		 st.pending_declares);
 	return s;
+}
+
+bool sv2_jd_pin_token(const uint8_t *token, uint8_t len)
+{
+	struct sv2_jd_token *tok;
+	bool ok = false;
+
+	ensure_lock();
+	mutex_lock(&jd_lock);
+	tok = find_token_locked(token, len);
+	if (tok && tok->declared && tok->snapshot_order && tok->coinbase_tx_prefix &&
+	    tok->job_refs < UINT_MAX) {
+		tok->job_refs++;
+		ok = true;
+	}
+	mutex_unlock(&jd_lock);
+	return ok;
+}
+
+void sv2_jd_unpin_token(const uint8_t *token, uint8_t len)
+{
+	struct sv2_jd_token *tok, *t, *tmp;
+	int64_t client_id;
+	unsigned int unused = 0;
+
+	ensure_lock();
+	mutex_lock(&jd_lock);
+	tok = find_token_locked(token, len);
+	if (!tok || !tok->job_refs)
+		goto out;
+	client_id = tok->client_id;
+	if (--tok->job_refs)
+		goto out;
+	if (tok->orphaned) {
+		free_token_locked(tok);
+		goto out;
+	}
+	/* Pinning may temporarily extend history, within the byte budgets.
+	 * Once released, retain only the usual recent unused snapshots. */
+	HASH_ITER(hh, jd_tokens, t, tmp) {
+		if (t->client_id == client_id && t->snapshot_order && !t->job_refs)
+			unused++;
+	}
+	while (unused > SV2_JD_PUSH_TOKEN_CANDIDATES) {
+		t = snapshot_to_retire_locked(client_id);
+		if (!t)
+			break;
+		free_token_snapshot_locked(t);
+		unused--;
+	}
+out:
+	mutex_unlock(&jd_lock);
 }
 
 bool sv2_jd_token_is_declared(const uint8_t *token, uint8_t token_len)
