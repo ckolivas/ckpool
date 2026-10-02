@@ -647,17 +647,14 @@ find_client_oldest_token_locked(int64_t client_id, const char *user)
 	return oldest;
 }
 
-/*
- * Free oldest *undeclared* token globally. Never touches declared tokens
- * (in-flight custom jobs). Only used when the table is full and this client
- * has no token of its own to re-issue.
- */
-static bool free_oldest_undeclared_global_locked(void)
+/* Reclaim unused authorization metadata under pressure. Retained snapshots,
+ * mining/worker pins and the parent of an in-progress redeclare stay valid. */
+static bool free_oldest_unused_global_locked(const struct sv2_jd_token *protect)
 {
 	struct sv2_jd_token *t, *tmp, *oldest = NULL;
 
 	HASH_ITER(hh, jd_tokens, t, tmp) {
-		if (t->declared)
+		if (t == protect || t->job_refs || t->latest_snapshot || t->snapshot_order)
 			continue;
 		if (!oldest || t->created < oldest->created)
 			oldest = t;
@@ -1400,7 +1397,7 @@ static int token_accept_declare_locked(struct sv2_jd_pending *pend,
 	}
 
 	while (jd_token_count >= SV2_JD_MAX_TOKENS_GLOBAL &&
-	       free_oldest_undeclared_global_locked())
+	       free_oldest_unused_global_locked(parent))
 		;
 	if (jd_token_count >= SV2_JD_MAX_TOKENS_GLOBAL) {
 		LOGNOTICE("SV2 JD declare token table full client %"PRId64
@@ -2275,7 +2272,7 @@ static uint8_t *handle_allocate(struct sv2_jd_client *c, const uint8_t *payload,
 	 *
 	 * Under pressure: re-issue this client's own token (prefer undeclared;
 	 * else oldest declared/undeclared). Never mint past the per-min cap
-	 * and never free another client's declared tokens.
+	 * and preserve retained snapshots and mining pins.
 	 */
 	ensure_lock();
 	mutex_lock(&jd_lock);
@@ -2342,8 +2339,7 @@ static uint8_t *handle_allocate(struct sv2_jd_client *c, const uint8_t *payload,
 
 	if (!reused) {
 		/*
-		 * Mint only under per-min budget. Never free another client's
-		 * declared tokens; only drop global undeclared when table full.
+		 * Mint only under per-min budget; reclaim only unused metadata.
 		 */
 		if (per_min_hit) {
 			/* No own token under per-min — cannot mint past cap. */
@@ -2354,13 +2350,13 @@ static uint8_t *handle_allocate(struct sv2_jd_client *c, const uint8_t *payload,
 			return NULL;
 		}
 		while (jd_token_count >= SV2_JD_MAX_TOKENS_GLOBAL &&
-		       free_oldest_undeclared_global_locked())
+		       free_oldest_unused_global_locked(NULL))
 			;
 		if (jd_token_count >= SV2_JD_MAX_TOKENS_GLOBAL) {
 			mutex_unlock(&jd_lock);
 			JD_STAT_INC(allocate_rate_limited);
 			LOGWARNING("SV2 JD AllocateMiningJobToken table full client %"PRId64
-				   " — no undeclared slot (not evicting declared)",
+				   " — no unused token slot",
 				   c->client_id);
 			return NULL;
 		}

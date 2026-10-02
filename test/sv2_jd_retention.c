@@ -194,6 +194,34 @@ static void check_pinned_snapshot(void)
 	assert(!sv2_jd_pin_token(token, sizeof(token)));
 }
 
+static void check_metadata_pressure(void)
+{
+	struct sv2_jd_token *parent, *pinned, *t;
+	uint8_t parent_id[SV2_JD_TOKEN_BYTES], pinned_id[SV2_JD_TOKEN_BYTES];
+	unsigned int i;
+
+	parent = allocate_token(44);
+	parent->declared = true; /* Retired authorization without reconstruction. */
+	memcpy(parent_id, parent->token, sizeof(parent_id));
+	pinned = declare(allocate_token(45), 1);
+	memcpy(pinned_id, pinned->token, sizeof(pinned_id));
+	assert(sv2_jd_pin_token(pinned_id, sizeof(pinned_id)));
+	for (i = jd_token_count; i < SV2_JD_MAX_TOKENS_GLOBAL; i++) {
+		t = allocate_token(44);
+		t->declared = true;
+	}
+	assert(jd_token_count == SV2_JD_MAX_TOKENS_GLOBAL);
+	t = declare(parent, 2);
+	assert(t != parent && jd_token_count == SV2_JD_MAX_TOKENS_GLOBAL);
+	assert(find_token_locked(parent_id, sizeof(parent_id)) == parent);
+	assert(find_token_locked(pinned_id, sizeof(pinned_id)) == pinned);
+	assert(t->payout_script[0] == 0x51);
+	sv2_jd_unpin_token(pinned_id, sizeof(pinned_id));
+	sv2_jd_drop_client(44);
+	sv2_jd_drop_client(45);
+	assert(!jd_tokens && !jd_token_count && !jd_token_snapshot_bytes);
+}
+
 int main(void)
 {
 	struct sv2_jd_token *first, *latest, *other, *t, *tmp;
@@ -309,6 +337,7 @@ int main(void)
 	}
 	check_custom_binding();
 	check_pinned_snapshot();
+	check_metadata_pressure();
 	puts("sv2_jd_retention: all OK");
 	return 0;
 }
