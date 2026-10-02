@@ -20,9 +20,9 @@ validate_address_CPPFLAGS = $(AM_CPPFLAGS)
 if HAVE_SV2
 AM_CPPFLAGS += @SV2_CFLAGS@
 check_PROGRAMS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit \
-	sv2_idle sv2_tx sv2_cb sv2_bridge sv2_groups sv2_jd_retention sv2_proxy_jobs
+	sv2_idle sv2_tx sv2_cb sv2_bridge sv2_groups sv2_jd_retention sv2_proxy_jobs sv2_jdc_session
 TESTS += sv2_codec sv2_codec_fuzz sv2_authority_b58 sv2_noise_hs sv2_hs_limit sv2_idle \
-	sv2_tx sv2_cb sv2_bridge sv2_groups sv2_jd_retention sv2_proxy_jobs
+	sv2_tx sv2_cb sv2_bridge sv2_groups sv2_jd_retention sv2_proxy_jobs sv2_jdc_session
 # Include JDS internals to check retained snapshots without node/IPC workers.
 sv2_jd_retention_SOURCES = sv2_jd_retention.c
 sv2_jd_retention_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/ipc/mining
@@ -72,4 +72,12 @@ sv2_proxy_jobs_SOURCES = sv2_proxy_jobs.c
 sv2_proxy_jobs_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/ipc/mining
 sv2_proxy_jobs_CFLAGS = $(AM_CFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections
 sv2_proxy_jobs_LDFLAGS = -Wl,--gc-sections
+endif
+
+if HAVE_SV2
+sv2_jdc_session_SOURCES = sv2_jdc_session.c $(top_srcdir)/src/sv2_noise.c
+sv2_jdc_session_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/ipc/mining
+sv2_jdc_session_CFLAGS = $(AM_CFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections
+sv2_jdc_session_LDFLAGS = -Wl,--gc-sections
+sv2_jdc_session_LDADD = $(top_srcdir)/src/libckpool.a @SV2_LIBS@
 endif
