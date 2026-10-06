@@ -6214,16 +6214,19 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 static user_instance_t *generate_user(stratum_instance_t *client,
 				      const char *workername)
 {
-	char *base_username = strdupa(workername), *username;
+	char *base_username, *username;
 	bool new_user = false, new_worker = false;
 	sdata_t *sdata = ckpool.sdata;
 	worker_instance_t *worker;
 	user_instance_t *user;
 	int len;
 
+	/* Callers normally validate at the protocol boundary. Keep this safe
+	 * for every caller, before strdupa/strsep can see an empty identity. */
+	if (unlikely(workername_error(workername)))
+		return NULL;
+	base_username = strdupa(workername);
 	username = strsep(&base_username, "._");
-	if (!username || !strlen(username))
-		username = base_username;
 	len = strlen(username);
 	if (unlikely(len > 127))
 		username[127] = '\0';
@@ -6329,7 +6332,7 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 			    yyjson_mut_doc **err_doc)
 {
 	user_instance_t *user;
-	const char *buf, *pass;
+	const char *buf, *pass, *name_error;
 	bool ret = false;
 	int arr_size;
 	ts_t now;
@@ -6348,20 +6351,9 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 		goto out;
 	}
 	buf = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 0));
-	if (!buf) {
-		*err_doc = yyjson_string("Invalid workername parameter");
-		goto out;
-	}
-	if (!strlen(buf)) {
-		*err_doc = yyjson_string("Empty workername parameter");
-		goto out;
-	}
-	if (!memcmp(buf, ".", 1) || !memcmp(buf, "_", 1)) {
-		*err_doc = yyjson_string("Empty username parameter");
-		goto out;
-	}
-	if (strchr(buf, '/')) {
-		*err_doc = yyjson_string("Invalid character in username");
+	name_error = workername_error(buf);
+	if (name_error) {
+		*err_doc = yyjson_string(name_error);
 		goto out;
 	}
 	pass = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 1));
@@ -7053,7 +7045,7 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 	int64_t id;
 	bool ret = false;
 
-	if (!sdata || !user_identity || !out_instance_id || enonce1_len < 1 ||
+	if (!sdata || workername_error(user_identity) || !out_instance_id || enonce1_len < 1 ||
 	    enonce1_len > 16)
 		return false;
 

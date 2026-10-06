@@ -1051,6 +1051,14 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 		return NULL;
 	if (!sv2_decode_open_standard_channel(payload, len, &o))
 		return NULL;
+	if (workername_error(o.user_identity)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-username");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 	if (!wire_f32_hashrate_valid(o.nominal_hash_rate)) {
 		memset(&err, 0, sizeof(err));
 		err.request_id = o.request_id;
@@ -1456,6 +1464,14 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	}
 	if (!sv2_decode_open_extended_channel(payload, len, &o))
 		return NULL;
+	if (workername_error(o.user_identity)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-username");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 	if (!wire_f32_hashrate_valid(o.nominal_hash_rate)) {
 		memset(&err, 0, sizeof(err));
 		err.request_id = o.request_id;

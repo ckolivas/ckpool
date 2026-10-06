@@ -1555,6 +1555,19 @@ const int hex2bin_tbl[256] = {
 	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 };
 
+const char *workername_error(const char *workername)
+{
+	if (!workername)
+		return "Invalid workername parameter";
+	if (!workername[0])
+		return "Empty workername parameter";
+	if (workername[0] == '.' || workername[0] == '_')
+		return "Empty username parameter";
+	if (strchr(workername, '/'))
+		return "Invalid character in username";
+	return NULL;
+}
+
 bool _validhex(const char *buf, const char *file, const char *func, const int line)
 {
 	unsigned int i, slen;

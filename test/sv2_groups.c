@@ -30,7 +30,7 @@ struct opened_channel {
 };
 
 static struct opened_channel opened;
-static unsigned int success_count, sessions;
+static unsigned int success_count, sessions, session_open_calls;
 static int64_t expected_client;
 static uint32_t expected_request;
 static void *queued_share;
@@ -107,6 +107,7 @@ bool stratifier_sv2_open_session(int64_t __maybe_unused connector_id,
 		const uint8_t __maybe_unused *enonce1, int __maybe_unused enonce1_len,
 		double __maybe_unused diff, int64_t *out_instance_id)
 {
+	session_open_calls++;
 	*out_instance_id = ++sessions;
 	if (drop_during_open)
 		sv2_strat_drop_client(connector_id);
@@ -476,6 +477,78 @@ static void check_protocol_validation(void)
 	require(!sessions && !sv2_channels, "invalid opens create no sessions");
 }
 
+/* Exercise decoded wire identities before the session/user allocator. The
+ * session stub deliberately accepts anything: invalid input must not reach it. */
+static void check_worker_identities(void)
+{
+	const char *bad[] = {"", ".", "_", ".worker", "_worker", "user/worker"};
+	const char *good[] = {"user", "user.worker", "user_worker", "user.", "user_"};
+	struct sv2_setup_connection setup = {0};
+	uint8_t payload[512], target[32], *p;
+	size_t len;
+	unsigned int i, extended, calls = session_open_calls;
+
+	require(workername_error(NULL) != NULL, "NULL identity rejected");
+	expected_client = 3;
+	setup.min_version = setup.max_version = 2;
+	require(sv2_encode_setup_connection(payload, sizeof(payload), &len, &setup), "identity setup");
+	send_request(SV2_MSG_SETUP_CONNECTION, payload, len, true);
+	memset(target, 0xff, sizeof(target));
+	for (extended = 0; extended < 2; extended++) {
+		for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+			struct sv2_open_channel_error err;
+			struct sv2_client *c;
+			uint8_t *frame, *reply;
+			size_t flen, rlen;
+
+			require(workername_error(bad[i]) != NULL, "invalid worker name rejected");
+			p = payload;
+			sv2_write_u32(&p, i + 1);
+			sv2_write_str0_255(&p, bad[i]);
+			sv2_write_f32(&p, 0);
+			sv2_write_u256(&p, target);
+			if (extended)
+				sv2_write_u16(&p, 0);
+			require(sv2_build_frame(0, extended ? SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL :
+				SV2_MSG_OPEN_STANDARD_MINING_CHANNEL, payload, p - payload, &frame, &flen),
+				"invalid identity frame");
+			reply = sv2_strat_handle_frame(expected_client, frame, flen, &rlen);
+			require(reply && reply[2] == SV2_MSG_OPEN_MINING_CHANNEL_ERROR &&
+				sv2_decode_open_channel_error(reply + SV2_FRAME_HEADER_LEN,
+					rlen - SV2_FRAME_HEADER_LEN, &err), "identity error reply");
+			require(err.request_id == i + 1 && !strcmp(err.error_code, "invalid-username"),
+				"invalid identity returns request ID and error code");
+			require(session_open_calls == calls && !sessions && !sv2_channels,
+				"invalid identity never reaches session or user allocation");
+			c = client_get(expected_client, false);
+			require(c && c->next_channel_id == SV2_FIRST_CHANNEL_ID,
+				"invalid identity consumes no channel IDs");
+			client_put(c);
+			free(reply);
+			free(frame);
+		}
+	}
+	/* The same connection can still open valid names after repeated errors. */
+	for (extended = 0; extended < 2; extended++) {
+		for (i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+			require(!workername_error(good[i]), "valid worker syntax preserved");
+			p = payload;
+			expected_request = i + 100;
+			sv2_write_u32(&p, expected_request);
+			sv2_write_str0_255(&p, good[i]);
+			sv2_write_f32(&p, 0);
+			sv2_write_u256(&p, target);
+			if (extended)
+				sv2_write_u16(&p, 0);
+			send_request(extended ? SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL :
+				SV2_MSG_OPEN_STANDARD_MINING_CHANNEL, payload, p - payload, false);
+		}
+	}
+	require(sessions == 10, "valid names create sessions");
+	sv2_strat_drop_client(expected_client);
+	require(!sessions && !sv2_channels, "identity test cleans up sessions");
+}
+
 static void check_batch_timer(void)
 {
 	struct sv2_channel *ch;
@@ -523,6 +596,7 @@ int main(void)
 	check_open_disconnect(true);
 	check_protocol_validation();
 	check_batch_timer();
+	check_worker_identities();
 	puts("sv2_groups: all OK");
 	return 0;
 }
