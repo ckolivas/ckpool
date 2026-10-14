@@ -1,0 +1,8 @@
+# Copy this file alone to projects/ckpool/project.yaml in anthropics/oss-scanner.
+# Publish the referenced Dockerfile and threat model on master before enrolling.
+repo: https://bitbucket.org/ckolivas/ckpool.git#master
+primary_contact: kernel@kolivas.org
+homepage: https://bitbucket.org/ckolivas/ckpool
+disabled: false
+dockerfile: .oss-scanner/Dockerfile
+threat_model: .oss-scanner/threat_model.md
