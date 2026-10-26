@@ -2514,10 +2514,13 @@ struct sv2_proxy_job {
 	uint32_t min_ntime;
 	uint8_t merkle_count;
 	uint8_t merkle_path[SV2_MAX_MERKLE_PATH][32];
-	/* coinb1 = coinbase_tx_prefix[0..cb_tx_prefix_len) ‖ extranonce_prefix */
+	/* coinb1 = coinbase_tx_prefix ‖ en_prefix ‖ pad zeros */
 	uint8_t *coinb1;
 	int coinb1len;
-	int cb_tx_prefix_len;		/* for rebuild on SetExtranoncePrefix */
+	/* The channel extranonce prefix when the job arrived: SetExtranoncePrefix
+	 * only applies to jobs sent after it (spec 5.3.10). */
+	uint8_t en_prefix[SV2_MAX_B0_32];
+	uint8_t en_prefix_len;
 	uint8_t *coinb2;		/* coinbase_tx_suffix */
 	int coinb2len;
 	/*
@@ -3291,7 +3294,8 @@ bool sv2_proxy_set_custom_job(const struct sv2_jdc_custom_job *cj)
 	stage.merkle_count = (uint8_t)t->merkles;
 	for (i = 0; i < t->merkles; i++)
 		memcpy(stage.merkle_path[i], t->merkle_path[i], 32);
-	stage.cb_tx_prefix_len = cj->lcb_prefix_len;
+	stage.en_prefix_len = eplen;
+	memcpy(stage.en_prefix, sp->extranonce_prefix, eplen);
 	stage.coinb1len = cj->lcb_prefix_len + eplen + sp->pad_len;
 	stage.coinb1 = ckalloc(stage.coinb1len);
 	memcpy(stage.coinb1, cj->lcb_prefix, cj->lcb_prefix_len);
@@ -3528,9 +3532,8 @@ static void sv2_proxy_send_job(proxy_instance_t *proxi, struct sv2_proxy_job *jo
 		ni->sv2_dcb_suffix_len = job->dcb_suffix_len;
 		ni->sv2_dcb_suffix = ckalloc(job->dcb_suffix_len);
 		memcpy(ni->sv2_dcb_suffix, job->dcb_suffix, job->dcb_suffix_len);
-		ni->sv2_en_prefix_len = sp->extranonce_prefix_len;
-		memcpy(ni->sv2_en_prefix, sp->extranonce_prefix,
-		       sp->extranonce_prefix_len);
+		ni->sv2_en_prefix_len = job->en_prefix_len;
+		memcpy(ni->sv2_en_prefix, job->en_prefix, job->en_prefix_len);
 	}
 
 	mutex_lock(&gdata->notify_lock);
@@ -3803,6 +3806,69 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	}
 }
 
+/* Store an upstream extended job against the channel's current prefix. */
+static struct sv2_proxy_job *sv2_proxy_store_job(struct sv2_proxy *sp,
+						 const struct sv2_new_extended_mining_job *j)
+{
+	struct sv2_proxy_job *job = sv2_proxy_job_slot(sp, j->job_id);
+	int i;
+
+	job->diff = sp->target_diff;
+	job->future = !j->min_ntime_present;
+	job->min_ntime = j->min_ntime;
+	job->version = j->version;
+	job->merkle_count = j->merkle_count;
+	for (i = 0; i < j->merkle_count; i++)
+		memcpy(job->merkle_path[i], j->merkle_path[i], 32);
+	/* coinb1 = coinbase_tx_prefix ‖ extranonce_prefix ‖ pad zeros.
+	 * The pad fills the channel extranonce hole up to extranonce_size
+	 * so miners hash the exact U-byte layout the pool reconstructs. */
+	job->en_prefix_len = sp->extranonce_prefix_len;
+	memcpy(job->en_prefix, sp->extranonce_prefix, sp->extranonce_prefix_len);
+	job->coinb1len = j->coinbase_tx_prefix_len + sp->extranonce_prefix_len +
+			 sp->pad_len;
+	job->coinb1 = ckalloc(job->coinb1len ? job->coinb1len : 1);
+	memcpy(job->coinb1, j->coinbase_tx_prefix, j->coinbase_tx_prefix_len);
+	memcpy(job->coinb1 + j->coinbase_tx_prefix_len, sp->extranonce_prefix,
+	       sp->extranonce_prefix_len);
+	if (sp->pad_len)
+		memset(job->coinb1 + j->coinbase_tx_prefix_len +
+		       sp->extranonce_prefix_len, 0, sp->pad_len);
+	job->coinb2len = j->coinbase_tx_suffix_len;
+	job->coinb2 = ckalloc(job->coinb2len ? job->coinb2len : 1);
+	memcpy(job->coinb2, j->coinbase_tx_suffix, j->coinbase_tx_suffix_len);
+	return job;
+}
+
+/*
+ * Spec 5.3.10: a new prefix applies to jobs sent after it. Jobs already stored
+ * keep the prefix they were built with, which is what the pool reconstructs
+ * them with, so they stay minable and nothing downstream needs flushing.
+ * Returns true if an in-flight SetCustomMiningJob had to be dropped.
+ */
+static bool sv2_proxy_new_prefix(struct sv2_proxy *sp,
+				 const struct sv2_set_extranonce_prefix *e)
+{
+	struct sv2_proxy_job dropped = {};
+	bool had_pending = false;
+
+	memcpy(sp->extranonce_prefix, e->extranonce_prefix, e->extranonce_prefix_len);
+	sp->extranonce_prefix_len = e->extranonce_prefix_len;
+	/* A SetCustomMiningJob still in flight was built on the old prefix but
+	 * the pool will apply the new one to it, so its Success would install
+	 * work whose coinbase the pool reconstructs differently. */
+	mutex_lock(&sp->send_lock);
+	if (sp->custom_pending) {
+		sp->custom_pending = false;
+		dropped = sp->custom_stage;
+		memset(&sp->custom_stage, 0, sizeof(sp->custom_stage));
+		had_pending = true;
+	}
+	mutex_unlock(&sp->send_lock);
+	sv2_proxy_job_clear(&dropped);
+	return had_pending;
+}
+
 /* Dispatch one decrypted server→client frame, translating the SV2 mining flow
  * into the stratifier's notify/diff interface. */
 static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame,
@@ -3824,7 +3890,6 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 	case SV2_MSG_NEW_EXTENDED_MINING_JOB: {
 		struct sv2_new_extended_mining_job j;
 		struct sv2_proxy_job *job;
-		int i;
 
 		if (!sv2_decode_new_extended_mining_job(pay, pl, &j))
 			break;
@@ -3839,30 +3904,7 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 			sv2_new_extended_mining_job_free(&j);
 			break;
 		}
-		job = sv2_proxy_job_slot(sp, j.job_id);
-		job->diff = sp->target_diff;
-		job->future = !j.min_ntime_present;
-		job->min_ntime = j.min_ntime;
-		job->version = j.version;
-		job->merkle_count = j.merkle_count;
-		for (i = 0; i < j.merkle_count; i++)
-			memcpy(job->merkle_path[i], j.merkle_path[i], 32);
-		/* coinb1 = coinbase_tx_prefix ‖ extranonce_prefix ‖ pad zeros.
-		 * The pad fills the channel extranonce hole up to extranonce_size
-		 * so miners hash the exact U-byte layout the pool reconstructs. */
-		job->cb_tx_prefix_len = j.coinbase_tx_prefix_len;
-		job->coinb1len = j.coinbase_tx_prefix_len + sp->extranonce_prefix_len +
-				 sp->pad_len;
-		job->coinb1 = ckalloc(job->coinb1len ? job->coinb1len : 1);
-		memcpy(job->coinb1, j.coinbase_tx_prefix, j.coinbase_tx_prefix_len);
-		memcpy(job->coinb1 + j.coinbase_tx_prefix_len, sp->extranonce_prefix,
-		       sp->extranonce_prefix_len);
-		if (sp->pad_len)
-			memset(job->coinb1 + j.coinbase_tx_prefix_len +
-			       sp->extranonce_prefix_len, 0, sp->pad_len);
-		job->coinb2len = j.coinbase_tx_suffix_len;
-		job->coinb2 = ckalloc(job->coinb2len ? job->coinb2len : 1);
-		memcpy(job->coinb2, j.coinbase_tx_suffix, j.coinbase_tx_suffix_len);
+		job = sv2_proxy_store_job(sp, &j);
 		sv2_new_extended_mining_job_free(&j);
 		LOGINFO("SV2 proxy %d stored job %u future=%d merkles=%u",
 			proxi->id, job->job_id, job->future, job->merkle_count);
@@ -4052,82 +4094,13 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 	}
 	case SV2_MSG_SET_EXTRANONCE_PREFIX: {
 		struct sv2_set_extranonce_prefix e;
-		struct sv2_proxy_job dropped = {};
-		bool had_custom = false;
-		int ji;
 
 		if (!sv2_decode_set_extranonce_prefix(pay, pl, &e))
 			break;
-		memcpy(sp->extranonce_prefix, e.extranonce_prefix,
-		       e.extranonce_prefix_len);
-		sp->extranonce_prefix_len = e.extranonce_prefix_len;
-		LOGNOTICE("SV2 proxy %d SetExtranoncePrefix len=%u — rebuild + clean notify",
+		LOGNOTICE("SV2 proxy %d SetExtranoncePrefix len=%u for subsequent jobs",
 			  proxi->id, e.extranonce_prefix_len);
-		/* All stored jobs embed the old prefix in coinb1; rebuild. */
-		for (ji = 0; ji < SV2_PROXY_JOBS; ji++) {
-			struct sv2_proxy_job *job = &sp->jobs[ji];
-			uint8_t *ncoinb1;
-			int nlen;
-
-			/*
-			 * A custom job cannot be rebuilt this way: its coinbase hole
-			 * is what the JDS accepted and what both the pool's block
-			 * rebuild and our PushSolution assume, so a new prefix — even
-			 * one of the same length — makes it unmineable. Drop it and
-			 * have the template declared again for the new layout.
-			 */
-			if (job->custom) {
-				if (job->valid)
-					had_custom = true;
-				sv2_proxy_job_clear(job);
-				continue;
-			}
-			if (!job->valid || !job->coinb1 || job->cb_tx_prefix_len < 0 ||
-			    job->cb_tx_prefix_len > job->coinb1len)
-				continue;
-			nlen = job->cb_tx_prefix_len + sp->extranonce_prefix_len +
-			       sp->pad_len;
-			ncoinb1 = ckalloc(nlen ? nlen : 1);
-			memcpy(ncoinb1, job->coinb1, job->cb_tx_prefix_len);
-			memcpy(ncoinb1 + job->cb_tx_prefix_len, sp->extranonce_prefix,
-			       sp->extranonce_prefix_len);
-			if (sp->pad_len)
-				memset(ncoinb1 + job->cb_tx_prefix_len +
-				       sp->extranonce_prefix_len, 0, sp->pad_len);
-			dealloc(job->coinb1);
-			job->coinb1 = ncoinb1;
-			job->coinb1len = nlen;
-		}
-		/* Flush newest minable job so downstream adopts the prefix. */
-		if (sp->have_prevhash) {
-			for (ji = 0; ji < SV2_PROXY_JOBS; ji++) {
-				int idx = (sp->job_head - 1 - ji + SV2_PROXY_JOBS) %
-					  SV2_PROXY_JOBS;
-				struct sv2_proxy_job *job = &sp->jobs[idx];
-
-				if (job->valid && !job->future && job->coinb1) {
-					sv2_proxy_send_job(proxi, job, true);
-					break;
-				}
-			}
-		}
-		/* A SetCustomMiningJob still in flight was built on the old hole, so
-		 * its Success would install work nobody can mine. */
-		mutex_lock(&sp->send_lock);
-		if (sp->custom_pending) {
-			sp->custom_pending = false;
-			dropped = sp->custom_stage;
-			memset(&sp->custom_stage, 0, sizeof(sp->custom_stage));
-			had_custom = true;
-		}
-		mutex_unlock(&sp->send_lock);
-		sv2_proxy_job_clear(&dropped);
-		if (had_custom) {
-			sp->have_custom_prev = false;
-			sv2_proxy_work_src(proxi, SV2_WS_POOL,
-					   "custom work dropped for a new extranonce prefix");
+		if (sv2_proxy_new_prefix(sp, &e))
 			sv2_jdc_custom_dropped("SetExtranoncePrefix");
-		}
 		break;
 	}
 	case SV2_MSG_SUBMIT_SHARES_SUCCESS: {

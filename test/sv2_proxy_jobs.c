@@ -74,6 +74,39 @@ int main(void)
 		assert(sv2_proxy_find_job(&sp, 7) == current);
 		sv2_proxy_invalidate_jobs(&sp, NULL);
 	}
+	{
+		/* Spec 5.3.10: SetExtranoncePrefix applies to jobs sent after it. */
+		struct sv2_new_extended_mining_job nj = {0};
+		struct sv2_set_extranonce_prefix e = {0};
+		struct sv2_proxy_job *job;
+		uint8_t cb[4] = {1, 2, 3, 4};
+
+		mutex_init(&sp.send_lock);
+		sp.extranonce_prefix[0] = 0xaa;
+		sp.extranonce_prefix_len = 1;
+		nj.job_id = 20;
+		nj.coinbase_tx_prefix = cb;
+		nj.coinbase_tx_prefix_len = sizeof(cb);
+		nj.coinbase_tx_suffix = cb;
+		nj.coinbase_tx_suffix_len = sizeof(cb);
+		sv2_proxy_store_job(&sp, &nj);
+		e.extranonce_prefix[0] = 0xbb;
+		e.extranonce_prefix[1] = 0xcc;
+		e.extranonce_prefix_len = 2;
+		sp.custom_pending = true;
+		assert(sv2_proxy_new_prefix(&sp, &e) && !sp.custom_pending);
+		assert(sp.extranonce_prefix_len == 2);
+		job = sv2_proxy_find_job(&sp, 20);
+		assert(job && job->en_prefix_len == 1 && job->en_prefix[0] == 0xaa);
+		assert(job->coinb1len == 5 && job->coinb1[4] == 0xaa);
+		nj.job_id = 21;
+		job = sv2_proxy_store_job(&sp, &nj);
+		assert(job->en_prefix_len == 2 && job->coinb1len == 6);
+		assert(job->coinb1[4] == 0xbb && job->coinb1[5] == 0xcc);
+		assert(sv2_proxy_find_job(&sp, 20)->coinb1[4] == 0xaa);
+		assert(!sv2_proxy_new_prefix(&sp, &e));
+		sv2_proxy_invalidate_jobs(&sp, NULL);
+	}
 	puts("sv2_proxy_jobs: all OK");
 	return 0;
 }
