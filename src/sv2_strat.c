@@ -1017,6 +1017,11 @@ static uint8_t *handle_setup(struct sv2_client *c, const uint8_t *payload,
 	c->flags = sc.flags;
 	memset(&ok, 0, sizeof(ok));
 	ok.used_version = 2;
+	/* §5.3.1: NewMiningJob always permits rolling the BIP323 bits unless
+	 * we say otherwise here. REQUIRES_VERSION_ROLLING clients were refused
+	 * above when there is no mask, so this never contradicts their flags. */
+	if (!ckpool.version_mask)
+		ok.flags |= SV2_FLAG_REQUIRES_FIXED_VERSION;
 	if (!sv2_encode_setup_connection_success(pbuf, sizeof(pbuf), &plen, &ok))
 		return NULL;
 	LOGNOTICE("SV2 SetupConnection ok client %"PRId64" vendor=%s%s",

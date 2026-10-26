@@ -588,6 +588,35 @@ static void check_version_rolling(void)
 	require(sv2_submit_version_ok(base, base, false), "unrolled version accepted");
 }
 
+/* Spec 5.3.1: a pool with no version mask must say so, as standard jobs
+ * otherwise always permit rolling. */
+static void check_fixed_version(void)
+{
+	const uint32_t masks[] = {0, 0x1fffe000};
+	struct sv2_setup_connection_success ok;
+	struct sv2_setup_connection sc = {0};
+	uint32_t saved = ckpool.version_mask;
+	uint8_t payload[512], *reply;
+	size_t len, rlen;
+	unsigned int i;
+
+	sc.min_version = sc.max_version = 2;
+	require(sv2_encode_setup_connection(payload, sizeof(payload), &len, &sc), "encode setup");
+	for (i = 0; i < sizeof(masks) / sizeof(masks[0]); i++) {
+		struct sv2_client c = {0};
+
+		ckpool.version_mask = masks[i];
+		reply = handle_setup(&c, payload, len, &rlen);
+		require(reply && c.setup_ok && reply[2] == SV2_MSG_SETUP_CONNECTION_SUCCESS &&
+			sv2_decode_setup_connection_success(reply + 6, rlen - 6, &ok),
+			"setup accepted");
+		require(!!(ok.flags & SV2_FLAG_REQUIRES_FIXED_VERSION) == !masks[i],
+			"fixed version advertised only without a mask");
+		free(reply);
+	}
+	ckpool.version_mask = saved;
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -611,6 +640,7 @@ int main(void)
 	check_batch_timer();
 	check_worker_identities();
 	check_version_rolling();
+	check_fixed_version();
 	puts("sv2_groups: all OK");
 	return 0;
 }
