@@ -588,6 +588,48 @@ static void check_version_rolling(void)
 	require(sv2_submit_version_ok(base, base, false), "unrolled version accepted");
 }
 
+static unsigned int count_channels(int64_t client_id, bool standard)
+{
+	struct sv2_channel *ch, *tmp;
+	unsigned int n = 0;
+
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id == client_id && ch->standard == standard)
+			n++;
+	}
+	mutex_unlock(&sv2_lock);
+	return n;
+}
+
+static void send_close(uint32_t channel_id)
+{
+	uint8_t payload[64], *p = payload;
+
+	sv2_write_u32(&p, channel_id);
+	sv2_write_str0_255(&p, "test");
+	send_request(SV2_MSG_CLOSE_CHANNEL, payload, p - payload, false);
+}
+
+/* Spec 5.3.9: closing a group channel closes every channel in the group. */
+static void check_close_group(void)
+{
+	ckpool.nonce1length = 4;
+	ckpool.nonce2length = 8;
+	check_connection(1, false);
+	require(count_channels(1, true) == 4 && count_channels(1, false) == 4 &&
+		sessions == 8, "four channels of each kind open");
+	send_close(SV2_FIRST_CHANNEL_ID);
+	require(count_channels(1, true) + count_channels(1, false) == 7 && sessions == 7,
+		"single channel close");
+	send_close(SV2_STANDARD_GROUP_ID);
+	require(!count_channels(1, true) && count_channels(1, false) >= 3,
+		"standard group closed, extended untouched");
+	send_close(SV2_EXTENDED_GROUP_ID);
+	require(!count_channels(1, false) && !sessions, "extended group closed");
+	sv2_strat_drop_all();
+}
+
 /* Spec 5.3.1: a pool with no version mask must say so, as standard jobs
  * otherwise always permit rolling. */
 static void check_fixed_version(void)
@@ -641,6 +683,7 @@ int main(void)
 	check_worker_identities();
 	check_version_rolling();
 	check_fixed_version();
+	check_close_group();
 	puts("sv2_groups: all OK");
 	return 0;
 }

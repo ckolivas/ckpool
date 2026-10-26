@@ -2085,6 +2085,46 @@ void sv2_strat_clear_instance(int64_t instance_id)
 	mutex_unlock(&sv2_lock);
 }
 
+/*
+ * CloseChannel for one channel, or for every member when channel_id names one
+ * of our groups (spec 5.3.9). Same two-phase free as sv2_strat_drop_client.
+ */
+static void close_channels(int64_t client_id, uint32_t channel_id)
+{
+	bool group = channel_id == SV2_STANDARD_GROUP_ID ||
+		     channel_id == SV2_EXTENDED_GROUP_ID;
+	struct sv2_channel *ch, *tmp, *dead, **to_free = NULL;
+	int nfree = 0, niids = 0, i;
+	int64_t *iids = NULL;
+
+	ensure_lock();
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id != client_id)
+			continue;
+		if (group ? ch->standard != (channel_id == SV2_STANDARD_GROUP_ID) :
+		    ch->channel_id != channel_id)
+			continue;
+		if (ch->instance_id) {
+			iids = ckrealloc(iids, (niids + 1) * sizeof(*iids));
+			iids[niids++] = ch->instance_id;
+		}
+		HASH_DEL(sv2_channels, ch);
+		dead = channel_unref_locked(ch);
+		if (dead) {
+			to_free = ckrealloc(to_free, (nfree + 1) * sizeof(*to_free));
+			to_free[nfree++] = dead;
+		}
+	}
+	mutex_unlock(&sv2_lock);
+	for (i = 0; i < nfree; i++)
+		channel_finish_free(to_free[i]);
+	dealloc(to_free);
+	for (i = 0; i < niids; i++)
+		stratifier_sv2_close_session(iids[i]);
+	dealloc(iids);
+}
+
 uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 				size_t framelen, size_t *replylen)
 {
@@ -2254,28 +2294,9 @@ uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 	}
 	case SV2_MSG_CLOSE_CHANNEL: {
 		struct sv2_close_channel cl;
-		struct sv2_channel *ch;
-		struct sv2_chan_key key;
-		int64_t iid = 0;
 
-		if (sv2_decode_close_channel(payload, plen, &cl)) {
-			struct sv2_channel *dead = NULL;
-
-			chan_key_init(&key, client_id, cl.channel_id);
-			ensure_lock();
-			mutex_lock(&sv2_lock);
-			HASH_FIND(hh, sv2_channels, &key, sizeof(key), ch);
-			if (ch) {
-				iid = ch->instance_id;
-				HASH_DEL(sv2_channels, ch);
-				dead = channel_unref_locked(ch);
-			}
-			mutex_unlock(&sv2_lock);
-			if (dead)
-				channel_finish_free(dead);
-			if (iid)
-				stratifier_sv2_close_session(iid);
-		}
+		if (sv2_decode_close_channel(payload, plen, &cl))
+			close_channels(client_id, cl.channel_id);
 		ret = NULL;
 		break;
 	}
