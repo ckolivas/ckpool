@@ -7232,7 +7232,6 @@ bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 	stratum_instance_t *client;
 	sdata_t *sdata = ckpool.sdata;
 	int cblen, i, en1len;
-	uint32_t *data32, *swap32;
 
 	if (!stratifier_sv2_snapshot_work(&snap, instance_id))
 		return false;
@@ -7260,9 +7259,10 @@ bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 		gen_hash(merkle_sha, merkle_root, 64);
 		memcpy(merkle_sha, merkle_root, 32);
 	}
-	data32 = (uint32_t *)merkle_sha;
-	swap32 = (uint32_t *)merkle_root_le;
-	flip_32(swap32, data32);
+	/* Raw SHA256d output is already header byte order, which is what SV2
+	 * NewMiningJob.merkle_root expects. Unlike the v1 share path we are not
+	 * inserting into the word-swapped headerbin, so no flip_32. */
+	memcpy(merkle_root_le, merkle_sha, 32);
 
 	if (wb_id_out)
 		*wb_id_out = snap.wb_id;
