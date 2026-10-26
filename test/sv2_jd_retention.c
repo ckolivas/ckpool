@@ -354,6 +354,19 @@ int main(void)
 		assert(sv2_decode_setup_connection_error(reply + 6, rlen - 6, &err));
 		assert(err.flags == (UINT32_MAX & ~SV2_JD_FLAG_DECLARE_TX_DATA));
 		free(reply);
+		/* A missing required flag is not an unsupported one (spec 3.6.3). */
+		sc.flags = 0;
+		assert(sv2_encode_setup_connection(payload, sizeof(payload), &len, &sc));
+		reply = handle_setup(&c, payload, len, &rlen);
+		assert(reply && !c.setup_ok);
+		assert(sv2_decode_setup_connection_error(reply + 6, rlen - 6, &err));
+		assert(!err.flags && !strcmp(err.error_code, "full-template-mode-required"));
+		free(reply);
+		sc.flags = SV2_JD_FLAG_DECLARE_TX_DATA;
+		assert(sv2_encode_setup_connection(payload, sizeof(payload), &len, &sc));
+		reply = handle_setup(&c, payload, len, &rlen);
+		assert(reply && c.setup_ok && reply[2] == SV2_MSG_SETUP_CONNECTION_SUCCESS);
+		free(reply);
 	}
 	puts("sv2_jd_retention: all OK");
 	return 0;
