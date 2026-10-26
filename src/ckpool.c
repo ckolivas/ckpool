@@ -2315,20 +2315,17 @@ int main(int argc, char **argv)
 	append_sv2_serverurls(ckpool.sv2url, ckpool.sv2urls, false, 3336);
 	append_sv2_serverurls(ckpool.sv2jdurl, ckpool.sv2jdurls, true, 3337);
 	/*
-	 * SV2 has no version-mask advertisement: NewExtendedMiningJob's
-	 * version_rolling_allowed grants every BIP320 general-purpose bit
-	 * (0x1fffe000), and clients cannot be told about a narrower policy the
-	 * way SV1 mining.configure does. Shares rolling bits outside the mask
-	 * are rejected invalid-share, so a narrowed mask silently costs SV2
-	 * miners work. Warn loudly; version_mask == 0 refuses
-	 * REQUIRES_VERSION_ROLLING clients outright at SetupConnection instead.
+	 * SV2 has no version-mask advertisement: clients may roll every BIP323
+	 * general purpose bit (0x1fffffe0) and cannot be told about a narrower
+	 * policy the way SV1 mining.configure does. version_mask therefore only
+	 * switches SV2 rolling on or off; 0 refuses REQUIRES_VERSION_ROLLING
+	 * clients at SetupConnection and fixes the version for everyone else.
 	 */
 	if ((ckpool.sv2urls || ckpool.sv2jdurls) && ckpool.version_mask &&
-	    ckpool.version_mask != 0x1fffe000) {
-		LOGWARNING("version_mask 0x%08x is narrower than BIP320 0x1fffe000: "
-			   "SV2 clients are granted all BIP320 bits by version_rolling_allowed "
-			   "and cannot learn the narrower mask — shares rolling excluded bits "
-			   "will be rejected", ckpool.version_mask);
+	    ckpool.version_mask != 0x1fffffe0) {
+		LOGNOTICE("version_mask 0x%08x applies to SV1 only: SV2 clients may roll "
+			  "all BIP323 bits 0x1fffffe0 (set 0 to disable SV2 version rolling)",
+			  ckpool.version_mask);
 	}
 	/*
 	 * Default Noise key paths when not set in the conf file.

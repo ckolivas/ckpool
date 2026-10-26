@@ -315,7 +315,9 @@ the health of the bitcoin network.
 
 `"version_mask"` : This is a mask of which bits in the version number it is
 valid for a client to alter and is expressed as an hex string. Eg `"00fff000"`
-Default is `"1fffe000"`.
+Default is `"1fffe000"`. Stratum V2 cannot advertise a mask, so SV2 clients may
+alter any BIP323 bit (`"1fffffe0"`) unless this is set to `"0"`, which disables
+SV2 version rolling entirely.
 
 `"dropidle"` : Drop clients which have been idle for this duration in seconds,
 use 0 to disable. Default 0.

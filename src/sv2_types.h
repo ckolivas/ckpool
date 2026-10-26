@@ -76,6 +76,9 @@
 /* Job Declaration SetupConnection.flags */
 #define SV2_JD_FLAG_DECLARE_TX_DATA		(1u << 0)
 
+/* BIP323 general purpose nVersion bits 5-28 a client may roll (spec 05 §5.1) */
+#define SV2_BIP323_VERSION_MASK		0x1fffffe0u
+
 /* SetupConnection.Success.flags (server → client) */
 #define SV2_FLAG_REQUIRES_FIXED_VERSION		(1u << 0)
 #define SV2_FLAG_REQUIRES_EXTENDED_CHANNELS	(1u << 1)

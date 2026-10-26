@@ -575,6 +575,19 @@ static void check_batch_timer(void)
 	sv2_strat_drop_all();
 }
 
+/* Spec 5.1: BIP323 bits 5-28 roll freely, nothing else may change. */
+static void check_version_rolling(void)
+{
+	const uint32_t base = 0x20000000;
+
+	require(sv2_submit_version_ok(base | 0x1fffffe0, base, true), "all BIP323 bits roll");
+	require(sv2_submit_version_ok(base | 0x00001fe0, base, true), "bits 5-12 roll");
+	require(!sv2_submit_version_ok(base | 0x00000010, base, true), "bit 4 is fixed");
+	require(!sv2_submit_version_ok(base ^ 0x20000000, base, true), "bit 29 is fixed");
+	require(!sv2_submit_version_ok(base | 0x00002000, base, false), "no rolling is exact");
+	require(sv2_submit_version_ok(base, base, false), "unrolled version accepted");
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -597,6 +610,7 @@ int main(void)
 	check_protocol_validation();
 	check_batch_timer();
 	check_worker_identities();
+	check_version_rolling();
 	puts("sv2_groups: all OK");
 	return 0;
 }

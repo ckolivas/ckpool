@@ -344,15 +344,16 @@ static bool channel_lookup_job_locked(struct sv2_channel *ch, uint32_t job_id,
 /*
  * Spec §5.3.16 / §5.3.15 / §5.3.18: SubmitShares carries full nVersion.
  * When version_rolling is false the client MUST use the job version as-is.
- * When true, only bits in ckpool.version_mask (BIP320 / pool policy) may
- * differ from the job version — same rule as SV1 invalid-version-mask.
+ * When true, any BIP323 general purpose bit may differ from the job version.
+ * SV2 cannot advertise a narrower mask the way SV1 mining.configure does, so
+ * ckpool.version_mask only decides whether rolling is allowed at all.
  */
 static bool sv2_submit_version_ok(uint32_t submitted, uint32_t job_version,
 				  bool version_rolling)
 {
 	if (!version_rolling)
 		return submitted == job_version;
-	return ((submitted ^ job_version) & ~ckpool.version_mask) == 0;
+	return ((submitted ^ job_version) & ~SV2_BIP323_VERSION_MASK) == 0;
 }
 
 /* Drop all custom jobs (tip change). Pool-template slots stay. */

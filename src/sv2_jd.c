@@ -3386,9 +3386,10 @@ uint8_t *sv2_jd_handle_frame(int64_t client_id, const uint8_t *frame,
 }
 
 /* The header's time and tip are checked by the mining server. Match the
- * remaining job material to the immutable declaration, allowing BIP320 bits. */
+ * remaining job material to the immutable declaration, allowing BIP323 bits. */
 bool sv2_jd_custom_matches(const struct sv2_set_custom_mining_job *req, uint8_t hole)
 {
+	uint32_t rolling = ckpool.version_mask ? SV2_BIP323_VERSION_MASK : 0;
 	struct sv2_jd_token *tok;
 	uint8_t zeros[32] = {0}, cbhash[32], root[32], *cb;
 	size_t cap = (size_t)req->coinbase_tx_outputs_len + 151, len;
@@ -3409,7 +3410,7 @@ bool sv2_jd_custom_matches(const struct sv2_set_custom_mining_job *req, uint8_t 
 	mutex_lock(&jd_lock);
 	tok = find_token_locked(req->mining_job_token, req->mining_job_token_len);
 	if (tok && tok->declared && tok->have_custom_commitment && tok->enonce_len == hole &&
-	    !((req->version ^ tok->version) & ~ckpool.version_mask) &&
+	    !((req->version ^ tok->version) & ~rolling) &&
 	    !memcmp(cbhash, tok->coinbase_zero_txid, 32) &&
 	    !memcmp(root, tok->merkle_zero_root, 32))
 		ok = true;
