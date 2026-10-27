@@ -92,6 +92,9 @@ sps_t allsps;
  * no longer being updated and its hashrates and worker count are frozen. */
 #define USER_FROZEN 300
 
+/* A pool.status this many seconds old means its pool is no longer running. */
+#define POOL_STALE 300
+
 typedef struct {
 	UT_hash_handle hh;
 
@@ -105,6 +108,16 @@ typedef struct {
 	int64_t currejected;
 	int64_t curlastupdate;
 	double curdiff;
+	/* This pool's own stats for the summary log */
+	pstats_t pstats;
+	sps_t sps;
+	double hashrate5m;
+	double hashrate1hr;
+	double hashrate1d;
+	double hashrate7d;
+	bool solved;		/* Solved a block since the last run */
+	int64_t solvedaccepted;	/* Accepted count it took to solve it */
+	double solvedpct;	/* As a percentage of network difficulty */
 	bool known;	/* Was in the state file */
 	bool present;	/* Is in the current config */
 } pool_t;
@@ -112,6 +125,13 @@ typedef struct {
 pool_t *pools;
 
 const char *statefile = "ckpoolstats.state";
+/* Persistent log appended with a summary of each pool hourly and whenever a
+ * block is solved. */
+const char *summaryfile = "ckpoolstats-summary.log";
+int64_t lastsummary;
+
+/* Current time, sampled once at startup as the reference for expiry. */
+static int64_t now_t;
 int64_t total_accepted, total_rejected;
 double networkdiff;
 bool firstrun = true;
@@ -298,6 +318,7 @@ static void read_state(void)
 	json_get_int64(&total_accepted, root, "accepted");
 	json_get_int64(&total_rejected, root, "rejected");
 	json_get_double(&networkdiff, root, "networkdiff");
+	json_get_int64(&lastsummary, root, "lastsummary");
 	log("Loaded state accepted %"PRId64" rejected %"PRId64" networkdiff %.1f",
 	    total_accepted, total_rejected, networkdiff);
 
@@ -342,12 +363,13 @@ static void write_state(void)
 	tv_t now;
 
 	tv_time(&now);
-	doc = yyjson_mut_pack("{si,sI,sI,sI,sf}",
+	doc = yyjson_mut_pack("{si,sI,sI,sI,sf,sI}",
 		     "version", STATE_VERSION,
 		  "lastupdate", (int64_t)now.tv_sec,
 		    "accepted", total_accepted,
 		    "rejected", total_rejected,
-		 "networkdiff", networkdiff);
+		 "networkdiff", networkdiff,
+		 "lastsummary", lastsummary);
 	if (unlikely(!doc))
 		fail("Failed to create state document");
 	root = yyjson_mut_doc_get_root(doc);
@@ -390,8 +412,9 @@ static bool solved_block(const pool_t *pool)
 }
 
 /* Accumulate our own running totals from the difference in each pool's counts
- * since the last run, resetting the totals if any pool solved a block. */
-static void update_totals(void)
+ * since the last run, resetting the totals if any pool solved a block. Returns
+ * whether any pool solved a block. */
+static bool update_totals(void)
 {
 	int64_t deltaacc = 0, deltarej = 0, prevacc = 0, prevrej = 0;
 	bool blocksolved = false;
@@ -419,6 +442,11 @@ static void update_totals(void)
 			log("Pool %s accepted dropped from %"PRId64" to %"PRId64", block solved",
 			    pool->dir, pool->accepted, pool->curaccepted);
 			blocksolved = true;
+			pool->solved = true;
+			pool->solvedaccepted = pool->accepted;
+			/* Still the network difficulty the block was solved at */
+			if (networkdiff > 0)
+				pool->solvedpct = pool->accepted * 100 / networkdiff;
 			/* Everything it has now is since the block */
 			dacc = pool->curaccepted;
 			drej = pool->currejected;
@@ -460,6 +488,8 @@ static void update_totals(void)
 
 	allsps.accepted = total_accepted;
 	allsps.rejected = total_rejected;
+
+	return blocksolved;
 }
 
 /* Each pool stores the proportion of the network difficulty it has found as a
@@ -518,6 +548,7 @@ void read_poolstats(pool_t *pool, FILE *fp)
 	allpstats.workers += json_get_int64(&poolpstats.workers, val, "Workers");
 	allpstats.idle += json_get_int64(&poolpstats.idle, val, "Idle");
 	allpstats.disconnected += json_get_int64(&poolpstats.disconnected, val, "Disconnected");
+	pool->pstats = poolpstats;
 	yyjson_mut_doc_free(doc);
 
 	/* Pessimise these two values from worst stats */
@@ -531,12 +562,16 @@ void read_poolstats(pool_t *pool, FILE *fp)
 		fail("Failed to json decode dsps line from pool logfile: %s", sps);
 	val = yyjson_mut_doc_get_root(doc);
 	alldsps.hashrate1m += dsps_from_key(val, "hashrate1m");
-	alldsps.hashrate5m += dsps_from_key(val, "hashrate5m");
+	pool->hashrate5m = dsps_from_key(val, "hashrate5m");
+	alldsps.hashrate5m += pool->hashrate5m;
 	alldsps.hashrate15m += dsps_from_key(val, "hashrate15m");
-	alldsps.hashrate1hr += dsps_from_key(val, "hashrate1hr");
+	pool->hashrate1hr = dsps_from_key(val, "hashrate1hr");
+	alldsps.hashrate1hr += pool->hashrate1hr;
 	alldsps.hashrate6hr += dsps_from_key(val, "hashrate6hr");
-	alldsps.hashrate1d += dsps_from_key(val, "hashrate1d");
-	alldsps.hashrate7d += dsps_from_key(val, "hashrate7d");
+	pool->hashrate1d = dsps_from_key(val, "hashrate1d");
+	alldsps.hashrate1d += pool->hashrate1d;
+	pool->hashrate7d = dsps_from_key(val, "hashrate7d");
+	alldsps.hashrate7d += pool->hashrate7d;
 	yyjson_mut_doc_free(doc);
 
 	doc = parse_json(sps);
@@ -557,7 +592,70 @@ void read_poolstats(pool_t *pool, FILE *fp)
 	json_get_int64(&poolsps.bestshare, val, "bestshare");
 	if (poolsps.bestshare > allsps.bestshare)
 		allsps.bestshare = poolsps.bestshare;
+	pool->sps = poolsps;
 	yyjson_mut_doc_free(doc);
+}
+
+/* Append a one line summary of each pool in the config to the summary log,
+ * each line stamped with the time and the reason it was written so the log
+ * can be grepped by pool, preceded by a line for each block solved. */
+static void write_summary(const char *reason)
+{
+	char timestr[64], up[32], acc[16], rej[16], best[16];
+	char h5[16], h60[16], h1440[16], h10080[16];
+	time_t now = now_t;
+	pool_t *pool, *tmp;
+	struct tm tm;
+	FILE *fp;
+
+	fp = fopen(summaryfile, "ae");
+	if (unlikely(!fp)) {
+		logerr("Failed to open summary log %s", summaryfile);
+		return;
+	}
+	localtime_r(&now, &tm);
+	strftime(timestr, sizeof(timestr), "%F %T %Z", &tm);
+
+	HASH_ITER(hh, pools, pool, tmp) {
+		if (!pool->present || !pool->solved)
+			continue;
+		suffix_string(pool->solvedaccepted, acc, 16, 0);
+		fprintf(fp, "%s block %s: solved after %s accepted (%.2f%% of network difficulty)\n",
+			timestr, pool->dir, acc, pool->solvedpct);
+	}
+
+	HASH_ITER(hh, pools, pool, tmp) {
+		int64_t runtime = pool->pstats.runtime;
+		double totalshares;
+
+		if (!pool->present)
+			continue;
+		snprintf(up, sizeof(up), "%"PRId64"d%02"PRId64"h%02"PRId64"m",
+			 runtime / 86400, runtime % 86400 / 3600, runtime % 3600 / 60);
+		suffix_string(pool->hashrate5m * nonces, h5, 16, 0);
+		suffix_string(pool->hashrate1hr * nonces, h60, 16, 0);
+		suffix_string(pool->hashrate1d * nonces, h1440, 16, 0);
+		suffix_string(pool->hashrate7d * nonces, h10080, 16, 0);
+		suffix_string(pool->sps.accepted, acc, 16, 0);
+		suffix_string(pool->sps.rejected, rej, 16, 0);
+		suffix_string(pool->sps.bestshare, best, 16, 0);
+		totalshares = pool->sps.accepted + pool->sps.rejected;
+		fprintf(fp, "%s %s %s:%s up %s users %"PRId64" workers %"PRId64
+			" idle %"PRId64" disconnected %"PRId64
+			" hashrate5m %s 1hr %s 1d %s 7d %s SPS1h %.1f"
+			" accepted %s rejected %s (%.2f%%) diff %.2f%% bestshare %s\n",
+			timestr, reason, pool->dir,
+			now_t - pool->pstats.lastupdate > POOL_STALE ? " STALE" : "",
+			up, pool->pstats.users, pool->pstats.workers,
+			pool->pstats.idle, pool->pstats.disconnected,
+			h5, h60, h1440, h10080, pool->sps.sps1h, acc, rej,
+			totalshares > 0 ? pool->sps.rejected * 100 / totalshares : 0,
+			pool->sps.diff, best);
+	}
+	if (unlikely(fclose(fp)))
+		logerr("Failed to write summary log %s", summaryfile);
+	else
+		log("Appended %s summary to %s", reason, summaryfile);
 }
 
 static void add_hashrates(yyjson_mut_doc *doc, yyjson_mut_val *sval, yyjson_mut_val *val, const char *key)
@@ -647,9 +745,6 @@ user_t *get_user(const char *username, bool *new)
 	}
 	return user;
 }
-
-/* Current time, sampled once at startup as the reference for expiry. */
-static int64_t now_t;
 
 /* Workers whose last share is older than WORKER_EXPIRY have had their stats
  * frozen by the stratifier so must not be collated. */
@@ -787,6 +882,7 @@ int main(int argc, char __maybe_unused **argv)
 	yyjson_mut_doc *confdoc, *doc;
 	yyjson_mut_val *conf, *dirs, *val, *sval;
 	size_t index, max;
+	bool blocksolved;
 	FILE *fp;
 	char *s;
 	int opt;
@@ -819,6 +915,9 @@ int main(int argc, char __maybe_unused **argv)
 	sval = yyjson_mut_obj_get(conf, "statefile");
 	if (sval && yyjson_mut_is_str(sval))
 		statefile = yyjson_mut_get_str(sval);
+	sval = yyjson_mut_obj_get(conf, "summaryfile");
+	if (sval && yyjson_mut_is_str(sval))
+		summaryfile = yyjson_mut_get_str(sval);
 
 	/* Load our own accumulated stats from the last run, if any */
 	read_state();
@@ -844,8 +943,16 @@ int main(int argc, char __maybe_unused **argv)
 
 	/* Accumulate our own accepted/rejected totals and derive the network
 	 * difficulty percentage from them before writing anything out. */
-	update_totals();
+	blocksolved = update_totals();
 	update_networkdiff();
+	/* Summarise each pool on the first run in each hour and as soon as a
+	 * block is solved, before storing when we last did so. */
+	if (blocksolved)
+		write_summary("block");
+	if (now_t / 3600 != lastsummary / 3600) {
+		write_summary("hourly");
+		lastsummary = now_t;
+	}
 	write_state();
 
 	/* Write pool.status for allstats */
