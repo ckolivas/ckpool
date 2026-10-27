@@ -87,6 +87,11 @@ sps_t allsps;
  * than this have frozen stats so we discard them as well. */
 #define WORKER_EXPIRY 600000
 
+/* The stratifier rewrites the user files it holds every minute along with its
+ * pool.status, so a user file this many seconds older than its pool.status is
+ * no longer being updated and its hashrates and worker count are frozen. */
+#define USER_FROZEN 300
+
 typedef struct {
 	UT_hash_handle hh;
 
@@ -659,16 +664,31 @@ static bool worker_expired(yyjson_mut_val *wval)
 	return (now_t - lastshare > WORKER_EXPIRY);
 }
 
-/* Discard the hashrates from the source file, which include those of the
- * workers we're dropping, ready to be accumulated from the workers we keep. */
-static void zero_hashrates(user_t *user)
+/* Discard the hashrates from a user or worker in the source file. */
+static void zero_hashrates(yyjson_mut_doc *doc, yyjson_mut_val *val)
 {
 	int i;
 
 	for (i = 0; hashrate_keys[i]; i++) {
-		yyjson_mut_obj_put(user->json, yyjson_mut_strcpy(user->doc, hashrate_keys[i]),
-				   yyjson_mut_strcpy(user->doc, "0"));
+		yyjson_mut_obj_put(val, yyjson_mut_strcpy(doc, hashrate_keys[i]),
+				   yyjson_mut_strcpy(doc, "0"));
 	}
+}
+
+/* A frozen user file still holds valid share history, but its hashrates and
+ * worker count describe a user no longer mining there so must not be added. */
+static void freeze_user(yyjson_mut_doc *doc, yyjson_mut_val *val)
+{
+	yyjson_mut_val *warray = yyjson_mut_obj_get(val, "worker");
+	yyjson_mut_val *w;
+	size_t index, max;
+
+	zero_hashrates(doc, val);
+	yyjson_mut_obj_put(val, yyjson_mut_strcpy(doc, "workers"), yyjson_mut_int(doc, 0));
+	if (!warray || !yyjson_mut_is_arr(warray))
+		return;
+	yyjson_mut_arr_foreach(warray, index, max, w)
+		zero_hashrates(doc, w);
 }
 
 static void init_worker_hash(user_t *user)
@@ -681,7 +701,10 @@ static void init_worker_hash(user_t *user)
 	if (!warray || !yyjson_mut_is_arr(warray))
 		return;
 
-	zero_hashrates(user);
+	/* Discard the hashrates from the source file, which include those of
+	 * the workers we're dropping, ready to be accumulated from the workers
+	 * we keep. */
+	zero_hashrates(user->doc, user->json);
 
 	while (index < yyjson_mut_arr_size(warray)) {
 		yyjson_mut_val *wn_val;
@@ -903,9 +926,17 @@ int main(int argc, char __maybe_unused **argv)
 workers_only:
 	yyjson_mut_arr_foreach(dirs, index, max, val) {
 		struct dirent *dir;
+		struct stat fdbuf;
+		time_t poolupdate;
 		char *username;
 		DIR *d;
 		const char *sdir = yyjson_mut_get_str(val);
+
+		/* Without a pool.status we can't tell which user files are
+		 * frozen so treat them all as current. */
+		ASPRINTF(&s, "%s/pool/pool.status", sdir);
+		poolupdate = stat(s, &fdbuf) ? 0 : fdbuf.st_mtime;
+		free(s);
 
 		ASPRINTF(&s, "%s/users", sdir);
 		d = opendir(s);
@@ -917,18 +948,24 @@ workers_only:
 			user_t *user = NULL;
 			yyjson_mut_doc *fdoc;
 			yyjson_mut_val *fval;
-			bool new = false;
+			bool new = false, frozen;
 
 			username = basename(dir->d_name);
 			if (!strcmp(username, "/") || !strcmp(username, ".") || !strcmp(username, ".."))
 				continue;
 
 			ASPRINTF(&s, "%s/users/%s", sdir, username);
+			frozen = poolupdate && !stat(s, &fdbuf) &&
+				 poolupdate - fdbuf.st_mtime > USER_FROZEN;
 			fdoc = read_json_file(s);
 			free(s);
 			if (!fdoc) /* Invalid or not user file */
 				continue;
 			fval = yyjson_mut_doc_get_root(fdoc);
+			if (frozen) {
+				LOGDEBUG("Discarding frozen hashrates of user %s in %s", username, sdir);
+				freeze_user(fdoc, fval);
+			}
 			user = get_user(username, &new);
 			if (new) {
 				user->doc = fdoc;
