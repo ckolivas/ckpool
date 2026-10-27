@@ -6046,8 +6046,11 @@ static void read_userstats(sdata_t *sdata, int tvsec_diff)
 		LOGINFO("Successfully read user %s stats %f %f %f %f %f %f %ld %ld", user->username,
 			user->dsps1, user->dsps5, user->dsps60, user->dsps1440,
 			user->dsps10080, user->best_diff, user->best_ever, user->auth_time);
-		if (tvsec_diff > 60)
+		/* Stats were last decayed when the pool went down */
+		if (tvsec_diff > 60) {
+			user->last_decay.tv_sec -= tvsec_diff;
 			decay_user(user, 0, &now);
+		}
 
 		worker_array = yyjson_obj_get(val, "worker");
 		yyjson_arr_iter_init(worker_array, &iter);
@@ -6082,8 +6085,10 @@ static void read_userstats(sdata_t *sdata, int tvsec_diff)
 			yyjson_obj_get_int64(&worker->shares, arr_val, "shares");
 			LOGINFO("Successfully read worker %s stats %f %f %f %f %f %ld", worker->workername,
 				worker->dsps1, worker->dsps5, worker->dsps60, worker->dsps1440, worker->best_diff, worker->best_ever);
-			if (tvsec_diff > 60)
+			if (tvsec_diff > 60) {
+				worker->last_decay.tv_sec -= tvsec_diff;
 				decay_worker(worker, 0, &now);
+			}
 		}
 		yyjson_doc_free(doc);
 	}
@@ -9966,13 +9971,15 @@ static void *statsupdate(void __maybe_unused *arg)
 			worker_instance_t *worker;
 			yyjson_mut_val *root;
 
-			if (!user->authorised)
-				continue;
-
 			tv_time(&now);
 
 			/* Decay times per user */
 			per_tdiff = tvdiff(&now, &user->last_share);
+			/* Users restored at startup are unauthorised until they
+			 * reconnect, but their stored stats must keep decaying
+			 * until their workers would no longer be stored. */
+			if (!user->authorised && (!user->auth_time || per_tdiff > 600000))
+				continue;
 			/* Drop storage of users with no shares */
 			if (!user->last_share.tv_sec) {
 				LOGDEBUG("Skipping inactive user %s", user->username);
@@ -10080,7 +10087,7 @@ static void *statsupdate(void __maybe_unused *arg)
 			s = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY | YYJSON_WRITE_NEWLINE_AT_END, NULL);
 			add_log_entry(&log_entries, &fname, &s);
 			yyjson_mut_doc_free(doc);
-			if (ckpool.remote)
+			if (ckpool.remote && user->authorised)
 				upstream_workers(user);
 		}
 
