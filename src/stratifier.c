@@ -10572,6 +10572,13 @@ static void *ipcnotify(void __maybe_unused *arg)
 			}
 			continue;
 		}
+		/* bitcoind is shutting down and returns at once on every call
+		 * until it drops the connection, so pace the retries instead of
+		 * spinning on it. */
+		if (rc == MINING_IPC_NO_TIP) {
+			cksleep_ms(1000);
+			continue;
+		}
 
 		/* Non-zero means the connection was lost (a benign timeout returns
 		 * the current tip, not an error). Re-obtain a Mining client,

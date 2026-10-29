@@ -227,6 +227,9 @@ public:
 				req.setTimeout(timeout_seconds * 1000);
 
 			auto resp = req.send().wait(ws);
+			/* bitcoind returns no tip only once it is shutting down. */
+			if (!resp.hasResult())
+				return MINING_IPC_NO_TIP;
 			return fill_tip(resp.getResult(), out);
 		} catch (const kj::Exception &e) {
 			/* bitcoind signals a genuine timeout by returning the current

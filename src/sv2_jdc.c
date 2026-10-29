@@ -2263,6 +2263,13 @@ static void *jdc_tipwaiter(void __maybe_unused *arg)
 				cksleep_ms(SV2_JDC_TIP_POLL_MS);
 			continue;
 		}
+		/* bitcoind is shutting down and returns at once on every call
+		 * until it drops the connection, so pace the retries instead of
+		 * spinning on it. */
+		if (rc == MINING_IPC_NO_TIP) {
+			cksleep_ms(1000);
+			continue;
+		}
 
 		/* Non-zero means the connection was lost. */
 		if (mining_ipc_try_obtain_mining(ctx)) {

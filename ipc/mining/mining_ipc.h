@@ -56,8 +56,11 @@ int mining_ipc_get_tip(mining_ipc_ctx *ctx, mining_tip *out_tip);
  * timeout_seconds elapses, returning as soon as a new tip is connected
  * regardless of the timeout. A timeout_seconds <= 0 waits indefinitely.
  * Returns 0 and fills out_new_tip with the new tip, or with the unchanged tip
- * on timeout; non-zero on failure, including a disconnection, which flags the
- * context for reconnection. */
+ * on timeout; MINING_IPC_NO_TIP without waiting once bitcoind is shutting
+ * down, with the connection left up; other non-zero values on failure,
+ * including a disconnection, which flags the context for reconnection. */
+#define MINING_IPC_NO_TIP	1
+
 int mining_ipc_wait_tip_changed(mining_ipc_ctx *ctx,
 				const char *current_tip_hex,
 				double timeout_seconds,
