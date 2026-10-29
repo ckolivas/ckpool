@@ -221,7 +221,10 @@ public:
 			auto req = mining_.waitTipChangedRequest();
 			fill_context(req.initContext());
 			req.setCurrentTip(kj::arrayPtr(reinterpret_cast<const capnp::byte *>(tip), 32));
-			req.setTimeout(timeout_seconds > 0 ? timeout_seconds : 1e9);
+			/* bitcoind takes the timeout in milliseconds, and waits
+			 * indefinitely for a new tip without one. */
+			if (timeout_seconds > 0)
+				req.setTimeout(timeout_seconds * 1000);
 
 			auto resp = req.send().wait(ws);
 			return fill_tip(resp.getResult(), out);

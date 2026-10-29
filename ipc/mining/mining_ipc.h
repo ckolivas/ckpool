@@ -53,9 +53,11 @@ int mining_ipc_try_obtain_mining(mining_ipc_ctx *ctx);
 int mining_ipc_get_tip(mining_ipc_ctx *ctx, mining_tip *out_tip);
 
 /* Block until the chain tip differs from current_tip_hex (64 hex chars) or
- * timeout_seconds elapses. Returns 0 and fills out_new_tip when a new tip
- * arrives; non-zero on timeout or failure. A timeout is a normal, non-fatal
- * result; a disconnection flags the context for reconnection. */
+ * timeout_seconds elapses, returning as soon as a new tip is connected
+ * regardless of the timeout. A timeout_seconds <= 0 waits indefinitely.
+ * Returns 0 and fills out_new_tip with the new tip, or with the unchanged tip
+ * on timeout; non-zero on failure, including a disconnection, which flags the
+ * context for reconnection. */
 int mining_ipc_wait_tip_changed(mining_ipc_ctx *ctx,
 				const char *current_tip_hex,
 				double timeout_seconds,

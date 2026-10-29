@@ -35,9 +35,10 @@
 #define SV2_JDC_MAX_BLOCK_BYTES	(4u << 20)
 /* Seconds between fee-bump template refreshes on an unchanged tip. */
 #define SV2_JDC_REFRESH_SECS	30
-/* Floor between waitTipChanged calls that return the same tip immediately (see
- * jdc_tipwaiter): small enough that tip detection stays prompt if the wait is
- * not blocking, large enough not to spin on the IPC socket. */
+/* Floor between waitTipChanged calls that return the same tip early, before
+ * their timeout (see jdc_tipwaiter): small enough that tip detection stays
+ * prompt if the wait is not blocking, large enough not to spin on the IPC
+ * socket. */
 #define SV2_JDC_TIP_POLL_MS	200
 /* Give up on a declare the JDS never answers. Its checkBlock is a full
  * ConnectBlock and may queue behind others, so allow generously; the cost of

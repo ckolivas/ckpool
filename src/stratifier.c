@@ -10557,12 +10557,11 @@ static void *ipcnotify(void __maybe_unused *arg)
 	while (!ckpool.shutdown) {
 		mining_tip new_tip = {};
 		/* Wait for a tip change. A new block returns immediately; the
-		 * timeout (in seconds) only bounds how often we wake to notice a
-		 * dropped connection or a shutdown request. A short window also
-		 * means we are rarely blocked mid-request, since closing the
-		 * socket while a long waitTipChanged executes wedges bitcoind's
-		 * IPC server. */
-		int rc = mining_ipc_wait_tip_changed(ctx, tip.hash, 5.0, &new_tip);
+		 * 1 second timeout only bounds how often we wake to notice a
+		 * dropped connection or a shutdown request, so a shutdown waits
+		 * at most that long for this thread to disconnect cleanly rather
+		 * than closing the socket under an in-flight waitTipChanged. */
+		int rc = mining_ipc_wait_tip_changed(ctx, tip.hash, 1.0, &new_tip);
 
 		if (!rc) {
 			if (memcmp(new_tip.hash, tip.hash, 64)) {
@@ -10618,9 +10617,9 @@ void stratifier_shutdown_ipc(void)
 {
 	int waited = 0;
 
-	/* Bound the wait comfortably above the ipcnotify wait window (5s) so it
+	/* Bound the wait comfortably above the ipcnotify wait window (1s) so it
 	 * has time to notice the shutdown, break out and disconnect. */
-	while (ckpool.btc_mining_ctx && waited++ < 200)
+	while (ckpool.btc_mining_ctx && waited++ < 60)
 		cksleep_ms(50);
 }
 

@@ -41,10 +41,13 @@ runs as before when Cap'n Proto is absent.
 ### Tip notification
 
 `mining_ipc.h` exposes `connect`, `disconnect`, `get_tip`, `wait_tip_changed`,
-and `try_obtain_mining`. When the `btcmining` config option points at an
+and `try_obtain_mining`. When the `ipcmining` config option points at an
 existing socket, the stratifier drives block updates from
 `Mining.waitTipChanged` instead of ZMQ (with the block-poll thread still
-acting as a backstop).
+acting as a backstop). A new tip returns immediately; each wait is otherwise
+bounded to 1 second (bitcoind takes the timeout in milliseconds, which
+`mining_ipc_wait_tip_changed()` converts from seconds) so a dropped connection
+or a shutdown is noticed within a second.
 
 ### Template service (workgen / submit)
 
