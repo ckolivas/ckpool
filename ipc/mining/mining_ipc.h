@@ -162,11 +162,14 @@ void mining_ipc_block_free(unsigned char *block);
 
 /* Submit a mined solution for a template. coinbase is the full assembled
  * coinbase transaction bytes. Returns 0 and sets *accepted on a completed
- * call; non-zero on RPC failure. */
+ * call; non-zero on RPC failure. On rejection, reason/debug are filled when
+ * non-NULL buffers are provided (NUL-terminated, truncated to size-1). */
 int mining_ipc_submit_solution(mining_block_template *t, uint32_t version,
 			       uint32_t timestamp, uint32_t nonce,
 			       const unsigned char *coinbase, size_t coinbase_len,
-			       int *accepted);
+			       int *accepted,
+			       char *reason, size_t reason_sz,
+			       char *debug, size_t debug_sz);
 
 /* Release a template handle. Safe with NULL. */
 void mining_block_template_destroy(mining_block_template *t);

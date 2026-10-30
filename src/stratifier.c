@@ -41,6 +41,7 @@
 #ifdef HAVE_SV2
 #include "sv2_strat.h"
 #include "sv2_jd.h"
+#include "sv2_tx.h"
 #endif
 
 /* Consistent across all pool instances */
@@ -6647,42 +6648,26 @@ downstream_block(sdata_t *sdata, yyjson_mut_doc *val, const int cblen,
 }
 
 #ifdef HAVE_CAPNP
-/* Submit a solved IPC-templated block via the mining interface. The coinbase
- * must be witness-serialised (marker+flag + coinbase witness reserved value);
- * the server reconstructs and validates the full block. Returns true if
- * accepted. */
-static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char *coinbase,
-			     const int cblen, const uint32_t ntime32)
+/* Serialise the coinbase the way the block carries it. BIP141 only permits
+ * the coinbase to carry a witness when the block has a witness commitment;
+ * without one the coinbase must be serialised legacy or the block is rejected.
+ * generate_coinbase only emits the commitment when insert_witness is set, so
+ * mirror that here instead of always segwit-serialising. Any block containing
+ * a single segwit transaction forces a commitment, so the legacy form is only
+ * used on a witness-free block, in practice regtest. The coinbase passed in is
+ * already in legacy form (version || vin || vout || locktime). Returns a
+ * ckalloced buffer and stores its length in *len. */
+static uchar *ipc_block_coinbase(const workbase_t *wb, const char *coinbase, const int cblen,
+				 int *len)
 {
-	unsigned char *wcb;
-	uint32_t version, nonce;
-	int wl, accepted = 0;
+	uchar *wcb = ckalloc(cblen + 40);
+	int wl = 0;
 
-	/* A real coinbase is well over 60 bytes; guard the tx version(4) +
-	 * body(cblen-8) + locktime(4) arithmetic below against a degenerate
-	 * length. */
-	if (unlikely(!wb->tmpl || cblen < 12))
-		return false;
-	memcpy(&version, data, 4);
-	memcpy(&nonce, data + 76, 4);
-
-	/* BIP141 only permits the coinbase to carry a witness when the block
-	 * has a witness commitment; without one the coinbase must be serialised
-	 * legacy or the block is rejected. generate_coinbase only emits the
-	 * commitment when insert_witness is set, so mirror that here instead of
-	 * always segwit-serialising. Any block containing a single segwit
-	 * transaction forces a commitment, so this is only reached on a
-	 * witness-free block, in practice regtest. The coinbase is already in
-	 * legacy form (version || vin || vout || locktime) so submit it as is. */
 	if (unlikely(!wb->insert_witness)) {
-		if (mining_ipc_submit_solution(wb->tmpl, version, ntime32, nonce,
-					       (const unsigned char *)coinbase,
-					       (size_t)cblen, &accepted))
-			accepted = 0;
-		return accepted;
+		memcpy(wcb, coinbase, cblen);
+		*len = cblen;
+		return wcb;
 	}
-
-	wcb = ckalloc(cblen + 40);
 	memcpy(wcb, coinbase, 4);			/* tx version */
 	wl = 4;
 	wcb[wl++] = 0x00; wcb[wl++] = 0x01;		/* segwit marker + flag */
@@ -6694,11 +6679,90 @@ static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char
 	wl += 32;
 	memcpy(wcb + wl, coinbase + cblen - 4, 4);	/* lock time */
 	wl += 4;
+	*len = wl;
+	return wcb;
+}
 
-	if (mining_ipc_submit_solution(wb->tmpl, version, ntime32, nonce, wcb, wl, &accepted))
+/* Submit a solved IPC-templated block via the mining interface; the server
+ * reconstructs and validates the full block. Returns true if accepted. Sets
+ * *duplicate when bitcoind already has this exact block, such as from a
+ * replayed share, which must not be retried or reported as a new solve. */
+static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char *coinbase,
+			     const int cblen, const uint32_t ntime32, bool *duplicate)
+{
+	char reason[128] = {}, debug[256] = {};
+	uint32_t version, nonce;
+	int wl, accepted = 0;
+	uchar *wcb;
+
+	/* A real coinbase is well over 60 bytes; guard the tx version(4) +
+	 * body(cblen-8) + locktime(4) arithmetic against a degenerate length. */
+	if (unlikely(!wb->tmpl || cblen < 12))
+		return false;
+	memcpy(&version, data, 4);
+	memcpy(&nonce, data + 76, 4);
+
+	wcb = ipc_block_coinbase(wb, coinbase, cblen, &wl);
+	if (mining_ipc_submit_solution(wb->tmpl, version, ntime32, nonce, wcb, wl, &accepted,
+				       reason, sizeof(reason), debug, sizeof(debug))) {
+		LOGWARNING("Failed to submit block %d on the mining IPC", wb->height);
 		accepted = 0;
-	free(wcb);
+	} else if (!accepted) {
+		LOGWARNING("Mining IPC rejected block %d: %s %s", wb->height, reason, debug);
+		*duplicate = !strcmp(reason, "duplicate");
+	}
+	dealloc(wcb);
 	return accepted;
+}
+
+/* Fall back to submitting an IPC-templated block over RPC, so a solve never
+ * depends on the mining IPC alone. The template's own block supplies the
+ * transactions; its header and coinbase are replaced by ours. Returns true if
+ * accepted. */
+static bool ipc_rpc_submit_block(const workbase_t *wb, const uchar *data, const char *coinbase,
+				 const int cblen, const uchar *flip32)
+{
+	const uint8_t *p, *end;
+	uchar *tblock = NULL, *wcb;
+	size_t tlen, cbtxlen, rest;
+	char *gbt_block, *hex;
+	uint64_t txns;
+	int wl;
+
+	if (unlikely(!wb->tmpl || cblen < 12))
+		return false;
+	if (mining_ipc_template_block(wb->tmpl, &tblock, &tlen)) {
+		LOGWARNING("Failed to fetch template block %d to submit over RPC", wb->height);
+		return false;
+	}
+	/* Skip the template's header, transaction count and its own coinbase */
+	p = tblock + 80;
+	end = tblock + tlen;
+	if (tlen <= 80 || !sv2_read_compact_size(&p, end, &txns) || !txns ||
+	    !sv2_bitcoin_tx_parse(p, end - p, &cbtxlen, NULL, NULL)) {
+		LOGWARNING("Failed to parse template block %d to submit over RPC", wb->height);
+		mining_ipc_block_free(tblock);
+		return false;
+	}
+	p += cbtxlen;
+	rest = end - p;
+
+	wcb = ipc_block_coinbase(wb, coinbase, cblen, &wl);
+	/* Header and transaction count, our coinbase, then the transactions */
+	gbt_block = ckalloc((80 + 9 + wl + rest) * 2 + 1);
+	hex = gbt_block;
+	__bin2hex(hex, data, 80);
+	hex += 160;
+	__bin2hex(hex, tblock + 80, (p - cbtxlen) - (tblock + 80));
+	hex += strlen(hex);
+	__bin2hex(hex, wcb, wl);
+	hex += wl * 2;
+	__bin2hex(hex, p, rest);
+	dealloc(wcb);
+	mining_ipc_block_free(tblock);
+
+	LOGWARNING("Submitting block %d over RPC", wb->height);
+	return local_block_submit(gbt_block, flip32, wb->height);
 }
 #endif
 
@@ -6794,9 +6858,13 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	/* Submit block locally after sending it to remote locations avoiding
 	 * the delay of local verification */
 #ifdef HAVE_CAPNP
-	if (wb->ipc)
-		ret = ipc_submit_block(wb, data, coinbase, cblen, ntime32);
-	else
+	if (wb->ipc) {
+		bool duplicate = false;
+
+		ret = ipc_submit_block(wb, data, coinbase, cblen, ntime32, &duplicate);
+		if (!ret && !duplicate)
+			ret = ipc_rpc_submit_block(wb, data, coinbase, cblen, flip32);
+	} else
 #endif
 		ret = local_block_submit(gbt_block, flip32, wb->height);
 	if (ret)

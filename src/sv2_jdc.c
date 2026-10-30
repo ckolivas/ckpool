@@ -1638,6 +1638,7 @@ void sv2_jdc_solved(const struct sv2_jdc_solution *sol)
 {
 	struct sv2_push_solution ps;
 	uint8_t buf[SV2_PUSH_SOLUTION_MAX_BYTES];
+	char reason[128] = {}, debug[256] = {};
 	size_t plen = 0;
 	int accepted = 0;
 	uint64_t generation;
@@ -1688,14 +1689,14 @@ void sv2_jdc_solved(const struct sv2_jdc_solution *sol)
 	 */
 	if (mining_ipc_submit_solution(sol->t->tmpl, sol->version, sol->ntime,
 				       sol->nonce, sol->coinbase, sol->coinbase_len,
-				       &accepted)) {
+				       &accepted, reason, sizeof(reason), debug, sizeof(debug))) {
 		LOGWARNING("JDC local block submit height %d template %"PRIu64" failed on "
 			   "the mining IPC", sol->t->height, sol->t->id);
 		return;
 	}
 	LOGWARNING("JDC local block submit height %d template %"PRIu64" coinbase %zu "
-		   "bytes: %s by our node", sol->t->height, sol->t->id,
-		   sol->coinbase_len, accepted ? "ACCEPTED" : "rejected");
+		   "bytes: %s by our node %s %s", sol->t->height, sol->t->id,
+		   sol->coinbase_len, accepted ? "ACCEPTED" : "rejected", reason, debug);
 }
 
 /*

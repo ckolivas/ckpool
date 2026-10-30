@@ -878,15 +878,34 @@ void mining_ipc_block_free(unsigned char *block)
 	free(block);
 }
 
+/* Copy a reason/debug string into a caller buffer, NUL-terminated and
+ * truncated to fit. Safe with a NULL or zero-sized buffer. */
+static void copy_text(char *buf, size_t sz, const std::string &text)
+{
+	if (!buf || !sz)
+		return;
+	std::snprintf(buf, sz, "%s", text.c_str());
+	buf[sz - 1] = '\0';
+}
+
 int mining_ipc_submit_solution(mining_block_template *t, uint32_t version,
 			       uint32_t timestamp, uint32_t nonce,
-			       const unsigned char *coinbase, size_t coinbase_len, int *accepted)
+			       const unsigned char *coinbase, size_t coinbase_len,
+			       int *accepted,
+			       char *reason, size_t reason_sz,
+			       char *debug, size_t debug_sz)
 {
 	if (!t || !coinbase || !accepted)
 		return -1;
 	auto *h = reinterpret_cast<BlockTemplateHolder *>(t);
 	try {
-		bool ok = h->svc->run([=]() -> kj::Promise<bool> {
+		struct SubmitResult {
+			bool ok;
+			std::string reason;
+			std::string debug;
+		};
+
+		SubmitResult r = h->svc->run([=]() -> kj::Promise<SubmitResult> {
 			auto req = h->client.submitSolutionRequest();
 			h->svc->fill_context(req.initContext());
 			req.setVersion(version);
@@ -894,11 +913,20 @@ int mining_ipc_submit_solution(mining_block_template *t, uint32_t version,
 			req.setNonce(nonce);
 			req.setCoinbase(kj::arrayPtr(reinterpret_cast<const capnp::byte *>(coinbase),
 						     coinbase_len));
-			return req.send().then([](auto resp) -> bool {
-				return resp.getResult();
+			return req.send().then([](auto resp) -> SubmitResult {
+				SubmitResult out;
+				auto reason_t = resp.getReason();
+				auto debug_t = resp.getDebug();
+
+				out.ok = resp.getResult();
+				out.reason = std::string(reason_t.cStr(), reason_t.size());
+				out.debug = std::string(debug_t.cStr(), debug_t.size());
+				return out;
 			});
 		});
-		*accepted = ok ? 1 : 0;
+		*accepted = r.ok ? 1 : 0;
+		copy_text(reason, reason_sz, r.reason);
+		copy_text(debug, debug_sz, r.debug);
 		return 0;
 	} catch (...) {
 		return -1;
@@ -976,22 +1004,8 @@ int mining_ipc_check_block(mining_ipc_service *svc,
 		});
 
 		*valid = r.ok ? 1 : 0;
-		if (reason && reason_sz) {
-			if (r.reason.empty())
-				reason[0] = '\0';
-			else {
-				std::snprintf(reason, reason_sz, "%s", r.reason.c_str());
-				reason[reason_sz - 1] = '\0';
-			}
-		}
-		if (debug && debug_sz) {
-			if (r.debug.empty())
-				debug[0] = '\0';
-			else {
-				std::snprintf(debug, debug_sz, "%s", r.debug.c_str());
-				debug[debug_sz - 1] = '\0';
-			}
-		}
+		copy_text(reason, reason_sz, r.reason);
+		copy_text(debug, debug_sz, r.debug);
 		return 0;
 	} catch (...) {
 		return -1;
