@@ -7,6 +7,8 @@ wget https://api.bitbucket.org/2.0/repositories/ckolivas/ckpool/src/master/scrip
 chmod +x install-ckpool-solo.sh
 sudo ./install-ckpool-solo.sh
 ```
+NOTE: The IPC version is tied to the bitcoin core version and the current code
+is designed for use with Bitcoin Core version 32.x.
 
 This will download ckpool source code, v32.1 bitcoin daemon binary, check its
 validity, install the daemon, build ckpool, and install it, configured for

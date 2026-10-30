@@ -364,6 +364,9 @@ unavailable). In proxy mode it is required when any proxy entry has a `"jds"`
 Job Declaration client. Example: `"/tmp/btc-mining.sock"`
 Requires bitcoind `-ipcbind`, e.g.:
 
+NOTE: The IPC version is tied to the bitcoin core version and the current code
+is designed for use with Bitcoin Core version 32.x.
+
 ```bash
 bitcoind -m node -ipcbind=unix:/tmp/btc-mining.sock
 ```
