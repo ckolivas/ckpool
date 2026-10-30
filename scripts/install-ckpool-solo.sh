@@ -109,7 +109,7 @@ if $PREVIOUS_INSTALL; then
 fi
 
 # Main installation
-echo "Starting installation of Bitcoin Core v31.1 and CKPool-Solo. This requires sudo privileges."
+echo "Starting installation of Bitcoin Core v32.1 and CKPool-Solo. This requires sudo privileges."
 echo "Warning: Bitcoin Core downloads the whole ~810GB blockchain while syncing no matter what; pruning only limits how much is kept on disk (~15GB by default here). Ensure sufficient disk space and bandwidth."
 echo "Important: You cannot mine with CKPool-Solo until the Bitcoin Core blockchain is fully synchronized, which may take days depending on your hardware and network speed."
 
@@ -369,11 +369,11 @@ echo "Enabling persistent journal storage for easier log access..."
 mkdir -p /var/log/journal
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
-# Download and verify Bitcoin Core v31.1 tarball into a scratch directory that
+# Download and verify Bitcoin Core v32.1 tarball into a scratch directory that
 # the exit trap removes, rather than littering the invoking directory.
 WORK_DIR=$(mktemp -d)
 cd "$WORK_DIR"
-BITCOIN_VERSION="31.1"
+BITCOIN_VERSION="32.1"
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
     BITCOIN_TAR="bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"

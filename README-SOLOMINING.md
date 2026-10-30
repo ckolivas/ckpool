@@ -8,7 +8,7 @@ chmod +x install-ckpool-solo.sh
 sudo ./install-ckpool-solo.sh
 ```
 
-This will download ckpool source code, v31.1 bitcoin daemon binary, check its
+This will download ckpool source code, v32.1 bitcoin daemon binary, check its
 validity, install the daemon, build ckpool, and install it, configured for
 solo mining. Follow the prompts or simply press enter for the default settings.
 
