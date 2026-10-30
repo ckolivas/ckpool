@@ -870,21 +870,27 @@ static void clear_workbase(workbase_t *wb)
 	free(wb);
 }
 
-/* Remove all shares with a workbase id less than wb_id for block changes */
-static void purge_share_hashtable(sdata_t *sdata, const int64_t wb_id)
+/* Remove all shares whose workbase has been discarded on block changes. Shares
+ * of workbases that still exist are kept, as those can still be submitted
+ * as stale shares and must still be detected as duplicates. */
+static void purge_share_hashtable(sdata_t *sdata)
 {
 	share_t *share, *tmp;
+	workbase_t *wb;
 	int purged = 0;
 
+	ck_rlock(&sdata->workbase_lock);
 	mutex_lock(&sdata->share_lock);
 	HASH_ITER(hh, sdata->shares, share, tmp) {
-		if (share->workbase_id < wb_id) {
+		HASH_FIND_I64(sdata->workbases, &share->workbase_id, wb);
+		if (!wb) {
 			HASH_DEL(sdata->shares, share);
 			dealloc(share);
 			purged++;
 		}
 	}
 	mutex_unlock(&sdata->share_lock);
+	ck_runlock(&sdata->workbase_lock);
 
 	if (purged)
 		LOGINFO("Cleared %d shares from share hashtable", purged);
@@ -1223,7 +1229,7 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 		generate_userwbs(sdata, wb);
 
 	if (*new_block)
-		purge_share_hashtable(sdata, wb->id);
+		purge_share_hashtable(sdata);
 
 	if (!ckpool.passthrough)
 		send_workinfo(sdata, wb);
@@ -6495,9 +6501,11 @@ static void account_client_share(pool_stats_t *stats, stratum_instance_t *client
 	}
 }
 
-/* Needs to be entered with client holding a ref count. */
+/* Needs to be entered with client holding a ref count. Rejects are counted
+ * towards hashrate only when stale is set, meaning a stale share that met its
+ * diff and was not a duplicate. */
 static void add_submit(stratum_instance_t *client, const double diff, const bool valid,
-		       const bool submit)
+		       const bool stale)
 {
 	sdata_t *ckp_sdata = ckpool.sdata, *sdata = client->sdata;
 	worker_instance_t *worker = client->worker_instance;
@@ -6514,7 +6522,7 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 	if (valid) {
 		worker->shares += diff;
 		user->shares += diff;
-	} else if (!submit)
+	} else if (!stale)
 		return;
 
 	tv_time(&now_t);
@@ -7367,7 +7375,7 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 	char nonce2hex[64], noncehex[16];
 	uchar hash[32];
 	double sdiff, diff;
-	bool stale = false, result = false, submit = false;
+	bool stale = false, result = false;
 	int n2len, expect;
 
 	if (errbuf && errbufsz)
@@ -7435,6 +7443,9 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 
 	if (stale) {
 		snprintf(errbuf, errbufsz, "stale-share");
+		/* Stale shares that met the job diff are still work done. */
+		add_submit(client, job_diff, false,
+			   sdiff >= job_diff && new_share(sdata, hash, workbase_id));
 		put_workbase(sdata, wb);
 		dec_instance_ref(sdata, client);
 		return false;
@@ -7464,15 +7475,7 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 		result = false;
 	}
 
-	if (sdiff >= wb->diff)
-		submit = true;
-	ck_rlock(&sdata->workbase_lock);
-	if (sdata->current_workbase &&
-	    sdiff >= sdata->current_workbase->network_diff)
-		submit = true;
-	ck_runlock(&sdata->workbase_lock);
-
-	add_submit(client, diff, result, submit);
+	add_submit(client, diff, result, false);
 	put_workbase(sdata, wb);
 	dec_instance_ref(sdata, client);
 	return result;
@@ -7530,7 +7533,7 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	double diff, network_diff = 0;
-	bool result = false, submit = false;
+	bool result = false;
 	int64_t wb_id = workbase_id;
 
 	if (network_diff_met)
@@ -7538,8 +7541,27 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 	if (errbuf && errbufsz)
 		errbuf[0] = '\0';
 	if (!sv2_custom_job_current(sdata, workbase_id)) {
+		workbase_t *wb;
+		bool stale;
+
 		if (errbuf && errbufsz)
 			snprintf(errbuf, errbufsz, "stale-share");
+		client = ref_instance_by_id(sdata, instance_id);
+		if (!client || !client->authorised) {
+			if (client)
+				dec_instance_ref(sdata, client);
+			return false;
+		}
+		/* Stale shares that met the job diff are still work done, while
+		 * their workbase exists to detect duplicates against. */
+		wb = workbase_id > 0 && workbase_id < sdata->blockchange_id ?
+			get_workbase(sdata, workbase_id) : NULL;
+		stale = wb && sdiff >= job_diff && new_share(sdata, hash, wb_id);
+		if (wb) {
+			put_workbase(sdata, wb);
+			add_submit(client, job_diff, false, stale);
+		}
+		dec_instance_ref(sdata, client);
 		return false;
 	}
 	client = ref_instance_by_id(sdata, instance_id);
@@ -7576,17 +7598,12 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 		result = false;
 	}
 	ck_rlock(&sdata->workbase_lock);
-	if (sdata->current_workbase) {
+	if (sdata->current_workbase)
 		network_diff = sdata->current_workbase->network_diff;
-		if (sdiff >= sdata->current_workbase->diff)
-			submit = true;
-		if (sdiff >= network_diff)
-			submit = true;
-	}
 	ck_runlock(&sdata->workbase_lock);
 	if (network_diff_met && result && sdiff >= network_diff && network_diff > 0)
 		*network_diff_met = true;
-	add_submit(client, diff, result, submit);
+	add_submit(client, diff, result, false);
 	dec_instance_ref(sdata, client);
 	return result;
 }
@@ -7775,6 +7792,7 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 			 enum share_err *err_code)
 {
 	bool share = false, result = false, invalid = true, submit = false, stale = false;
+	bool stale_credit = false;
 	const char *workername, *job_id, *ntime, *version_mask;
 	double diff = client->diff, wdiff = 0, sdiff = -1;
 	char hexhash[68] = {}, sharehash[32], cdfield[64];
@@ -7985,7 +8003,10 @@ out_nowb:
 		submit_share(client, id, nonce2, ntime, nonce, version_mask32);
 	}
 
-	add_submit(client, diff, result, submit);
+	/* Stale shares that met the share diff are still work done. */
+	if (err == SE_STALE && sdiff >= diff && new_share(sdata, hash, id))
+		stale_credit = true;
+	add_submit(client, diff, result, stale_credit);
 
 	doc = yyjson_mut_pack("{sIsIsssssssssfsfsssbsssissssssssssssssss}",
 		"workinfoid", id,
