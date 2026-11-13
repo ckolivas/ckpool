@@ -8033,10 +8033,9 @@ out_nowb:
 	if (ckpool.logshares) {
 		fp = fopen(fname, "ae");
 		if (likely(fp)) {
-			yyjson_mut_write_file(fname, doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL);
-			fclose(fp);
-			if (unlikely(len < 0))
+			if (unlikely(!yyjson_mut_write_fp(fp, doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL)))
 				LOGERR("Failed to fwrite to %s", fname);
+			fclose(fp);
 		} else
 			LOGERR("Failed to fopen %s", fname);
 	}
