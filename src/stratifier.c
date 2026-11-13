@@ -1223,6 +1223,18 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 	}
 	ck_wunlock(&sdata->workbase_lock);
 
+	/* Log the workinfo alongside its sharelog outside of the lock */
+	if (ckpool.logshares) {
+		yyjson_mut_doc *wi_doc = generate_workinfo(wb, __func__);
+		char *wifname;
+
+		ASPRINTF(&wifname, "%s.workinfo", wb->logdir);
+		if (unlikely(!yyjson_mut_write_file(wifname, wi_doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL)))
+			LOGERR("Failed to write to %s", wifname);
+		yyjson_mut_doc_free(wi_doc);
+		dealloc(wifname);
+	}
+
 	/* This wb can't be pulled out from under us so no workbase lock is
 	 * required to generate_userwbs */
 	if (ckpool.btcsolo)
