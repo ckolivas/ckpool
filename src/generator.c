@@ -5827,19 +5827,27 @@ static void proxy_mode(proc_instance_t *pi)
 	sv2_jdc_start();
 #endif
 
+	/* Initialise the shared psend mutex and conditional once, before any
+	 * thread that may use them is launched. */
+	if (!ckpool.passthrough) {
+		mutex_init(&gdata->psend_lock);
+		cond_init(&gdata->psend_cond);
+	}
+
 	/* Create all our proxy structures and pointers */
 	for (i = 0; i < ckpool.proxies; i++) {
 		proxy = __add_proxy(gdata, i);
 		if (ckpool.passthrough) {
 			create_pthread(&proxy->pth_precv, passthrough_recv, proxy);
 			proxy->passsends = create_ckmsgq("passsend", &passthrough_send);
-		} else {
-			mutex_init(&gdata->psend_lock);
-			cond_init(&gdata->psend_cond);
+		} else
 			prepare_proxy(proxy);
-			create_pthread(&gdata->pth_uprecv, userproxy_recv, NULL);
-			create_pthread(&gdata->pth_psend, proxy_send, NULL);
-		}
+	}
+
+	/* One userproxy receiver and one proxy sender serve every proxy */
+	if (!ckpool.passthrough) {
+		create_pthread(&gdata->pth_uprecv, userproxy_recv, NULL);
+		create_pthread(&gdata->pth_psend, proxy_send, NULL);
 	}
 
 	proxy_loop(pi);
