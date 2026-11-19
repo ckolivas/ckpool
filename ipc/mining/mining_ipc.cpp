@@ -45,6 +45,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
@@ -350,27 +351,50 @@ public:
 
 	~MiningService()
 	{
+		/* Only reached once shutdown() has joined the thread, see
+		 * mining_ipc_service_disconnect(). Detach rather than let a
+		 * joinable std::thread terminate the process. */
+		if (!shutdown(0))
+			thread_.detach();
+	}
+
+	/* Stop the service thread, waiting up to wait_ms for it to exit. Returns
+	 * true once it has exited and been joined, after which the object may
+	 * be freed; until then the thread is still using it. */
+	bool shutdown(int wait_ms)
+	{
 		/* The capnp capability members reference the event loop owned by the
 		 * service thread and must be destroyed there, not on the caller's
 		 * thread. Reset them on the service thread; the member destructors
 		 * that then run on this thread are no-ops on null capabilities. Only
 		 * attempt this while connected: if the service thread is looping in
 		 * reconnect (not in the event loop) executeSync would block until it
-		 * returned, potentially forever if bitcoind is down. */
+		 * returned, potentially forever if bitcoind is down. Once the thread
+		 * has exited its event loop, and so the executor, is gone. */
 		/* Before reset_caps(), so the keepalive loop this is about to
 		 * unpark sees the stop and returns rather than reconnecting into a
 		 * service that is being destroyed. */
 		stop_.store(true);
-		if (executor_ && connected_.load()) {
+		if (executor_ && connected_.load() && !exited_.load()) {
 			try {
 				executor_->executeSync([this]() { reset_caps(); });
 			} catch (...) {
 			}
 		}
-		/* The service thread runs a kj loop for the process lifetime; detach
-		 * rather than join to avoid blocking on the cross-thread wakeup. */
-		if (thread_.joinable())
-			thread_.detach();
+		if (!thread_.joinable())
+			return true;
+		/* The thread only notices the stop between keepalive probes, and a
+		 * probe to a hung bitcoind may never return, so wait for it only
+		 * briefly. */
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			cv_.wait_for(lock, std::chrono::milliseconds(wait_ms),
+				     [this] { return exited_.load(); });
+		}
+		if (!exited_.load())
+			return false;
+		thread_.join();
+		return true;
 	}
 
 	/* Start the background thread and block until its first connect attempt
@@ -378,7 +402,16 @@ public:
 	 * whether mining is yet available). */
 	bool start()
 	{
-		thread_ = std::thread([this] { thread_main(); });
+		thread_ = std::thread([this] {
+			thread_main();
+			/* After thread_main()'s locals, including its event
+			 * loop, are gone. */
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				exited_.store(true);
+			}
+			cv_.notify_all();
+		});
 		std::unique_lock<std::mutex> lock(mutex_);
 		cv_.wait(lock, [this] { return started_; });
 		return true;
@@ -601,6 +634,7 @@ private:
 	std::atomic<bool> stop_{false};
 	std::atomic<bool> connected_{false};
 	std::atomic<bool> have_mining_{false};
+	std::atomic<bool> exited_{false};	/* service thread has finished */
 
 	bool started_ = false;
 	std::mutex mutex_;
@@ -711,7 +745,14 @@ mining_ipc_service *mining_ipc_service_connect(const char *socket_path)
 
 void mining_ipc_service_disconnect(mining_ipc_service *svc)
 {
-	delete reinterpret_cast<MiningService *>(svc);
+	auto *service = reinterpret_cast<MiningService *>(svc);
+
+	/* The service thread uses the object until it exits, which it only
+	 * notices between keepalive probes. Rather than free it from under a
+	 * thread that has not exited yet, leave it allocated: this is only
+	 * called as the process shuts down. */
+	if (service && service->shutdown(200))
+		delete service;
 }
 
 int mining_ipc_service_ready(mining_ipc_service *svc)
