@@ -2316,6 +2316,7 @@ retry:
 		LOGDEBUG("Connector received stats request");
 		msg = connector_stats(cdata, 0);
 		send_unix_msg(umsg->sockd, msg);
+		dealloc(msg);
 	} else if (cmdmatch(buf, "loglevel")) {
 		sscanf(buf, "loglevel=%d", &ckpool.loglevel);
 	} else if (cmdmatch(buf, "passthrough")) {
