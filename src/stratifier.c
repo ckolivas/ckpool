@@ -4024,6 +4024,8 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 	int64_t pass_id;
 
 	client = __recruit_stratum_instance(sdata);
+	/* SV1 and SV2 clients are added from different threads */
+	client->session_id = ++sdata->session_id;
 	ck_wunlock(&sdata->instance_lock);
 
 	/* Fake a share time at startup to prevent client being dropped for
@@ -4031,7 +4033,6 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 	client->start_time = client->last_share.tv_sec = time(NULL);
 
 	client->id = id;
-	client->session_id = ++sdata->session_id;
 	snprintf(client->address, sizeof(client->address), "%s", address);
 	/* Sanity check to not overflow lookup in ckpool.serverurl[]. A negative
 	 * index would read before the allocation in the trusted[]/nodeserver[]
