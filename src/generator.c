@@ -1269,7 +1269,7 @@ static bool send_pong(proxy_instance_t *proxi, yyjson_val *val)
 static void prepare_proxy(proxy_instance_t *proxi);
 
 #ifdef HAVE_SV2
-static void sv2_proxy_free(proxy_instance_t *proxi);
+static void sv2_proxy_reset(proxy_instance_t *proxi);
 static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 				   int64_t client_id);
 static void sv2_proxy_share_solve(int proxyid, yyjson_mut_val *val);
@@ -1406,6 +1406,10 @@ static proxy_instance_t *__subproxy_by_id(proxy_instance_t *proxy, const int sub
 /* Add to the dead list to be recycled if possible */
 static void store_proxy(gdata_t *gdata, proxy_instance_t *proxy)
 {
+#ifdef HAVE_SV2
+	struct sv2_proxy *sv2p = proxy->sv2p;
+#endif
+
 	LOGINFO("Recycling data from proxy %d:%d", proxy->id, proxy->subid);
 
 	mutex_lock(&gdata->lock);
@@ -1421,11 +1425,15 @@ static void store_proxy(gdata_t *gdata, proxy_instance_t *proxy)
 	dealloc(proxy->cs.port);
 #ifdef HAVE_SV2
 	/* Free Noise/channel/job state before the instance is zeroed. */
-	sv2_proxy_free(proxy);
+	sv2_proxy_reset(proxy);
 #endif
 	/* Drop any half-sent reference so send_json_msgq cannot UAF. */
 	proxy->sending = NULL;
 	memset(proxy, 0, sizeof(proxy_instance_t));
+#ifdef HAVE_SV2
+	/* Kept for the life of the instance, see sv2_proxy_reset() */
+	proxy->sv2p = sv2p;
+#endif
 	DL_APPEND(gdata->dead_proxies, proxy);
 	mutex_unlock(&gdata->lock);
 }
@@ -2608,13 +2616,15 @@ struct sv2_pending_share {
 };
 
 struct sv2_proxy {
+	/* Lives as long as the struct; everything after it is per connection
+	 * state that sv2_proxy_reset() zeroes. */
+	mutex_t send_lock;		/* serialises outbound Noise encrypt + pending map */
 	double target_diff;	/* target for future jobs, not active work */
 	sv2_noise_session_t *noise;
 	uint32_t channel_id;
 	bool channel_open;
 	uint32_t next_request_id;
 	uint32_t next_seq;		/* SubmitSharesExtended sequence */
-	mutex_t send_lock;		/* serialises outbound Noise encrypt + pending map */
 	struct sv2_pending_share *pending; /* recent submissions, including batched successes */
 	uint32_t unanswered;
 	time_t last_share_response;
@@ -2765,7 +2775,15 @@ static void sv2_proxy_job_clear(struct sv2_proxy_job *job)
 	memset(job, 0, sizeof(*job));
 }
 
-static void sv2_proxy_free(proxy_instance_t *proxi)
+#define SV2_PROXY_STATE_OFS offsetof(struct sv2_proxy, target_diff)
+
+/* Clear an SV2 proxy's connection state for a reconnect or for recycling the
+ * instance. The allocation and its send_lock are kept for the life of the
+ * proxy instance rather than freed: share submission, the JD client and
+ * stats all reach proxi->sv2p from other threads without a reference, so it
+ * must never be freed from under them. The noise session and share ledger
+ * are torn down under send_lock, the lock other threads use them under. */
+static void sv2_proxy_reset(proxy_instance_t *proxi)
 {
 	struct sv2_proxy *sp = proxi->sv2p;
 	struct sv2_pending_share *ps, *tmp;
@@ -2782,6 +2800,7 @@ static void sv2_proxy_free(proxy_instance_t *proxi)
 	 */
 	if (!proxi->subid)
 		sv2_jdc_pool_tip_clear(proxi->id);
+	mutex_lock(&sp->send_lock);
 	if (sp->noise)
 		sv2_noise_session_free(sp->noise);
 	for (i = 0; i < SV2_PROXY_JOBS; i++)
@@ -2792,10 +2811,9 @@ static void sv2_proxy_free(proxy_instance_t *proxi)
 		HASH_DEL(sp->pending, ps);
 		dealloc(ps);
 	}
-	mutex_destroy(&sp->send_lock);
 	dealloc(sp->rx);
-	dealloc(sp);
-	proxi->sv2p = NULL;
+	memset((char *)sp + SV2_PROXY_STATE_OFS, 0, sizeof(*sp) - SV2_PROXY_STATE_OFS);
+	mutex_unlock(&sp->send_lock);
 }
 
 /* Encrypt and send one plaintext SV2 message on the connection. The outbound
@@ -2815,7 +2833,8 @@ static bool sv2_proxy_send(proxy_instance_t *proxi, connsock_t *cs, uint8_t msg_
 	if (!sv2_build_frame(ext, msg_type, pay, (uint32_t)paylen, &frame, &flen))
 		goto out;
 	mutex_lock(&sp->send_lock);
-	if (sv2_noise_encrypt_frame(sp->noise, frame, flen, &ct, &ctlen))
+	/* Rechecked under the lock a reset tears the session down under */
+	if (sp->noise && sv2_noise_encrypt_frame(sp->noise, frame, flen, &ct, &ctlen))
 		ret = write_socket(cs->fd, ct, ctlen) == (int)ctlen;
 	mutex_unlock(&sp->send_lock);
 out:
@@ -3205,9 +3224,14 @@ static bool sv2_proxy_open(proxy_instance_t *proxi, connsock_t *cs)
  * OpenExtendedMiningChannel. cs->sem held by caller (proxy_alive). */
 static bool sv2_proxy_connect(proxy_instance_t *proxi, connsock_t *cs)
 {
-	sv2_proxy_free(proxi);
-	proxi->sv2p = ckzalloc(sizeof(struct sv2_proxy));
-	mutex_init(&proxi->sv2p->send_lock);
+	if (proxi->sv2p)
+		sv2_proxy_reset(proxi);
+	else {
+		struct sv2_proxy *sp = ckzalloc(sizeof(struct sv2_proxy));
+
+		mutex_init(&sp->send_lock);
+		proxi->sv2p = sp;
+	}
 	if (!sv2_proxy_handshake(proxi, cs))
 		goto fail;
 	if (!sv2_proxy_setup(proxi, cs))
@@ -3216,7 +3240,7 @@ static bool sv2_proxy_connect(proxy_instance_t *proxi, connsock_t *cs)
 		goto fail;
 	return true;
 fail:
-	sv2_proxy_free(proxi);
+	sv2_proxy_reset(proxi);
 	return false;
 }
 
