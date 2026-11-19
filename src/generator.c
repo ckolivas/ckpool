@@ -5241,8 +5241,10 @@ static void delete_proxy(gdata_t *gdata, proxy_instance_t *proxy)
 	/* Remove the proxy from the master list first */
 	mutex_lock(&gdata->lock);
 	HASH_DEL(gdata->proxies, proxy);
-	/* Disable all its threads */
-	pthread_cancel(proxy->pth_precv);
+	/* Disable all its threads. A userproxy added without one, being non
+	 * global, has a zeroed pth_precv that must not be cancelled. */
+	if (proxy->pth_precv)
+		pthread_cancel(proxy->pth_precv);
 	close_proxy_socket(proxy, proxy);
 	mutex_unlock(&gdata->lock);
 
