@@ -6921,8 +6921,10 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	ts_t ts_now;
 	bool ret;
 
-	/* Submit anything over 99.9% of the diff in case of rounding errors */
-	network_diff = sdata->current_workbase->network_diff * 0.999;
+	/* Submit anything over 99.9% of the diff in case of rounding errors.
+	 * The share's own workbase sets its target, not the current one, which
+	 * can differ, such as across min difficulty blocks on testnet. */
+	network_diff = wb->network_diff * 0.999;
 	if (likely(diff < network_diff))
 		return;
 
