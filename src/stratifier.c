@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
@@ -1103,13 +1104,23 @@ static void __generate_userwb(sdata_t *sdata, workbase_t *wb, user_instance_t *u
 	HASH_ADD_I64(user->userwbs, id, userwb);
 }
 
+/* How long after its last share a user with no clients keeps getting user
+ * workbases, covering miners briefly reconnecting. */
+#define USERWB_IDLE_SECS 600
+
 static void generate_userwbs(sdata_t *sdata, workbase_t *wb)
 {
 	user_instance_t *instance, *tmp;
+	time_t now_t = time(NULL);
 
 	ck_wlock(&sdata->instance_lock);
 	HASH_ITER(hh, sdata->user_instances, instance, tmp) {
 		if (!instance->btcaddress)
+			continue;
+		/* Every user ever seen would otherwise cost a coinbase on every
+		 * template; an authorising client gets the current one made
+		 * for it. */
+		if (!instance->clients && now_t - instance->last_share.tv_sec > USERWB_IDLE_SECS)
 			continue;
 		__generate_userwb(sdata, wb, instance);
 	}
@@ -6290,14 +6301,40 @@ static bool user_check_address(sdata_t *sdata, user_instance_t *user, const char
 	return user_publish_address(sdata, user, username, script, segwit);
 }
 
+/* Cheap local filter for usernames that cannot be any bitcoin address on any
+ * network, base58 or bech32, to spare bitcoind a validateaddress call. */
+static bool address_plausible(const char *username)
+{
+	size_t len = strlen(username), i;
+
+	if (len < 25 || len > 90)
+		return false;
+	for (i = 0; i < len; i++) {
+		if (!isalnum((unsigned char)username[i]))
+			return false;
+	}
+	return true;
+}
+
+static bool user_exists(sdata_t *sdata, const char *username)
+{
+	user_instance_t *user;
+
+	ck_rlock(&sdata->instance_lock);
+	HASH_FIND_STR(sdata->user_instances, username, user);
+	ck_runlock(&sdata->instance_lock);
+	return user != NULL;
+}
+
 /* This simply strips off the first part of the workername and matches it to a
  * user or creates a new one. Needs to be entered with client holding a ref
- * count. */
+ * count. Returns NULL with *why set if no user can be had. */
 static user_instance_t *generate_user(stratum_instance_t *client,
-				      const char *workername)
+				      const char *workername, const char **why)
 {
 	char *base_username, *username;
-	bool new_user = false, new_worker = false;
+	bool new_user = false, new_worker = false, checked = false;
+	bool script = false, segwit = false;
 	sdata_t *sdata = ckpool.sdata;
 	worker_instance_t *worker;
 	user_instance_t *user;
@@ -6305,18 +6342,36 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 
 	/* Callers normally validate at the protocol boundary. Keep this safe
 	 * for every caller, before strdupa/strsep can see an empty identity. */
-	if (unlikely(workername_error(workername)))
+	if (unlikely(workername_error(workername))) {
+		*why = "Invalid username";
 		return NULL;
+	}
 	base_username = strdupa(workername);
 	username = strsep(&base_username, "._");
 	len = strlen(username);
 	if (unlikely(len > 127))
 		username[127] = '\0';
 
+	/* A solo username that is not an address can never authorise, so
+	 * check it before it gets a permanent user record and a slot counted
+	 * against maxusers. */
+	if (ckpool.btcsolo && !user_exists(sdata, username)) {
+		if (!address_plausible(username) ||
+		    !generator_checkaddr(username, &script, &segwit)) {
+			LOGINFO("Client %s %s rejected invalid address username %s",
+				client->identity, client->address, username);
+			*why = "Invalid bitcoin address";
+			return NULL;
+		}
+		checked = true;
+	}
+
 	/* Limited: this is reached directly from mining.authorize. */
 	user = __get_create_user(sdata, username, &new_user, true);
-	if (unlikely(!user))
+	if (unlikely(!user)) {
+		*why = "Pool user limit reached";
 		return NULL;
+	}
 	worker = get_create_worker(sdata, user, workername, &new_worker);
 
 	/* Create one worker instance for combined data from workers of the
@@ -6328,8 +6383,12 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 	__inc_worker(sdata,user, worker);
 	ck_wunlock(&sdata->instance_lock);
 
-	if (!ckpool.proxy && (new_user || !user->btcaddress))
-		user_check_address(sdata, user, username);
+	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
+		if (checked)
+			user_publish_address(sdata, user, username, script, segwit);
+		else
+			user_check_address(sdata, user, username);
+	}
 	if (new_user) {
 		LOGNOTICE("Added new user %s%s", username, user->btcaddress ?
 			  " as address based registration" : "");
@@ -6408,8 +6467,8 @@ static void update_solo_client(sdata_t *sdata, workbase_t *wb, const int64_t cli
 static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_val,
 			    yyjson_mut_doc **err_doc)
 {
+	const char *buf, *pass, *name_error, *user_error = NULL;
 	user_instance_t *user;
-	const char *buf, *pass, *name_error;
 	bool ret = false;
 	int arr_size;
 	ts_t now;
@@ -6434,9 +6493,9 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 		goto out;
 	}
 	pass = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 1));
-	user = generate_user(client, buf);
+	user = generate_user(client, buf, &user_error);
 	if (unlikely(!user)) {
-		*err_doc = yyjson_string("Pool user limit reached");
+		*err_doc = yyjson_string(user_error);
 		client->dropped = true;
 		goto out;
 	}
@@ -7185,6 +7244,7 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 				 int server, const uint8_t *enonce1, int enonce1_len,
 				 double diff, int64_t *out_instance_id)
 {
+	const char *user_error = NULL;
 	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	user_instance_t *user;
@@ -7219,9 +7279,9 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 	snprintf(client->identity, sizeof(client->identity),
 		 "sv2:%"PRId64":%u", connector_id, channel_id);
 
-	user = generate_user(client, user_identity);
+	user = generate_user(client, user_identity, &user_error);
 	if (unlikely(!user)) {
-		LOGNOTICE("SV2 reject user %s with maxusers reached", user_identity);
+		LOGNOTICE("SV2 reject user %s: %s", user_identity, user_error);
 		client->dropped = true;
 		dec_instance_ref(sdata, client);
 		return false;
