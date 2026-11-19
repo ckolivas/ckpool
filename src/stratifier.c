@@ -6258,6 +6258,38 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 	return get_create_worker(sdata, user, workername, &dummy);
 }
 
+/* Publish username's payout script on user. The script is complete before
+ * btcaddress is set, both under instance_lock, so a userwb generated
+ * concurrently can never see btcaddress with an empty or partial script. */
+static bool user_publish_address(sdata_t *sdata, user_instance_t *user, const char *username,
+				 const bool script, const bool segwit)
+{
+	char txnbin[sizeof(user->txnbin)];
+	int txnlen;
+
+	txnlen = address_to_txn(txnbin, username, script, segwit);
+	if (unlikely(txnlen < 1))
+		return false;
+	ck_wlock(&sdata->instance_lock);
+	user->script = script;
+	user->segwit = segwit;
+	memcpy(user->txnbin, txnbin, txnlen);
+	user->txnlen = txnlen;
+	user->btcaddress = true;
+	ck_wunlock(&sdata->instance_lock);
+	return true;
+}
+
+/* Is this a btc address based username? Publish its payout script if so. */
+static bool user_check_address(sdata_t *sdata, user_instance_t *user, const char *username)
+{
+	bool script = false, segwit = false;
+
+	if (!generator_checkaddr(username, &script, &segwit))
+		return false;
+	return user_publish_address(sdata, user, username, script, segwit);
+}
+
 /* This simply strips off the first part of the workername and matches it to a
  * user or creates a new one. Needs to be entered with client holding a ref
  * count. */
@@ -6296,13 +6328,8 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 	__inc_worker(sdata,user, worker);
 	ck_wunlock(&sdata->instance_lock);
 
-	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
-		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
-			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
-		}
-	}
+	if (!ckpool.proxy && (new_user || !user->btcaddress))
+		user_check_address(sdata, user, username);
 	if (new_user) {
 		LOGNOTICE("Added new user %s%s", username, user->btcaddress ?
 			  " as address based registration" : "");
@@ -8736,13 +8763,8 @@ static user_instance_t *generate_remote_user(const char *workername)
 
 	user = get_create_user(sdata, username, &new_user);
 
-	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
-		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
-			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
-		}
-	}
+	if (!ckpool.proxy && (new_user || !user->btcaddress))
+		user_check_address(sdata, user, username);
 	if (new_user) {
 		LOGNOTICE("Added new remote user %s%s", username, user->btcaddress ?
 			  " as address based registration" : "");
