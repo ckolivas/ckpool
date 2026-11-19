@@ -2032,11 +2032,11 @@ static void stratifier_reconnect_client(const int64_t id)
 }
 
 /* Add a share to the gdata share hashlist. Returns the share id */
-static int add_share(gdata_t *gdata, const int64_t client_id, const double diff)
+static int64_t add_share(gdata_t *gdata, const int64_t client_id, const double diff)
 {
 	share_msg_t *share = ckzalloc(sizeof(share_msg_t)), *tmpshare;
 	time_t now;
-	int ret;
+	int64_t ret;
 
 	share->submit_time = now = time(NULL);
 	share->client_id = client_id;
@@ -2063,9 +2063,9 @@ static void submit_share(gdata_t *gdata, yyjson_mut_doc *doc)
 	bool have_id __maybe_unused = false;
 	proxy_instance_t *proxy, *proxi;
 	bool success = false;
-	int id, subid, share_id;
+	int64_t client_id, share_id;
+	int id, subid;
 	stratum_msg_t *msg;
-	int64_t client_id;
 
 	/* Get the client id so we can tell the stratifier to drop it if the
 	 * proxy it's bound to is not functional */
@@ -2349,7 +2349,8 @@ static void *proxy_send(void __maybe_unused *arg)
 	pthread_detach(pthread_self());
 
 	while (42) {
-		int proxyid = 0, subid = 0, share_id = 0;
+		int proxyid = 0, subid = 0;
+		int64_t share_id = 0;
 		proxy_instance_t *proxy, *subproxy;
 		yyjson_mut_val *root, *sroot, *jobid;
 		int64_t client_id = 0, id;
@@ -2398,7 +2399,7 @@ static void *proxy_send(void __maybe_unused *arg)
 			LOGWARNING("Failed to find client_id in proxy_send msg");
 			continue;
 		}
-		yyjson_mut_obj_get_int(&share_id, sroot, "id");
+		yyjson_mut_obj_get_int64(&share_id, sroot, "id");
 		proxy = proxy_by_id(gdata, proxyid);
 		if (unlikely(!proxy)) {
 			LOGWARNING("Proxysend for got message for non-existent proxy %d",
@@ -2428,7 +2429,7 @@ static void *proxy_send(void __maybe_unused *arg)
 			continue;
 		}
 
-		root = yyjson_mut_pack_val(doc, "{s[sosss]siss}", "params", subproxy->auth,
+		root = yyjson_mut_pack_val(doc, "{s[sosss]sIss}", "params", subproxy->auth,
 				jobid,
 				yyjson_mut_get_str(yyjson_mut_obj_get(sroot, "nonce2")),
 				yyjson_mut_get_str(yyjson_mut_obj_get(sroot, "ntime")),
