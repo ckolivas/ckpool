@@ -24,7 +24,7 @@ bool generator_alive(void);
 bool generator_checkaddr(const char *addr, bool *script, bool *segwit);
 char *generator_checktxn(const char *txn);
 char *generator_get_txn(const char *hash);
-bool generator_submitblock(const char *buf);
+int generator_submitblock(const char *buf);
 void generator_preciousblock(const char *hash);
 bool generator_get_blockhash(int height, char *hash);
 void *generator(void *arg);

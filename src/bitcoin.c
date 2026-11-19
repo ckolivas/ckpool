@@ -402,43 +402,34 @@ out:
 	return ret;
 }
 
-bool submit_block(connsock_t *cs, const char *params)
+/* Make one submitblock call. Returns 1 if the node accepted the block (or
+ * already had it), 0 if the node answered and rejected it, and -1 if no usable
+ * answer came back, in which case the caller may retry elsewhere or later. */
+int submit_block(connsock_t *cs, const char *params)
 {
-	yyjson_doc *doc;
 	yyjson_val *root, *res_val;
-	int len, retries = 0;
 	const char *res_ret;
-	bool ret = false;
+	yyjson_doc *doc;
 	char *rpc_req;
+	int len, ret = -1;
 
 	len = strlen(params) + 64;
-retry:
 	rpc_req = ckalloc(len);
 	sprintf(rpc_req, "{\"method\": \"submitblock\", \"params\": [\"%s\"]}\n", params);
 	doc = yyjson_rpc_call(cs, rpc_req);
 	dealloc(rpc_req);
 	if (!doc) {
 		LOGWARNING("%s:%s Failed to get valid json response to submitblock", cs->url, cs->port);
-		if (++retries < 5)
-			goto retry;
 		return ret;
 	}
 	root = yyjson_doc_get_root(doc);
 	if (unlikely(!root)) {
 		LOGERR("Failed to get json root in response to submitblock");
-		if (++retries < 5) {
-			yyjson_doc_free(doc);
-			goto retry;
-		}
 		goto out;
 	}
 	res_val = yyjson_obj_get(root, "result");
 	if (!res_val) {
 		LOGWARNING("Failed to get result in json response to submitblock");
-		if (++retries < 5) {
-			yyjson_doc_free(doc);
-			goto retry;
-		}
 		goto out;
 	}
 	if (!yyjson_is_null(res_val)) {
@@ -446,15 +437,17 @@ retry:
 		if (res_ret && strlen(res_ret)) {
 			LOGWARNING("SUBMIT BLOCK RETURNED: %s", res_ret);
 			/* Consider duplicate response as an accepted block */
-			if (safecmp(res_ret, "duplicate"))
+			if (safecmp(res_ret, "duplicate")) {
+				ret = 0;
 				goto out;
+			}
 		} else {
 			LOGWARNING("SUBMIT BLOCK GOT NO RESPONSE!");
 			goto out;
 		}
 	}
 	LOGWARNING("BLOCK ACCEPTED!");
-	ret = true;
+	ret = 1;
 out:
 	yyjson_doc_free(doc);
 	return ret;

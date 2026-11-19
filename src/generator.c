@@ -387,12 +387,24 @@ static void clear_unix_msg(unix_msg_t **umsg)
 	}
 }
 
-bool generator_submitblock(const char *buf)
+/* How long to keep resubmitting a block that no bitcoind answered, such as
+ * across a node restart, and the cap on the delay between attempts. */
+#define BLOCK_SUBMIT_SECS 300
+#define BLOCK_SUBMIT_MAX_DELAY 10
+
+/* Submit a solved block to the current bitcoind and, failing that, every other
+ * configured one. A block that no node answered is retried with increasing
+ * delays rather than dropped, since the whole reward depends on it. Returns 1
+ * if any node accepted it, 0 if a node answered and rejected it, and -1 if no
+ * node answered within BLOCK_SUBMIT_SECS. This blocks the calling thread for
+ * as long as it takes. */
+int generator_submitblock(const char *buf)
 {
 	gdata_t *gdata = ckpool.gdata;
+	int i, ret, delay = 1;
 	server_instance_t *si;
 	bool warn = false;
-	connsock_t *cs;
+	time_t start;
 
 	while (unlikely(!(si = gdata->current_si))) {
 		if (!warn)
@@ -400,9 +412,39 @@ bool generator_submitblock(const char *buf)
 		warn = true;
 		cksleep_ms(10);
 	}
-	cs = &si->cs;
 	LOGNOTICE("Submitting block data!");
-	return submit_block(cs, buf);
+	start = time(NULL);
+	while (42) {
+		ret = submit_block(&si->cs, buf);
+		if (ret > 0)
+			return ret;
+		for (i = 0; i < ckpool.btcds; i++) {
+			server_instance_t *other = ckpool.servers[i];
+			int oret;
+
+			if (other == si)
+				continue;
+			LOGWARNING("Submitting block data to bitcoind %s:%s",
+				   other->cs.url, other->cs.port);
+			oret = submit_block(&other->cs, buf);
+			if (oret > 0)
+				return oret;
+			if (!oret)
+				ret = 0;
+		}
+		/* A node has seen the block and judged it */
+		if (!ret)
+			return ret;
+		if (time(NULL) - start >= BLOCK_SUBMIT_SECS)
+			break;
+		LOGEMERG("No bitcoind answered block submission, retrying in %d seconds", delay);
+		sleep(delay);
+		delay = MIN(delay * 2, BLOCK_SUBMIT_MAX_DELAY);
+		/* Pick up any failover to a live server in the meantime */
+		si = gdata->current_si;
+	}
+	LOGEMERG("FAILED TO SUBMIT BLOCK: no bitcoind answered for %d seconds", BLOCK_SUBMIT_SECS);
+	return -1;
 }
 
 void generator_preciousblock(const char *hash)
@@ -528,8 +570,7 @@ retry:
 			LOGWARNING("Got too short submitblock message");
 			goto retry;
 		}
-		LOGNOTICE("Submitting block data!");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = generator_submitblock(buf + 12 + 64 + 1) > 0;
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckpool.stratifier, blockmsg);
@@ -5600,7 +5641,7 @@ retry:
 			goto retry;
 		}
 		LOGNOTICE("Submitting likely block solve share from upstream pool");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = submit_block(cs, buf + 12 + 64 + 1) > 0;
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckpool.stratifier, blockmsg);

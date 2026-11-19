@@ -2431,16 +2431,42 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	return gbt_block;
 }
 
+/* Keep a block that no bitcoind could be reached to submit, so it can still
+ * be submitted by hand with bitcoin-cli submitblock once a node is back. */
+static void save_unsubmitted_block(const char *gbt_block, const char *rhash, int height)
+{
+	char *fname;
+	FILE *fp;
+
+	ASPRINTF(&fname, "%sblock-%d-%s.hex", ckpool.logdir, height, rhash);
+	fp = fopen(fname, "we");
+	if (unlikely(!fp)) {
+		LOGEMERG("Failed to open %s to save unsubmitted block %d %s", fname, height, rhash);
+		goto out;
+	}
+	if (unlikely(fprintf(fp, "%s\n", gbt_block) < 0 || fclose(fp)))
+		LOGEMERG("Failed to write unsubmitted block to %s", fname);
+	else
+		LOGEMERG("Saved unsubmitted block %d %s to %s", height, rhash, fname);
+out:
+	free(fname);
+}
+
 /* Submit block data locally, absorbing and freeing gbt_block */
 static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 {
-	bool ret = generator_submitblock(gbt_block);
 	char heighthash[68] = {}, rhash[68] = {};
 	uchar swap256[32];
+	int submitted;
+	bool ret;
 
-	free(gbt_block);
 	swap_256(swap256, flip32);
 	__bin2hex(rhash, swap256, 32);
+	submitted = generator_submitblock(gbt_block);
+	if (unlikely(submitted < 0))
+		save_unsubmitted_block(gbt_block, rhash, height);
+	ret = submitted > 0;
+	free(gbt_block);
 	generator_preciousblock(rhash);
 
 	/* Check failures that may be inconclusive but were submitted via other
@@ -7635,12 +7661,6 @@ bool stratifier_sv2_submit_block_bin(const unsigned char *block, size_t block_le
 
 	if (!block || block_len < 80 || block_len > 4 * 1024 * 1024)
 		return false;
-	hex = ckalloc(block_len * 2 + 1);
-	__bin2hex(hex, block, block_len);
-	/* generator_submitblock expects hex block data via submit path */
-	ret = generator_submitblock(hex);
-	dealloc(hex);
-
 	/* Block hash: dsha256(wire header), display = byte-reversed */
 	{
 		int i;
@@ -7651,6 +7671,18 @@ bool stratifier_sv2_submit_block_bin(const unsigned char *block, size_t block_le
 			swap[i] = hash[31 - i];
 		__bin2hex(blockhash, swap, 32);
 	}
+
+	hex = ckalloc(block_len * 2 + 1);
+	__bin2hex(hex, block, block_len);
+	/* generator_submitblock expects hex block data via submit path */
+	{
+		int submitted = generator_submitblock(hex);
+
+		if (unlikely(submitted < 0))
+			save_unsubmitted_block(hex, blockhash, 0);
+		ret = submitted > 0;
+	}
+	dealloc(hex);
 
 	ck_rlock(&sdata->workbase_lock);
 	if (sdata->current_workbase) {
