@@ -1809,7 +1809,14 @@ retry:
 		wb = generator_getbase();
 		if (unlikely(!wb)) {
 			if (retries++ < 5 || *prio == GEN_PRIORITY) {
-				LOGWARNING("Generator returned failure in update_base, retry #%d", retries);
+				/* A priority update retries until bitcoind is back,
+				 * so beyond the first few immediate retries pace it,
+				 * as every failure also queues a generator reconnect,
+				 * and rate limit the warning. */
+				if (retries <= 5 || !(retries % 50))
+					LOGWARNING("Generator returned failure in update_base, retry #%d", retries);
+				if (retries > 5)
+					cksleep_ms(100);
 				goto retry;
 			}
 			LOGWARNING("Generator failed in update_base after retrying");
