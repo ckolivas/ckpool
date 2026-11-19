@@ -2465,7 +2465,7 @@ static void save_unsubmitted_block(const char *gbt_block, const char *rhash, int
 	if (unlikely(fprintf(fp, "%s\n", gbt_block) < 0 || fclose(fp)))
 		LOGEMERG("Failed to write unsubmitted block to %s", fname);
 	else
-		LOGEMERG("Saved unsubmitted block %d %s to %s", height, rhash, fname);
+		LOGWARNING("Saved unsubmitted block %d %s to %s", height, rhash, fname);
 out:
 	free(fname);
 }

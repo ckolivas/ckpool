@@ -439,7 +439,7 @@ int generator_submitblock(const char *buf)
 			return ret;
 		if (time(NULL) - start >= BLOCK_SUBMIT_SECS)
 			break;
-		LOGEMERG("No bitcoind answered block submission, retrying in %d seconds", delay);
+		LOGWARNING("No bitcoind answered block submission, retrying in %d seconds", delay);
 		sleep(delay);
 		delay = MIN(delay * 2, BLOCK_SUBMIT_MAX_DELAY);
 		/* Pick up any failover to a live server in the meantime */
