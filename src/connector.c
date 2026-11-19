@@ -392,16 +392,44 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	address_len = sizeof(client->address_storage);
 	fd = accept(sockd, client->address, &address_len);
 	if (unlikely(fd < 0)) {
-		/* Handle these errors gracefully should we ever share this
-		 * socket */
-		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
-			LOGNOTICE("Recoverable error on accept in accept_client");
-			recycle_client(cdata, client);
-			return 0;
-		}
-		LOGERR("Failed to accept on socket %d in acceptor", sockd);
+		static time_t last_res_warn;
+		int err = errno;
+
 		recycle_client(cdata, client);
-		return -1;
+		switch (err) {
+			/* Only an unusable listening socket is fatal */
+			case EBADF:
+			case EFAULT:
+			case EINVAL:
+			case ENOTSOCK:
+			case EOPNOTSUPP:
+				LOGERR("Failed to accept on socket %d in acceptor: %s",
+				       sockd, strerror(err));
+				return -1;
+			/* Out of descriptors or memory. The connection stays
+			 * queued and the level triggered listening socket
+			 * stays ready, so back off briefly instead of spinning
+			 * on it until resources free up. */
+			case EMFILE:
+			case ENFILE:
+			case ENOBUFS:
+			case ENOMEM:
+				if (time(NULL) - last_res_warn >= 60) {
+					LOGWARNING("Unable to accept on socket %d: %s",
+						   sockd, strerror(err));
+					last_res_warn = time(NULL);
+				}
+				cksleep_ms(100);
+				return 0;
+			/* Linux reports pending network errors on the new
+			 * connection from accept() itself, and these only
+			 * affect that connection, as do EAGAIN and
+			 * ECONNABORTED should we ever share this socket. */
+			default:
+				LOGNOTICE("Recoverable error on accept in accept_client: %s",
+					  strerror(err));
+				return 0;
+		}
 	}
 
 	switch (client->address->sa_family) {
@@ -1346,8 +1374,9 @@ static void *receiver(void *arg)
 				expire_redirector_shares(cdata);
 		}
 		if (unlikely(ret < 1)) {
-			if (unlikely(ret == -1)) {
-				LOGEMERG("FATAL: Failed to epoll_wait in receiver");
+			if (unlikely(ret == -1 && errno != EINTR)) {
+				LOGEMERG("FATAL: Failed to epoll_wait in receiver: %s",
+					 strerror(errno));
 				break;
 			}
 			/* Nothing to service, still very unlikely */
