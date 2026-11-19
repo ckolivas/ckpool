@@ -6458,9 +6458,15 @@ static yyjson_mut_doc *__user_notify(const workbase_t *wb, const user_instance_t
 static void update_solo_client(sdata_t *sdata, workbase_t *wb, const int64_t client_id,
 				 user_instance_t *user_instance)
 {
-	yyjson_mut_doc *doc = __user_notify(wb, user_instance, true);
+	yyjson_mut_doc *doc;
 
-	stratum_add_yysend(sdata, doc, client_id, SM_UPDATE);
+	/* userwbs are added and deleted under instance_lock */
+	ck_rlock(&sdata->instance_lock);
+	doc = __user_notify(wb, user_instance, true);
+	ck_runlock(&sdata->instance_lock);
+
+	if (likely(doc))
+		stratum_add_yysend(sdata, doc, client_id, SM_UPDATE);
 }
 
 /* Needs to be entered with client holding a ref count. */
@@ -8265,7 +8271,7 @@ static void stratum_send_update(sdata_t *sdata, const int64_t client_id, const b
 	stratum_add_yysend(sdata, doc, client_id, SM_UPDATE);
 }
 
-/* Hold instance and workbase lock */
+/* Hold instance_lock, and either the workbase lock or a readcount on wb */
 static yyjson_mut_doc *__user_notify(const workbase_t *wb, const user_instance_t *user, const bool clean)
 {
 	int64_t id = wb->id;
@@ -8303,6 +8309,19 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
 {
 	stratum_instance_t *client, *tmp;
 	yyjson_mut_doc *doc;
+	workbase_t *wb;
+
+	/* Hold a readcount on the workbase rather than its lock, so each
+	 * user's userwbs can be read under the instance_lock they are added
+	 * and deleted under without nesting the two locks. */
+	ck_wlock(&sdata->workbase_lock);
+	wb = sdata->current_workbase;
+	if (likely(wb))
+		wb->readcount++;
+	ck_wunlock(&sdata->workbase_lock);
+	/* No work to broadcast before the first template */
+	if (unlikely(!wb))
+		return;
 
 	ck_wlock(&sdata->instance_lock);
 	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
@@ -8313,20 +8332,22 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
 		 * sv2_strat_on_work_update after this loop. */
 		if (client->sv2)
 			continue;
+		doc = __user_notify(wb, client->user_instance, clean);
+		if (unlikely(!doc))
+			continue;
 		__inc_instance_ref(client);
 		ck_wunlock(&sdata->instance_lock);
 
-		ck_rlock(&sdata->workbase_lock);
-		doc = __user_notify(sdata->current_workbase, client->user_instance, clean);
-		ck_runlock(&sdata->workbase_lock);
-
-		if (likely(doc))
-			stratum_add_yysend(sdata, doc, client->id, SM_UPDATE);
+		stratum_add_yysend(sdata, doc, client->id, SM_UPDATE);
 
 		ck_wlock(&sdata->instance_lock);
 		__dec_instance_ref(client);
 	}
 	ck_wunlock(&sdata->instance_lock);
+
+	ck_wlock(&sdata->workbase_lock);
+	wb->readcount--;
+	ck_wunlock(&sdata->workbase_lock);
 #ifdef HAVE_SV2
 	/* Solo path never went through stratum_broadcast_update before */
 	sv2_strat_on_work_update(clean);
