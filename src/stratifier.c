@@ -6409,9 +6409,16 @@ static void check_global_user(user_instance_t *user, stratum_instance_t *client)
 {
 	sdata_t *sdata = ckpool.sdata;
 	proxy_t *proxy = best_proxy(sdata);
-	int proxyid = proxy->id;
 	char buf[256];
+	int proxyid;
 
+	/* All global proxies may be dead during an upstream outage */
+	if (unlikely(!proxy)) {
+		LOGNOTICE("No global proxy to add user %s to for client %s",
+			  user->username, client->identity);
+		return;
+	}
+	proxyid = proxy->id;
 	sprintf(buf, "globaluser=%d:%d:%"PRId64":%s,%s", proxyid, user->id, client->id,
 		user->username, client->password);
 	send_proc(ckpool.generator,buf);
