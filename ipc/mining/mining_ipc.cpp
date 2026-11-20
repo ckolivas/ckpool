@@ -424,6 +424,12 @@ public:
 	template <typename Func>
 	auto run(Func &&func) -> decltype(std::declval<kj::Executor>().executeSync(std::declval<Func>()))
 	{
+		/* While disconnected the service thread sits in its reconnect
+		 * wait outside the event loop, so executeSync would block the
+		 * caller, such as a share thread submitting a block, until
+		 * bitcoind comes back. Fail now so it can fall back instead. */
+		if (!connected_.load())
+			throw std::runtime_error("mining IPC not connected");
 		return executor_->executeSync(kj::fwd<Func>(func));
 	}
 
