@@ -679,6 +679,26 @@ static double clamp_channel_diff(double diff)
 		return 1.0;
 	if (diff > SV2_MAX_CHANNEL_DIFF)
 		return SV2_MAX_CHANNEL_DIFF;
+	/* Whole numbers only, rounded up the same way the stratifier rounds
+	 * its int64 client diff. Vardiff only runs on shares whose job diff
+	 * equals the client diff exactly, so a fractional channel diff would
+	 * disable vardiff for the life of the channel. */
+	return floor(diff + 0.999999);
+}
+
+/* Target for diff, never easier than max_target. Raising diff to the
+ * max_target difficulty keeps it whole; the float round trip may still
+ * overshoot max_target by an epsilon, in which case max_target is sent. */
+static double channel_target(uint8_t target[32], double diff,
+			     const uint8_t max_target[32])
+{
+	target_from_diff(target, diff);
+	if (target_cmp_le(target, max_target) <= 0)
+		return diff;
+	diff = clamp_channel_diff(diff_from_target((uchar *)max_target));
+	target_from_diff(target, diff);
+	if (target_cmp_le(target, max_target) > 0)
+		memcpy(target, max_target, 32);
 	return diff;
 }
 
@@ -944,12 +964,10 @@ static void push_set_target(struct sv2_channel *ch)
 	 * (tProxy rejects SetTarget if target > UpdateChannel.maximum_target).
 	 * target_from_diff float round-trip can slightly overshoot.
 	 */
-	target_from_diff(wire_target, diff);
-	if (has_max && target_cmp_le(wire_target, max_target) > 0) {
-		memcpy(wire_target, max_target, 32);
-		diff = clamp_channel_diff(diff_from_target(max_target));
-		ch->diff = diff;
-	}
+	if (has_max)
+		diff = ch->diff = channel_target(wire_target, diff, max_target);
+	else
+		target_from_diff(wire_target, diff);
 	ch->advertised_diff = diff;
 	mutex_unlock(&sv2_lock);
 
@@ -1050,7 +1068,7 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	uint8_t pbuf[128];
 	size_t plen = 0;
 	uint32_t ch_id;
-	double diff, floor;
+	double diff, floor, open_diff;
 	int64_t instance_id = 0;
 
 	if (!c->setup_ok)
@@ -1132,11 +1150,8 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	memset(&ok, 0, sizeof(ok));
 	ok.request_id = o.request_id;
 	ok.channel_id = ch_id;
-	target_from_diff(ok.target, ch->diff);
-	if (target_cmp_le(ok.target, ch->max_target) > 0) {
-		memcpy(ok.target, ch->max_target, 32);
-		ch->diff = clamp_channel_diff(diff_from_target(ch->max_target));
-	}
+	ch->diff = channel_target(ok.target, ch->diff, ch->max_target);
+	open_diff = ch->diff;
 	ok.extranonce_prefix_len = ch->enonce1_len;
 	memcpy(ok.extranonce_prefix, ch->enonce1, ch->enonce1_len);
 	ch->advertised_diff = ch->diff;
@@ -1157,6 +1172,13 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 			channel_finish_free(dead);
 		stratifier_sv2_close_session(instance_id);
 		return NULL;
+	}
+
+	/* A max_target clamp raises diff above the session's opening diff;
+	 * vardiff only runs while the stratifier's diff matches the jobs'. */
+	if (open_diff != diff) {
+		stratifier_sv2_set_diff(instance_id, open_diff);
+		diff = open_diff;
 	}
 
 	LOGNOTICE("SV2 OpenStandard ch=%u client %"PRId64" inst %"PRId64" user=%s diff=%.1f",
@@ -1451,7 +1473,7 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	uint8_t pbuf[128];
 	size_t plen = 0;
 	uint32_t ch_id;
-	double diff, floor;
+	double diff, floor, open_diff;
 	int64_t instance_id = 0;
 	uint16_t en2;
 
@@ -1557,11 +1579,8 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	memset(&ok, 0, sizeof(ok));
 	ok.request_id = o.request_id;
 	ok.channel_id = ch_id;
-	target_from_diff(ok.target, ch->diff);
-	if (target_cmp_le(ok.target, ch->max_target) > 0) {
-		memcpy(ok.target, ch->max_target, 32);
-		ch->diff = clamp_channel_diff(diff_from_target(ch->max_target));
-	}
+	ch->diff = channel_target(ok.target, ch->diff, ch->max_target);
+	open_diff = ch->diff;
 	ok.extranonce_size = ch->extranonce_size;
 	ok.extranonce_prefix_len = ch->enonce1_len;
 	memcpy(ok.extranonce_prefix, ch->enonce1, ch->enonce1_len);
@@ -1582,6 +1601,13 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 			channel_finish_free(dead);
 		stratifier_sv2_close_session(instance_id);
 		return NULL;
+	}
+
+	/* A max_target clamp raises diff above the session's opening diff;
+	 * vardiff only runs while the stratifier's diff matches the jobs'. */
+	if (open_diff != diff) {
+		stratifier_sv2_set_diff(instance_id, open_diff);
+		diff = open_diff;
 	}
 
 	LOGNOTICE("SV2 OpenExtended ch=%u client %"PRId64" inst %"PRId64" user=%s diff=%.1f en2=%u",
@@ -2036,14 +2062,17 @@ void sv2_strat_note_client(int64_t client_id, const char *address, int server)
 	client_put(c);
 }
 
-void sv2_strat_set_instance_diff(int64_t instance_id, double diff)
+double sv2_strat_set_instance_diff(int64_t instance_id, double diff)
 {
 	struct sv2_channel *ch, *tmp;
 	struct sv2_channel **list = NULL;
+	double applied;
 	int n = 0, i;
 
 	if (instance_id < 1 || !isfinite(diff) || diff < 1.0)
-		return;
+		return diff;
+	diff = clamp_channel_diff(diff);
+	applied = diff;
 
 	ensure_lock();
 	mutex_lock(&sv2_lock);
@@ -2059,11 +2088,17 @@ void sv2_strat_set_instance_diff(int64_t instance_id, double diff)
 
 	for (i = 0; i < n; i++) {
 		push_set_target(list[i]);
+		/* push_set_target may raise diff to honour max_target */
+		mutex_lock(&sv2_lock);
+		if (list[i]->diff > applied)
+			applied = list[i]->diff;
+		mutex_unlock(&sv2_lock);
 		channel_put(list[i]);
 	}
 	dealloc(list);
 	LOGINFO("SV2 SetTarget instance %"PRId64" diff %.1f channels=%d",
-		instance_id, diff, n);
+		instance_id, applied, n);
+	return applied;
 }
 
 void sv2_strat_clear_instance(int64_t instance_id)

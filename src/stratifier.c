@@ -6588,6 +6588,23 @@ out:
 }
 
 /* Needs to be entered with client holding a ref count. */
+#ifdef HAVE_SV2
+/* Round a difficulty up to the int64_t client difficulty is carried as,
+ * returning 0 for anything not usable. Bounded because a double to int64_t
+ * conversion that overflows raises FE_INVALID, which is fatal here, and SV2
+ * difficulty can be derived from a client supplied max_target. Matches the
+ * 1e18 bound suggest_diff() applies to the SV1 side. */
+static int64_t sane_diff_int64(const double diff)
+{
+	if (unlikely(!isfinite(diff) || diff < 1.0))
+		return 0;
+	if (unlikely(diff > 1e18))
+		return (int64_t)1e18;
+	return (int64_t)(diff + 0.999999);
+}
+
+#endif
+
 static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client)
 {
 	yyjson_mut_doc *doc;
@@ -6595,7 +6612,15 @@ static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client)
 #ifdef HAVE_SV2
 	/* Virtual SV2 sessions have no connector socket — send SetTarget */
 	if (client->sv2) {
-		sv2_strat_set_instance_diff(client->id, (double)client->diff);
+		int64_t applied;
+
+		/* A channel's max_target may raise the diff. Track what the
+		 * channel advertises since vardiff only runs on shares whose
+		 * job diff matches client->diff. */
+		applied = sane_diff_int64(sv2_strat_set_instance_diff(client->id,
+								     (double)client->diff));
+		if (applied > client->diff)
+			((stratum_instance_t *)client)->diff = applied;
 		return;
 	}
 #endif
@@ -7144,20 +7169,6 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 #include "sv2_strat.h"
 #include "sv2_jd.h"
 #include "connector.h"
-
-/* Round a difficulty up to the int64_t client difficulty is carried as,
- * returning 0 for anything not usable. Bounded because a double to int64_t
- * conversion that overflows raises FE_INVALID, which is fatal here, and SV2
- * difficulty can be derived from a client supplied max_target. Matches the
- * 1e18 bound suggest_diff() applies to the SV1 side. */
-static int64_t sane_diff_int64(const double diff)
-{
-	if (unlikely(!isfinite(diff) || diff < 1.0))
-		return 0;
-	if (unlikely(diff > 1e18))
-		return (int64_t)1e18;
-	return (int64_t)(diff + 0.999999);
-}
 
 bool stratifier_sv2_snapshot_work(struct sv2_work_snap *out, int64_t instance_id)
 {

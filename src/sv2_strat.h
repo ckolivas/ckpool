@@ -34,8 +34,9 @@ void sv2_strat_on_work_update(bool clean);
 void sv2_strat_note_client(int64_t client_id, const char *address, int server);
 
 /* Pool auto-vardiff / UpdateChannel: update channel target and send SetTarget
- * for every SV2 channel bound to this stratum instance_id. */
-void sv2_strat_set_instance_diff(int64_t instance_id, double diff);
+ * for every SV2 channel bound to this stratum instance_id. Returns the whole
+ * number diff actually applied, which a channel's max_target may raise. */
+double sv2_strat_set_instance_diff(int64_t instance_id, double diff);
 
 /* Clear instance binding when stratifier drops a virtual SV2 session so we
  * stop pushing jobs / validating shares for a dead instance. */
