@@ -8428,7 +8428,7 @@ static void suggest_diff(stratum_instance_t *client, const char *method,
 			 yyjson_mut_val *params_val)
 {
 	yyjson_mut_val *arr_val = yyjson_mut_arr_get(params_val, 0);
-	int64_t sdiff;
+	int64_t sdiff, mindiff;
 
 	if (unlikely(!client_active(client))) {
 		LOGNOTICE("Attempted to suggest diff on unauthorised client %s", client->identity);
@@ -8446,9 +8446,15 @@ static void suggest_diff(stratum_instance_t *client, const char *method,
 		LOGINFO("Failed to parse suggest_difficulty for client %s", client->identity);
 		return;
 	}
-	/* Clamp suggest diff to global pool mindiff */
-	if (sdiff < ckpool.mindiff)
-		sdiff = ckpool.mindiff;
+	/* Clamp suggest diff to global pool mindiff, or to highdiff on a
+	 * highdiff port, since suggest_diff replaces the highdiff floor set
+	 * when the client connected. */
+	mindiff = ckpool.mindiff;
+	if (ckpool.server_highdiff && ckpool.server_highdiff[client->server] &&
+	    ckpool.highdiff > mindiff)
+		mindiff = ckpool.highdiff;
+	if (sdiff < mindiff)
+		sdiff = mindiff;
 	if (sdiff == client->suggest_diff)
 		return;
 	client->suggest_diff = sdiff;
