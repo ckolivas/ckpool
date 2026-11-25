@@ -632,6 +632,8 @@ bool _validhex(const char *buf, const char *file, const char *func, const int li
 bool _hex2bin(void *p, const void *vhexstr, size_t len, const char *file, const char *func, const int line);
 #define hex2bin(p, vhexstr, len) _hex2bin(p, vhexstr, len, __FILE__, __func__, __LINE__)
 char *http_base64(const char *src);
+char *bin2base64(const uchar *src, const size_t len);
+uchar *base642bin(const char *src, size_t *outlen);
 void b58tobin(char *b58bin, const char *b58);
 int safecmp(const char *a, const char *b);
 bool cmdmatch(const char *buf, const char *cmd);

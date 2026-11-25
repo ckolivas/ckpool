@@ -439,7 +439,7 @@ static uint32_t alloc_channel_id(struct sv2_client *c)
 	return id;
 }
 
-void sv2_strat_drop_client(int64_t client_id)
+bool sv2_strat_drop_client(int64_t client_id)
 {
 	struct sv2_client *c;
 	struct sv2_channel *ch, *tmp, *dead;
@@ -482,6 +482,33 @@ void sv2_strat_drop_client(int64_t client_id)
 	for (i = 0; i < niids; i++)
 		stratifier_sv2_close_session(iids[i]);
 	dealloc(iids);
+	return c || niids;
+}
+
+/* Drop every SV2 client carried by passthrough parent_id, whose subclient
+ * ids hold the parent id in their upper 32 bits. */
+void sv2_strat_drop_passthrough(int64_t parent_id)
+{
+	struct sv2_client *c, *ctmp;
+	int64_t *ids = NULL;
+	int n = 0, i;
+
+	if (parent_id < 1)
+		return;
+	ensure_lock();
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_clients, c, ctmp) {
+		if ((c->client_id >> 32) != parent_id)
+			continue;
+		ids = ckrealloc(ids, (n + 1) * sizeof(*ids));
+		ids[n++] = c->client_id;
+	}
+	mutex_unlock(&sv2_lock);
+	for (i = 0; i < n; i++)
+		sv2_strat_drop_client(ids[i]);
+	dealloc(ids);
+	if (n)
+		LOGNOTICE("SV2 dropped %d client(s) of passthrough %"PRId64, n, parent_id);
 }
 
 void sv2_strat_drop_all(void)

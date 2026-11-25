@@ -33,6 +33,12 @@
  * still have a finite ceiling so a compromised peer cannot grow the recv
  * buffer without bound. */
 #define MAX_REMOTE_MSGSIZE (16 * 1024 * 1024)
+/* A passthrough parent multiplexes many clients and carries base64 encoded
+ * SV2 frames, so its lines may exceed a miner's MAX_MSGSIZE. */
+#define MAX_PASSTHROUGH_MSGSIZE (64 * 1024)
+/* Largest decrypted SV2 frame a passthrough will carry upstream. Mining
+ * frames from a miner are well under 2KB; SetupConnection is the largest. */
+#define SV2_PASSTHROUGH_MAX_FRAME 16384
 
 typedef struct client_instance client_instance_t;
 typedef struct sender_send sender_send_t;
@@ -123,6 +129,8 @@ struct client_instance {
 	time_t sv2_setup_time;
 	/* Mining: Open*Channel.Success. JD: AllocateMiningJobToken.Success. */
 	bool sv2_has_channel;
+	/* Passthrough: the upstream has been sent this client's address */
+	bool sv2_pt_noted;
 #endif
 };
 
@@ -463,6 +471,20 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 #ifdef HAVE_SV2
 	if (ckpool.server_sv2 && server < (uint64_t)ckpool.serverurls &&
 	    ckpool.server_sv2[server]) {
+		/* A passthrough can only carry SV2 clients to an upstream pool
+		 * that says it accepts them. */
+		if (ckpool.passthrough && !generator_passthrough_sv2()) {
+			static time_t last_pt_warn;
+
+			if (time(NULL) - last_pt_warn >= 60) {
+				LOGWARNING("Rejecting SV2 client %s: passthrough upstream does not accept SV2",
+					   client->address_name);
+				last_pt_warn = time(NULL);
+			}
+			Close(fd);
+			recycle_client(cdata, client);
+			return 0;
+		}
 		/*
 		 * Reserve HS slot before keys/ECDH so rate limits cannot be
 		 * TOCTOUed past and expensive work is not free under flood.
@@ -515,7 +537,7 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	ck_wunlock(&cdata->lock);
 
 #ifdef HAVE_SV2
-	if (client->sv2) {
+	if (client->sv2 && !ckpool.passthrough) {
 		if (client->sv2_jd)
 			sv2_jd_note_client(client->id, client->address_name, (int)server);
 		else
@@ -594,6 +616,8 @@ static int finish_drop_client(client_instance_t *client, int fd)
 #ifdef HAVE_SV2
 		sv2_strat_drop_client(client_id);
 		sv2_jd_drop_client(client_id);
+		if (passthrough)
+			sv2_strat_drop_passthrough(client_id);
 #endif
 	}
 
@@ -665,6 +689,7 @@ static void drop_all_clients(cdata_t *cdata)
 {
 	client_instance_t *client, *tmp;
 	int64_t *ids = NULL;
+	bool *pts = NULL;
 	int n = 0, i;
 
 	/*
@@ -675,9 +700,12 @@ static void drop_all_clients(cdata_t *cdata)
 	ck_wlock(&cdata->lock);
 	HASH_ITER(hh, cdata->clients, client, tmp) {
 		int64_t id = client->id;
+		bool passthrough = client->passthrough;
 
 		if (__drop_client(cdata, client) > -1) {
 			ids = ckrealloc(ids, (n + 1) * sizeof(*ids));
+			pts = ckrealloc(pts, (n + 1) * sizeof(*pts));
+			pts[n] = passthrough;
 			ids[n++] = id;
 		}
 	}
@@ -688,9 +716,12 @@ static void drop_all_clients(cdata_t *cdata)
 #ifdef HAVE_SV2
 		sv2_strat_drop_client(ids[i]);
 		sv2_jd_drop_client(ids[i]);
+		if (pts[i])
+			sv2_strat_drop_passthrough(ids[i]);
 #endif
 	}
 	dealloc(ids);
+	dealloc(pts);
 }
 
 static void send_client(cdata_t *cdata, int64_t id, char *buf);
@@ -803,6 +834,129 @@ static client_instance_t *ref_client_by_id(cdata_t *cdata, int64_t id);
 
 /* SV2 binary path: Noise reassembly, decrypt, stratifier handle, encrypt reply.
  * Returns false to drop. */
+/* Plain passthrough mode, where SV2 clients terminate Noise here and their
+ * decrypted frames are carried to the upstream pool. */
+static bool sv2_passthrough(void)
+{
+	return ckpool.passthrough && !ckpool.node && !ckpool.redirector;
+}
+
+static void drop_passthrough_client(cdata_t *cdata, const int64_t id);
+
+/* Passthrough: carry a decrypted SV2 frame from a local client to the
+ * upstream pool, which runs the SV2 mining logic for it. The first frame
+ * also carries the client's address. */
+static bool passthrough_sv2_forward(client_instance_t *client, const uint8_t *frame,
+				    const size_t len)
+{
+	yyjson_mut_doc *doc;
+	yyjson_mut_val *root;
+	char *b64;
+
+	if (unlikely(len > SV2_PASSTHROUGH_MAX_FRAME)) {
+		LOGNOTICE("SV2 client %"PRId64" frame of %zu bytes too large to pass through, dropping",
+			  client->id, len);
+		return false;
+	}
+	if (unlikely(!generator_passthrough_sv2())) {
+		LOGINFO("SV2 client %"PRId64" dropped: passthrough upstream unavailable or lacks SV2",
+			client->id);
+		return false;
+	}
+	b64 = bin2base64(frame, len);
+	doc = yyjson_mut_doc_new(&ckyyalc);
+	root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_sint(doc, root, "client_id", client->id);
+	if (!client->sv2_pt_noted) {
+		yyjson_mut_obj_add_str(doc, root, "address", client->address_name);
+		client->sv2_pt_noted = true;
+	}
+	yyjson_mut_obj_add_str(doc, root, "sv2", b64);
+	/* Serialises and frees doc before returning */
+	generator_add_send(doc);
+	dealloc(b64);
+	return true;
+}
+
+/* Passthrough: deliver an SV2 frame the upstream pool sent for local client
+ * id, encrypting it for the client on its sender shard. */
+static void passthrough_sv2_deliver(cdata_t *cdata, const int64_t id, const char *b64)
+{
+	client_instance_t *client;
+	uint8_t *plain;
+	size_t len;
+
+	plain = base642bin(b64, &len);
+	if (unlikely(!plain || len < SV2_FRAME_HEADER_LEN)) {
+		LOGWARNING("Passthrough upstream sent invalid SV2 frame for client %"PRId64, id);
+		dealloc(plain);
+		return;
+	}
+	client = ref_client_by_id(cdata, id);
+	if (unlikely(!client)) {
+		LOGDEBUG("Passthrough SV2 frame for missing client %"PRId64, id);
+		dealloc(plain);
+		return;
+	}
+	if (likely(client->sv2 && !client->sv2_jd))
+		send_client_bin(cdata, client, plain, (int)len);
+	else
+		dealloc(plain);
+	dec_instance_ref(cdata, client);
+}
+
+/* Upstream pool: send an SV2 frame for a passthrough subclient back to its
+ * passthrough, which encrypts it for the client. */
+static void passthrough_sv2_send(cdata_t *cdata, const int64_t id, uint8_t *plain,
+				 const size_t len)
+{
+	char *b64, *msg;
+
+	b64 = bin2base64(plain, len);
+	dealloc(plain);
+	ASPRINTF(&msg, "{\"client_id\":%"PRId64",\"sv2\":\"%s\"}\n", (int64_t)(id & 0xffffffffll), b64);
+	dealloc(b64);
+	send_client(cdata, id, msg);
+}
+
+/* Upstream pool: an SV2 frame a passthrough carried from one of its clients.
+ * The passthrough terminated Noise, so the SV2 mining logic runs here for
+ * the subclient exactly as for a directly connected SV2 client. */
+static void passthrough_sv2_recv(cdata_t *cdata, client_instance_t *client,
+				 const int64_t passthrough_id, yyjson_mut_val *root)
+{
+	const char *b64 = yyjson_mut_get_str(yyjson_mut_obj_get(root, "sv2"));
+	const char *address = yyjson_mut_get_str(yyjson_mut_obj_get(root, "address"));
+	uint8_t *frame, *rplain;
+	size_t len, rlen = 0;
+
+	frame = base642bin(b64, &len);
+	if (unlikely(!frame || len < SV2_FRAME_HEADER_LEN ||
+		     len > SV2_FRAME_HEADER_LEN + SV2_MAX_MINING_PAYLOAD)) {
+		LOGNOTICE("Passthrough %"PRId64" sent invalid SV2 frame for client %"PRId64", dropping it",
+			  client->id, (int64_t)(passthrough_id & 0xffffffffll));
+		dealloc(frame);
+		sv2_strat_drop_client(passthrough_id);
+		drop_passthrough_client(cdata, passthrough_id);
+		return;
+	}
+	/* Sent with the subclient's first frame, before any channel exists.
+	 * Subclients share the passthrough's server for listen port policy,
+	 * as SV1 passthrough subclients do. */
+	if (address) {
+		if (strlen(address) >= INET6_ADDRSTRLEN)
+			address = client->address_name;
+		sv2_strat_note_client(passthrough_id, address, client->server);
+	}
+	rplain = sv2_strat_handle_frame(passthrough_id, frame, len, &rlen);
+	dealloc(frame);
+	if (rplain && rlen)
+		passthrough_sv2_send(cdata, passthrough_id, rplain, rlen);
+	else
+		dealloc(rplain);
+}
+
 static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
 {
 	uint8_t rdbuf[8192];
@@ -876,7 +1030,18 @@ static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
 		if (client->sv2_jd)
 			rplain = sv2_jd_handle_frame(client->id, frames[i],
 						     frame_lens[i], &rlen);
-		else
+		else if (sv2_passthrough()) {
+			if (unlikely(!passthrough_sv2_forward(client, frames[i],
+							       frame_lens[i]))) {
+				for (; i < nframes; i++)
+					dealloc(frames[i]);
+				dealloc(frames);
+				dealloc(frame_lens);
+				return false;
+			}
+			dealloc(frames[i]);
+			continue;
+		} else
 			rplain = sv2_strat_handle_frame(client->id, frames[i],
 							frame_lens[i], &rlen);
 
@@ -942,6 +1107,11 @@ void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen
 		dealloc(plain);
 		return;
 	}
+	/* A passthrough subclient: its passthrough encrypts for it */
+	if (subclient(client_id)) {
+		passthrough_sv2_send(cdata, client_id, plain, plainlen);
+		return;
+	}
 	client = ref_client_by_id(cdata, client_id);
 	if (!client || !client->sv2 || !client->sv2c) {
 		if (client)
@@ -957,6 +1127,15 @@ void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen
 
 /* Client is holding a reference count from being on the epoll list. Returns
  * true if we will still be receiving messages from this client. */
+static unsigned long client_max_msgsize(const client_instance_t *client)
+{
+	if (client->remote)
+		return MAX_REMOTE_MSGSIZE;
+	if (client->passthrough)
+		return MAX_PASSTHROUGH_MSGSIZE;
+	return MAX_MSGSIZE;
+}
+
 static bool parse_client_msg(cdata_t *cdata, client_instance_t *client)
 {
 	yyjson_doc *sdoc;
@@ -970,8 +1149,9 @@ static bool parse_client_msg(cdata_t *cdata, client_instance_t *client)
 
 retry:
 	if (unlikely(client->bufofs > MAX_MSGSIZE)) {
-		/* Remote clients are allowed a larger but finite ceiling. */
-		if (unlikely(!client->remote || client->bufofs > MAX_REMOTE_MSGSIZE)) {
+		/* Remote and passthrough clients are allowed a larger but
+		 * finite ceiling. */
+		if (unlikely(client->bufofs > client_max_msgsize(client))) {
 			LOGNOTICE("Client id %"PRId64" fd %d overloaded buffer without EOL, disconnecting",
 				client->id, client->fd);
 			return false;
@@ -1004,8 +1184,7 @@ reparse:
 
 	/* Do something useful with this message now */
 	buflen = eol - client->buf + 1;
-	if (unlikely(buflen > MAX_MSGSIZE &&
-		     (!client->remote || buflen > MAX_REMOTE_MSGSIZE))) {
+	if (unlikely((unsigned long)buflen > client_max_msgsize(client))) {
 		LOGNOTICE("Client id %"PRId64" fd %d message oversize, disconnecting", client->id, client->fd);
 		return false;
 	}
@@ -1036,6 +1215,28 @@ reparse:
 			if (unlikely(!(subclient_id >= 0 && subclient_id < 4294967296.0)))
 				subclient_id = 0;
 			passthrough_id = (client->id << 32) | (int64_t)subclient_id;
+#ifdef HAVE_SV2
+			if (!ckpool.proxy) {
+				const char *method;
+
+				/* SV2 frames are handled here, never by the
+				 * stratifier's SV1 parser. */
+				if (yyjson_mut_obj_get(root, "sv2")) {
+					if (likely(subclient_id))
+						passthrough_sv2_recv(cdata, client, passthrough_id, root);
+					yyjson_mut_doc_free(doc);
+					goto next_msg;
+				}
+				/* A dropped SV2 subclient has no stratifier
+				 * instance of its own to terminate. */
+				method = yyjson_mut_get_str(yyjson_mut_obj_get(root, "method"));
+				if (method && !safecmp(method, "mining.term") &&
+				    sv2_strat_drop_client(passthrough_id)) {
+					yyjson_mut_doc_free(doc);
+					goto next_msg;
+				}
+			}
+#endif
 			/* Strip only after reading the remotely supplied subclient
 			 * id above, which is a legitimate input on this path. */
 			strip_reserved_keys(root, false);
@@ -1073,6 +1274,9 @@ reparse:
 		} else
 			yyjson_mut_doc_free(doc);
 	}
+#ifdef HAVE_SV2
+next_msg:
+#endif
 	client->bufofs -= buflen;
 	if (client->bufofs)
 		memmove(client->buf, client->buf + buflen, client->bufofs);
@@ -1867,7 +2071,14 @@ static void passthrough_client(cdata_t *cdata, client_instance_t *client)
 
 	LOGINFO("Connector adding passthrough client %"PRId64, client->id);
 	client->passthrough = true;
-	doc = yyjson_mut_pack("{sb}", "result", true);
+#ifdef HAVE_SV2
+	/* Tell new passthroughs we run the SV2 mining logic for their SV2
+	 * clients. Older passthroughs ignore the extra key. */
+	if (!ckpool.proxy)
+		doc = yyjson_mut_pack("{sbsb}", "result", true, "sv2", true);
+	else
+#endif
+		doc = yyjson_mut_pack("{sb}", "result", true);
 	send_client_yyjson(cdata, client->id, doc);
 	if (!ckpool.rmem_warn)
 		set_recvbufsize(client->fd, 1048576);
@@ -2081,6 +2292,17 @@ static void client_yymessage_processor(yyjson_mut_doc *doc)
 	root = yyjson_mut_doc_get_root(doc);
 	/* Extract the client id from the json message and remove its entry */
 	client_id = yyjson_mut_get_num(yyjson_mut_obj_get(root, "client_id"));
+#ifdef HAVE_SV2
+	if (sv2_passthrough()) {
+		const char *b64 = yyjson_mut_get_str(yyjson_mut_obj_get(root, "sv2"));
+
+		if (b64) {
+			passthrough_sv2_deliver(cdata, client_id, b64);
+			yyjson_mut_doc_free(doc);
+			return;
+		}
+	}
+#endif
 	yyjson_mut_obj_remove_key(root, "client_id");
 	/* Put client_id back in for a passthrough subclient, passing its
 	 * upstream client_id instead of the passthrough's. */

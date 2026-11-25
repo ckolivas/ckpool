@@ -97,6 +97,16 @@ Mandatory upstream pool config fields:
   point at it. Upstream ckpool instances only accept passthrough connections on
   bindings listed there.
 
+Stratum V2 miners can also connect through a passthrough by adding `"sv2url"`
+entries, with `"sv2_authority_key"` and `"sv2_static_key"` set to the same
+key files as the upstream pool so miners verify the same authority key. The
+passthrough terminates the Noise encryption and carries each client's
+decrypted SV2 frames to the upstream pool over the same connection, where the
+SV2 mining logic runs as for directly connected SV2 clients. The upstream must
+be a ckpool new enough to advertise SV2 passthrough support; until it does,
+SV2 clients are refused. Job declaration (`"sv2jdurl"`) is not supported in
+passthrough mode.
+
 ## Redirector mode
 
 When run with the `-R` or `--redirector` parameter, ckpool operates in the same

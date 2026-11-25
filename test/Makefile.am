@@ -1,10 +1,11 @@
 AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)
 LDADD = $(top_srcdir)/src/libckpool.a
 
-check_PROGRAMS = sha256 validate_address reject_stats
-TESTS = sha256 validate_address reject_stats
+check_PROGRAMS = sha256 validate_address reject_stats base64
+TESTS = sha256 validate_address reject_stats base64
 
 sha256_SOURCES = sha256.c
+base64_SOURCES = base64.c
 # Include the stratifier to exercise its actual per-client accounting path;
 # discard unrelated server entry points and their dependencies when linking.
 reject_stats_SOURCES = reject_stats.c

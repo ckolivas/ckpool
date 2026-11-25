@@ -1761,6 +1761,96 @@ char *http_base64(const char *src)
 	return (str);
 }
 
+/* Binary safe base64 encoding of len bytes of src into a newly allocated
+ * NUL terminated string. */
+char *bin2base64(const uchar *src, const size_t len)
+{
+	size_t l = len;
+	char *str, *dst;
+	uint32_t t;
+
+	str = ckalloc(((len + 2) / 3) * 4 + 1);
+	dst = str;
+	while (l >= 3) {
+		t = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
+		*dst++ = base64[(t >> 18) & 0x3f];
+		*dst++ = base64[(t >> 12) & 0x3f];
+		*dst++ = base64[(t >> 6) & 0x3f];
+		*dst++ = base64[t & 0x3f];
+		src += 3;
+		l -= 3;
+	}
+	if (l) {
+		t = (uint32_t)src[0] << 16;
+		if (l == 2)
+			t |= (uint32_t)src[1] << 8;
+		*dst++ = base64[(t >> 18) & 0x3f];
+		*dst++ = base64[(t >> 12) & 0x3f];
+		*dst++ = l == 2 ? base64[(t >> 6) & 0x3f] : '=';
+		*dst++ = '=';
+	}
+	*dst = '\0';
+	return str;
+}
+
+static int base64_val(const char c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return c - 'a' + 26;
+	if (c >= '0' && c <= '9')
+		return c - '0' + 52;
+	if (c == '+')
+		return 62;
+	if (c == '/')
+		return 63;
+	return -1;
+}
+
+/* Decode padded base64 src into a newly allocated buffer, storing its length
+ * in outlen. Returns NULL on any malformed input. */
+uchar *base642bin(const char *src, size_t *outlen)
+{
+	size_t slen, i, pad = 0, o = 0;
+	uchar *out;
+
+	*outlen = 0;
+	if (unlikely(!src))
+		return NULL;
+	slen = strlen(src);
+	if (unlikely(!slen || slen % 4))
+		return NULL;
+	if (src[slen - 1] == '=')
+		pad++;
+	if (src[slen - 2] == '=')
+		pad++;
+	out = ckalloc(slen / 4 * 3);
+	for (i = 0; i < slen; i += 4) {
+		int v[4], j;
+		uint32_t t;
+
+		for (j = 0; j < 4; j++) {
+			/* Padding is only valid in the final quantum */
+			if (src[i + j] == '=' && i + 4 == slen && j >= 4 - (int)pad)
+				v[j] = 0;
+			else if (unlikely((v[j] = base64_val(src[i + j])) < 0)) {
+				dealloc(out);
+				return NULL;
+			}
+		}
+		t = ((uint32_t)v[0] << 18) | ((uint32_t)v[1] << 12) |
+		    ((uint32_t)v[2] << 6) | (uint32_t)v[3];
+		out[o++] = (t >> 16) & 0xff;
+		if (i + 4 < slen || pad < 2)
+			out[o++] = (t >> 8) & 0xff;
+		if (i + 4 < slen || pad < 1)
+			out[o++] = t & 0xff;
+	}
+	*outlen = o;
+	return out;
+}
+
 static const int8_t charset_rev[128] = {
 	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,

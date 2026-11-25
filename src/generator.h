@@ -17,6 +17,7 @@
 #define GETBEST_SUCCESS 1
 
 void generator_add_send(yyjson_mut_doc *doc);
+bool generator_passthrough_sv2(void);
 struct genwork *generator_getbase(void);
 uint32_t generator_get_block_mintime(const char *hash);
 int generator_getbest(char *hash);

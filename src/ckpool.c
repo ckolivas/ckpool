@@ -1498,13 +1498,22 @@ static void free_sv2_urllist(char ***urls, int *nurls)
 
 /*
  * SV2 mining/JD *server* binds are allowed only in normal pool mode or
- * btcsolo. All proxy-family modes set ckpool.proxy (proxy, userproxy,
+ * btcsolo, plus SV2 mining (not JD) in plain passthrough mode, which
+ * terminates Noise locally and carries the decrypted frames to an upstream
+ * pool. All proxy-family modes set ckpool.proxy (proxy, userproxy,
  * passthrough, node, redirector). Upstream SV2 as a *client* (ckproxy) is
  * independent of this.
  */
-static bool sv2_server_listen_allowed(void)
+static bool sv2_passthrough_mode(void)
 {
-	return !ckpool.proxy;
+	return ckpool.passthrough && !ckpool.node && !ckpool.redirector;
+}
+
+static bool sv2_server_listen_allowed(const bool jd)
+{
+	if (!ckpool.proxy)
+		return true;
+	return !jd && sv2_passthrough_mode();
 }
 
 /* True if host means "all interfaces" for clash purposes. */
@@ -1581,9 +1590,9 @@ static void append_sv2_serverurls(char **urls, int nurl, bool jd, int defport)
 
 	if (!urls || nurl <= 0)
 		return;
-	if (!sv2_server_listen_allowed()) {
-		LOGWARNING("Not binding SV2 %s: server listen is pool/solo only",
-			   jd ? "Job Declaration" : "mining");
+	if (!sv2_server_listen_allowed(jd)) {
+		LOGWARNING("Not binding SV2 %s: server listen is pool/solo%s only",
+			   jd ? "Job Declaration" : "mining", jd ? "" : "/passthrough");
 		return;
 	}
 
@@ -1825,17 +1834,15 @@ static void parse_config(void)
 	 * Proxy, userproxy, passthrough, node, and redirector all set
 	 * ckpool.proxy — drop SV2 binds there (upstream SV2 client is separate).
 	 */
-	if (!sv2_server_listen_allowed()) {
-		if (ckpool.sv2urls) {
-			LOGWARNING("Ignoring sv2url: SV2 server listen is pool/solo only "
-				   "(not proxy/passthrough/node/redirector/userproxy)");
-			free_sv2_urllist(&ckpool.sv2url, &ckpool.sv2urls);
-		}
-		if (ckpool.sv2jdurls) {
-			LOGWARNING("Ignoring sv2jdurl: SV2 server listen is pool/solo only "
-				   "(not proxy/passthrough/node/redirector/userproxy)");
-			free_sv2_urllist(&ckpool.sv2jdurl, &ckpool.sv2jdurls);
-		}
+	if (ckpool.sv2urls && !sv2_server_listen_allowed(false)) {
+		LOGWARNING("Ignoring sv2url: SV2 server listen is pool/solo/passthrough only "
+			   "(not proxy/node/redirector/userproxy)");
+		free_sv2_urllist(&ckpool.sv2url, &ckpool.sv2urls);
+	}
+	if (ckpool.sv2jdurls && !sv2_server_listen_allowed(true)) {
+		LOGWARNING("Ignoring sv2jdurl: SV2 Job Declaration listen is pool/solo only "
+			   "(not proxy/passthrough/node/redirector/userproxy)");
+		free_sv2_urllist(&ckpool.sv2jdurl, &ckpool.sv2jdurls);
 	}
 #endif
 

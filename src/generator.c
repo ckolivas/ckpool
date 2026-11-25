@@ -135,6 +135,7 @@ struct proxy_instance {
 
 	connsock_t cs;
 	bool passthrough;
+	bool sv2_passthrough; /* Upstream accepts SV2 frames over passthrough */
 	bool node;
 	int id; /* Proxy server id*/
 	int subid; /* Subproxy id */
@@ -905,6 +906,10 @@ static bool passthrough_stratum(connsock_t *cs, proxy_instance_t *proxi)
 		goto out;
 	}
 	proxi->passthrough = true;
+	/* Upstreams new enough to carry SV2 frames say so in the reply */
+	proxi->sv2_passthrough = yyjson_is_true(yyjson_obj_get(yyjson_doc_get_root(val), "sv2"));
+	if (proxi->sv2_passthrough)
+		LOGNOTICE("Passthrough upstream %d:%s accepts SV2 clients", proxi->id, proxi->url);
 out:
 	if (val)
 		yyjson_doc_free(val);
@@ -2476,6 +2481,18 @@ static void passthrough_add_send(proxy_instance_t *proxy, char *msg)
 	pm->cs = &proxy->cs;
 	pm->msg = msg;
 	ckmsgq_add(proxy->passsends, pm);
+}
+
+/* Whether the current passthrough upstream accepts SV2 frames */
+bool generator_passthrough_sv2(void)
+{
+	gdata_t *gdata = ckpool.gdata;
+	proxy_instance_t *proxy;
+
+	if (unlikely(!gdata))
+		return false;
+	proxy = gdata->current_proxy;
+	return proxy && proxy->alive && proxy->sv2_passthrough;
 }
 
 void generator_add_send(yyjson_mut_doc *doc)
